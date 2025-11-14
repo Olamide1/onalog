@@ -10,8 +10,7 @@ const companySchema = new mongoose.Schema({
   normalizedName: {
     type: String,
     required: true,
-    unique: true,
-    index: true
+    unique: true
   },
   
   // Admin user (first user who created company)
@@ -56,7 +55,7 @@ const companySchema = new mongoose.Schema({
 });
 
 // Indexes
-companySchema.index({ normalizedName: 1 });
+// Note: normalizedName already has unique: true which creates an index automatically
 companySchema.index({ adminId: 1 });
 
 export default mongoose.model('Company', companySchema);

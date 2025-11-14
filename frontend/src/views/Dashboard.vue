@@ -4,45 +4,55 @@
     <header class="dashboard-header horizontal-band">
       <div class="container">
         <div class="header-content">
-          <h1>Onalog</h1>
+          <div class="header-left">
+            <h1>Onalog</h1>
+            <div v-if="dashboardStats?.company" class="company-info">
+              <span class="company-name">{{ dashboardStats.company.name }}</span>
+              <span v-if="dashboardStats.company.memberCount > 1" class="member-count">
+                {{ dashboardStats.company.memberCount }} members
+              </span>
+            </div>
+          </div>
           <div class="header-actions">
             <span class="user-name">{{ authStore.user?.name || 'User' }}</span>
             <span v-if="authStore.user?.role === 'admin'" class="admin-badge">Admin</span>
-            <button
-              v-if="authStore.user?.role === 'admin'"
-              @click="showSettings = !showSettings"
+            <router-link
+              to="/settings"
               class="btn"
             >
               Settings
-            </button>
+            </router-link>
             <button @click="handleLogout" class="btn">Logout</button>
           </div>
         </div>
       </div>
     </header>
     
-    <!-- Company Settings Panel -->
-    <div v-if="showSettings && authStore.user?.role === 'admin'" class="settings-panel geometric-block">
-      <CompanySettings />
-    </div>
 
     <!-- Search Section - Wide rectangular band -->
     <section class="search-section horizontal-band">
       <div class="container">
-        <SearchForm @search="handleSearch" />
+        <SearchForm ref="searchFormRef" @search="handleSearch" />
       </div>
     </section>
 
     <!-- Main Content -->
     <div class="container main-content">
-      <!-- Loading State -->
-      <div v-if="leadsStore.loading && !leadsStore.currentSearch" class="loading-state">
-        <div class="loading-tile" v-for="i in 3" :key="i">
-          <div class="loading-bar"></div>
-        </div>
+      <!-- Dashboard Overview (when no active search) -->
+      <div v-if="!leadsStore.currentSearch" class="dashboard-overview">
+        <!-- Stats Cards -->
+        <DashboardStats v-if="dashboardStats" :stats="dashboardStats" />
+        
+        <!-- Recent Searches -->
+        <RecentSearches
+          :searches="dashboardStats?.searches?.recent || []"
+          :loading="loadingStats"
+          @select-search="loadSearch"
+          @view-all="viewAllSearches"
+        />
       </div>
 
-      <!-- Search Status -->
+      <!-- Active Search Status -->
       <div v-if="leadsStore.currentSearch" class="search-status geometric-block">
         <div class="status-header">
           <h3>{{ leadsStore.currentSearch.query }}</h3>
@@ -51,13 +61,41 @@
           </span>
         </div>
         <div class="status-stats">
-          <div>Total: {{ leadsStore.currentSearch.totalResults || 0 }}</div>
-          <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }}</div>
-          <div>Enriched: {{ leadsStore.enrichedCount }}</div>
+          <div class="stat-item">
+            <span class="stat-label">Total:</span>
+            <span class="stat-value">{{ leadsStore.currentSearch.totalResults || 0 }}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Extracted:</span>
+            <span class="stat-value">{{ leadsStore.currentSearch.extractedCount || 0 }}</span>
+          </div>
+          <div class="stat-item">
+            <span class="stat-label">Enriched:</span>
+            <span class="stat-value">{{ leadsStore.enrichedCount }}</span>
+          </div>
         </div>
         <div v-if="leadsStore.currentSearch.status === 'processing'" class="progress-indicator">
+          <div class="progress-label">
+            Processing leads... {{ leadsStore.currentSearch.extractedCount || 0 }} / {{ leadsStore.currentSearch.totalResults || 0 }}
+          </div>
           <div class="progress-bar">
             <div class="progress-fill" :style="{ width: progressPercent + '%' }"></div>
+          </div>
+        </div>
+        <button @click="clearSearch" class="btn" style="margin-top: var(--spacing-md);">
+          Start New Search
+        </button>
+      </div>
+
+      <!-- Loading State - When processing but no leads yet -->
+      <div v-if="leadsStore.currentSearch && leadsStore.currentSearch.status === 'processing' && leadsStore.filteredLeads.length === 0" class="loading-leads geometric-block">
+        <div class="loading-content">
+          <div class="loading-spinner"></div>
+          <h3>Discovering Leads...</h3>
+          <p>We're searching and extracting business information. This may take a moment.</p>
+          <div class="loading-stats">
+            <div>Found: {{ leadsStore.currentSearch.totalResults || 0 }} results</div>
+            <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }} leads</div>
           </div>
         </div>
       </div>
@@ -66,14 +104,25 @@
       <LeadList 
         v-if="leadsStore.filteredLeads.length > 0"
         :leads="leadsStore.filteredLeads"
+        :is-processing="leadsStore.currentSearch?.status === 'processing'"
         @select-lead="openLeadDetail"
         @export="handleExport"
       />
 
-      <!-- Empty State -->
-      <div v-if="!leadsStore.loading && leadsStore.filteredLeads.length === 0 && !leadsStore.currentSearch" class="empty-state geometric-block">
+      <!-- Empty State - No Search -->
+      <div v-if="!leadsStore.loading && leadsStore.filteredLeads.length === 0 && !leadsStore.currentSearch && !loadingStats" class="empty-state geometric-block">
         <h2>Start a search to discover leads</h2>
         <p>Enter a business query above to begin</p>
+      </div>
+
+      <!-- Empty State - Search Completed with 0 Results -->
+      <div v-if="leadsStore.currentSearch && leadsStore.currentSearch.status === 'completed' && leadsStore.filteredLeads.length === 0 && !leadsStore.loading" class="empty-state geometric-block">
+        <h2>No Results Found</h2>
+        <p>Your search for "{{ leadsStore.currentSearch.query }}" returned 0 results.</p>
+        <p class="empty-hint">Try adjusting your search query or filters and search again.</p>
+        <button @click="clearSearch" class="btn btn-accent" style="margin-top: var(--spacing-md);">
+          Start New Search
+        </button>
       </div>
     </div>
 
@@ -95,22 +144,33 @@ import { useAuthStore } from '../stores/auth';
 import SearchForm from '../components/SearchForm.vue';
 import LeadList from '../components/LeadList.vue';
 import LeadDetailPanel from '../components/LeadDetailPanel.vue';
-import CompanySettings from '../components/CompanySettings.vue';
+import DashboardStats from '../components/DashboardStats.vue';
+import RecentSearches from '../components/RecentSearches.vue';
+import api from '../services/api';
 
 const router = useRouter();
 const leadsStore = useLeadsStore();
 const authStore = useAuthStore();
 const selectedLead = ref(null);
 const searchFormRef = ref(null);
-const showSettings = ref(false);
+const dashboardStats = ref(null);
+const loadingStats = ref(false);
 let pollInterval = null;
+let statsInterval = null;
 
 // Check auth on mount
-onMounted(() => {
+onMounted(async () => {
   authStore.initAuth();
   if (!authStore.isAuthenticated) {
     router.push('/login');
+    return;
   }
+  
+  // Load dashboard stats
+  await loadDashboardStats();
+  
+  // Refresh stats every 30 seconds
+  statsInterval = setInterval(loadDashboardStats, 30000);
 });
 
 const progressPercent = computed(() => {
@@ -130,12 +190,14 @@ async function handleSearch(searchData) {
     );
     
     // Pass searchId to SearchForm for template saving
-    if (searchFormRef.value) {
+    if (searchFormRef.value && search.searchId) {
       searchFormRef.value.setSearchId(search.searchId);
     }
     
     // Start polling for updates
-    startPolling(search.searchId);
+    if (search.searchId) {
+      startPolling(search.searchId);
+    }
   } catch (error) {
     console.error('Search error:', error);
   }
@@ -185,6 +247,43 @@ function handleExport(format) {
   window.open(url, '_blank');
 }
 
+async function loadDashboardStats() {
+  if (!authStore.isAuthenticated) return;
+  
+  loadingStats.value = true;
+  try {
+    const response = await api.get('/company/stats');
+    dashboardStats.value = response.data;
+  } catch (error) {
+    console.error('Error loading dashboard stats:', error);
+  } finally {
+    loadingStats.value = false;
+  }
+}
+
+async function loadSearch(search) {
+  try {
+    const data = await leadsStore.fetchSearch(search._id);
+    startPolling(search._id);
+  } catch (error) {
+    console.error('Error loading search:', error);
+  }
+}
+
+function viewAllSearches() {
+  // Could navigate to a searches page or show all in a modal
+  // For now, just scroll to search form
+  document.querySelector('.search-section')?.scrollIntoView({ behavior: 'smooth' });
+}
+
+function clearSearch() {
+  leadsStore.currentSearch = null;
+  leadsStore.leads = [];
+  stopPolling();
+  // Refresh stats
+  loadDashboardStats();
+}
+
 function handleLogout() {
   authStore.clearUser();
   router.push('/');
@@ -192,6 +291,9 @@ function handleLogout() {
 
 onUnmounted(() => {
   stopPolling();
+  if (statsInterval) {
+    clearInterval(statsInterval);
+  }
 });
 </script>
 
@@ -218,6 +320,29 @@ onUnmounted(() => {
   padding: var(--spacing-md) 0;
 }
 
+.header-left {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.company-info {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  font-size: 0.875rem;
+}
+
+.company-name {
+  font-weight: var(--font-weight-semibold);
+  color: var(--neutral-2);
+}
+
+.member-count {
+  color: #666;
+  font-size: 0.8125rem;
+}
+
 .header-actions {
   display: flex;
   align-items: center;
@@ -226,6 +351,11 @@ onUnmounted(() => {
 
 .user-name {
   font-weight: var(--font-weight-semibold);
+}
+
+.header-actions .btn {
+  text-decoration: none;
+  display: inline-block;
 }
 
 .admin-badge {
@@ -237,10 +367,6 @@ onUnmounted(() => {
   text-transform: uppercase;
 }
 
-.settings-panel {
-  margin: var(--spacing-lg) auto;
-  max-width: 800px;
-}
 
 .search-section {
   margin-bottom: var(--spacing-xl);
@@ -248,6 +374,12 @@ onUnmounted(() => {
 
 .main-content {
   padding-top: var(--spacing-lg);
+}
+
+.dashboard-overview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xl);
 }
 
 .loading-state {
@@ -297,8 +429,67 @@ onUnmounted(() => {
 .status-stats {
   display: flex;
   gap: var(--spacing-lg);
-  margin-bottom: var(--spacing-md);
-  font-weight: var(--font-weight-semibold);
+  margin-top: var(--spacing-md);
+  flex-wrap: wrap;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.stat-label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--neutral-3);
+}
+
+.stat-value {
+  font-size: 1.25rem;
+  font-weight: var(--font-weight-bold);
+  color: var(--accent-color);
+}
+
+.progress-label {
+  font-size: 0.875rem;
+  margin-bottom: var(--spacing-sm);
+  color: var(--neutral-3);
+}
+
+.loading-leads {
+  padding: var(--spacing-xl);
+  text-align: center;
+  margin-top: var(--spacing-lg);
+}
+
+.loading-content {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.loading-spinner {
+  width: 48px;
+  height: 48px;
+  border: 4px solid var(--neutral-2);
+  border-top-color: var(--accent-color);
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.loading-stats {
+  display: flex;
+  gap: var(--spacing-lg);
+  margin-top: var(--spacing-sm);
+  font-size: 0.875rem;
+  color: var(--neutral-3);
 }
 
 .progress-indicator {

@@ -203,7 +203,7 @@ router.get('/me', async (req, res) => {
     
     const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
     const decoded = jwt.verify(token, secret);
-    const user = await User.findById(decoded.userId);
+    const user = await User.findById(decoded.userId).populate('companyId', 'name');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -213,13 +213,123 @@ router.get('/me', async (req, res) => {
       user: {
         id: user._id,
         name: user.name,
-        email: user.email
+        email: user.email,
+        role: user.role,
+        companyId: user.companyId?._id,
+        companyName: user.companyId?.name,
+        defaultCountry: user.defaultCountry,
+        defaultResultCount: user.defaultResultCount
       }
     });
     
   } catch (error) {
     console.error('Auth check error:', error);
     res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+/**
+ * PUT /api/auth/profile - Update user profile settings
+ */
+router.put('/profile', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+    
+    const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+    const decoded = jwt.verify(token, secret);
+    const user = await User.findById(decoded.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const { name, defaultCountry, defaultResultCount } = req.body;
+    
+    // Update allowed fields
+    if (name !== undefined) {
+      if (!name || name.trim().length < 2) {
+        return res.status(400).json({ error: 'Name must be at least 2 characters' });
+      }
+      user.name = name.trim();
+    }
+    
+    if (defaultCountry !== undefined) {
+      user.defaultCountry = defaultCountry || null;
+    }
+    
+    if (defaultResultCount !== undefined) {
+      if (![50, 100, 200].includes(defaultResultCount)) {
+        return res.status(400).json({ error: 'Result count must be 50, 100, or 200' });
+      }
+      user.defaultResultCount = defaultResultCount;
+    }
+    
+    await user.save();
+    
+    res.json({
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        defaultCountry: user.defaultCountry,
+        defaultResultCount: user.defaultResultCount
+      }
+    });
+    
+  } catch (error) {
+    console.error('Update profile error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * PUT /api/auth/password - Change user password
+ */
+router.put('/password', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    
+    if (!token) {
+      return res.status(401).json({ error: 'No token provided' });
+    }
+    
+    const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+    const decoded = jwt.verify(token, secret);
+    const user = await User.findById(decoded.userId);
+    
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const { currentPassword, newPassword } = req.body;
+    
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current password and new password are required' });
+    }
+    
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+    
+    // Verify current password
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+    
+    // Update password
+    user.password = newPassword;
+    await user.save();
+    
+    res.json({ message: 'Password updated successfully' });
+    
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 

@@ -21,12 +21,10 @@ const leadSchema = new mongoose.Schema({
   // Structured company data
   companyName: {
     type: String,
-    required: true,
-    index: true
+    required: true
   },
   website: {
-    type: String,
-    index: true
+    type: String
   },
   
   // Contact details

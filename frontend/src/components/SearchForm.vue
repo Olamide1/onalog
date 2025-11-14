@@ -17,12 +17,78 @@
         <label class="filter-label">Country</label>
         <select v-model="formData.country" class="input">
           <option value="">All Countries</option>
-          <option value="ng">Nigeria</option>
-          <option value="za">South Africa</option>
-          <option value="ke">Kenya</option>
-          <option value="gh">Ghana</option>
-          <option value="ug">Uganda</option>
-          <option value="tz">Tanzania</option>
+          <optgroup label="Africa">
+            <option value="ng">Nigeria</option>
+            <option value="za">South Africa</option>
+            <option value="ke">Kenya</option>
+            <option value="gh">Ghana</option>
+            <option value="ug">Uganda</option>
+            <option value="tz">Tanzania</option>
+            <option value="et">Ethiopia</option>
+            <option value="eg">Egypt</option>
+            <option value="zm">Zambia</option>
+            <option value="zw">Zimbabwe</option>
+            <option value="rw">Rwanda</option>
+            <option value="sn">Senegal</option>
+            <option value="ci">Ivory Coast</option>
+            <option value="cm">Cameroon</option>
+            <option value="ao">Angola</option>
+            <option value="ma">Morocco</option>
+            <option value="tn">Tunisia</option>
+            <option value="dz">Algeria</option>
+            <option value="mg">Madagascar</option>
+            <option value="mw">Malawi</option>
+          </optgroup>
+          <optgroup label="North America">
+            <option value="us">United States</option>
+            <option value="ca">Canada</option>
+            <option value="mx">Mexico</option>
+          </optgroup>
+          <optgroup label="Europe">
+            <option value="gb">United Kingdom</option>
+            <option value="de">Germany</option>
+            <option value="fr">France</option>
+            <option value="it">Italy</option>
+            <option value="es">Spain</option>
+            <option value="nl">Netherlands</option>
+            <option value="be">Belgium</option>
+            <option value="ch">Switzerland</option>
+            <option value="at">Austria</option>
+            <option value="se">Sweden</option>
+            <option value="no">Norway</option>
+            <option value="dk">Denmark</option>
+            <option value="pl">Poland</option>
+            <option value="ie">Ireland</option>
+            <option value="pt">Portugal</option>
+          </optgroup>
+          <optgroup label="Asia">
+            <option value="in">India</option>
+            <option value="cn">China</option>
+            <option value="jp">Japan</option>
+            <option value="kr">South Korea</option>
+            <option value="sg">Singapore</option>
+            <option value="my">Malaysia</option>
+            <option value="th">Thailand</option>
+            <option value="id">Indonesia</option>
+            <option value="ph">Philippines</option>
+            <option value="vn">Vietnam</option>
+            <option value="ae">United Arab Emirates</option>
+            <option value="sa">Saudi Arabia</option>
+            <option value="il">Israel</option>
+            <option value="pk">Pakistan</option>
+            <option value="bd">Bangladesh</option>
+          </optgroup>
+          <optgroup label="Oceania">
+            <option value="au">Australia</option>
+            <option value="nz">New Zealand</option>
+          </optgroup>
+          <optgroup label="South America">
+            <option value="br">Brazil</option>
+            <option value="ar">Argentina</option>
+            <option value="co">Colombia</option>
+            <option value="cl">Chile</option>
+            <option value="pe">Peru</option>
+          </optgroup>
         </select>
       </div>
 
@@ -60,11 +126,12 @@
         {{ showTemplates ? 'Hide' : 'Load' }} Template
       </button>
       <button 
-        v-if="currentSearchId && formData.query"
+        v-if="currentSearchId && formData.query.trim()"
         type="button" 
         class="btn"
         @click="saveAsTemplate"
         :disabled="loading"
+        title="Save this search as a template"
       >
         Save Template
       </button>

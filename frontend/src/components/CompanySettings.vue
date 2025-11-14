@@ -1,7 +1,10 @@
 <template>
   <div class="company-settings geometric-block">
     <div class="settings-header">
-      <h2>Company Settings</h2>
+      <div class="header-top">
+        <h2>Company Settings</h2>
+        <button v-if="showClose" @click="$emit('close')" class="btn-close">×</button>
+      </div>
       <p v-if="authStore.user?.role !== 'admin'" class="admin-only">
         Only admins can change these settings
       </p>
@@ -72,6 +75,15 @@ import { ref, onMounted } from 'vue';
 import { useAuthStore } from '../stores/auth';
 import api from '../services/api';
 
+defineProps({
+  showClose: {
+    type: Boolean,
+    default: false
+  }
+});
+
+defineEmits(['close']);
+
 const authStore = useAuthStore();
 const settings = ref({
   shareSearches: true,
@@ -123,8 +135,35 @@ onMounted(() => {
   margin-bottom: var(--spacing-lg);
 }
 
-.settings-header h2 {
+.header-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
   margin-bottom: var(--spacing-sm);
+}
+
+.settings-header h2 {
+  margin: 0;
+}
+
+.btn-close {
+  background: none;
+  border: none;
+  font-size: 2rem;
+  line-height: 1;
+  color: var(--neutral-2);
+  cursor: pointer;
+  padding: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 0.2s linear;
+}
+
+.btn-close:hover {
+  color: var(--accent);
 }
 
 .admin-only {

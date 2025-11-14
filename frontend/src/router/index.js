@@ -3,6 +3,7 @@ import Landing from '../views/Landing.vue';
 import SignIn from '../views/SignIn.vue';
 import Login from '../views/Login.vue';
 import Dashboard from '../views/Dashboard.vue';
+import Settings from '../views/Settings.vue';
 import { useAuthStore } from '../stores/auth';
 
 const routes = [
@@ -25,6 +26,12 @@ const routes = [
     path: '/dashboard',
     name: 'Dashboard',
     component: Dashboard,
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/settings',
+    name: 'Settings',
+    component: Settings,
     meta: { requiresAuth: true }
   }
 ];
