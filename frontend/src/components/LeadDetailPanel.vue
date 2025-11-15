@@ -6,6 +6,11 @@
     </div>
 
     <div class="panel-content">
+      <!-- Enrichment Status Notice -->
+      <div v-if="lead.enrichmentStatus === 'skipped'" class="enrichment-notice">
+        <p><strong>Enrichment Skipped:</strong> This lead was not enriched due to insufficient credits. Basic contact information is available, but AI-powered insights are missing.</p>
+      </div>
+
       <!-- Company Snapshot -->
       <section class="panel-section">
         <div class="section-header vertical-bar">
@@ -371,6 +376,19 @@ async function generateOutreach() {
   height: 100%;
   background: rgba(0, 0, 0, 0.3);
   z-index: 999;
+}
+
+.enrichment-notice {
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-lg);
+  background: #fff3cd;
+  border: var(--border-medium) solid #ffc107;
+  color: #856404;
+}
+
+.enrichment-notice p {
+  margin: 0;
+  line-height: 1.6;
 }
 </style>
 

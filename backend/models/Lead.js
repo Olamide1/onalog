@@ -97,7 +97,7 @@ const leadSchema = new mongoose.Schema({
   },
   enrichmentStatus: {
     type: String,
-    enum: ['pending', 'enriching', 'enriched', 'failed'],
+    enum: ['pending', 'enriching', 'enriched', 'failed', 'skipped'],
     default: 'pending'
   },
   isDuplicate: {

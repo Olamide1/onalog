@@ -5,10 +5,10 @@
       <div class="container">
         <div class="hero-content">
           <h1 class="hero-title">Onalog</h1>
-          <p class="hero-subtitle">Low-cost B2B lead discovery built into a structured visual world</p>
+          <p class="hero-subtitle">B2B Lead Discovery. Structured. Fast.</p>
           <p class="hero-description">
-            Convert any business search into a structured lead list. Extract contact details fast. 
-            Enrich each lead with missing info. Deliver clear actions for outreach.
+            Search. Extract. Enrich. Action.<br>
+            Turn any business query into a complete lead list in 25 seconds.
           </p>
           <div class="hero-actions">
             <router-link to="/signin" class="btn btn-accent">Get Started</router-link>
@@ -24,9 +24,8 @@
         <div class="value-prop-content geometric-block">
           <h2 class="section-title">Why Onalog?</h2>
           <p class="value-prop-lead">
-            Built specifically for African B2B teams who waste hours manually searching, 
-            opening results, and collecting scattered contact details. We turn that daily 
-            workflow into a 25-second automated process.
+            Hours of manual searching. Scattered contact details. Blank outreach pages.<br>
+            We turn that workflow into 25 seconds. Structured. Complete. Ready.
           </p>
           
           <div class="value-points">
@@ -35,7 +34,7 @@
                 <div class="value-point-stripe"></div>
                 <div class="value-point-content">
                   <h3>SPEED</h3>
-                  <p>Get a complete, enriched lead list in 25 seconds. Stop spending hours on Google searches and manual data collection. Start your outreach faster.</p>
+                  <p>25 seconds from search to structured lead list. No hours wasted on manual collection. Start outreach immediately.</p>
                 </div>
               </div>
               
@@ -43,7 +42,7 @@
                 <div class="value-point-stripe stripe-alt"></div>
                 <div class="value-point-content">
                   <h3>LOW COST</h3>
-                  <p>Affordable pricing that scales with your needs. No expensive enterprise contracts. Pay for what you use, not what you might need.</p>
+                  <p>Pay for what you use. No enterprise contracts. Scale as you grow. Affordable from day one.</p>
                 </div>
               </div>
             </div>
@@ -53,7 +52,7 @@
                 <div class="value-point-stripe stripe-alt-2"></div>
                 <div class="value-point-content">
                   <h3>ACTION-READY</h3>
-                  <p>Every lead includes ready-to-send outreach messages. WhatsApp openers, email templates, call scripts. No more blank pages wondering what to say.</p>
+                  <p>Every lead includes outreach templates. WhatsApp. Email. Call scripts. No blank pages. No guesswork.</p>
                 </div>
               </div>
             </div>
@@ -70,22 +69,22 @@
         <div class="features-grid grid grid-2">
           <div class="feature-block geometric-block">
             <h3>Search</h3>
-            <p>Generate raw lead candidates from Google with country and location filters</p>
+            <p>Query any business category. Filter by country and location. Generate lead candidates instantly.</p>
           </div>
           
           <div class="feature-block geometric-block">
             <h3>Extract</h3>
-            <p>Convert raw results into structured business data - emails, phones, socials</p>
+            <p>Convert results into structured data. Emails. Phones. Socials. Websites. Addresses.</p>
           </div>
           
           <div class="feature-block geometric-block">
             <h3>Enrich</h3>
-            <p>AI-powered enrichment fills gaps in African business data</p>
+            <p>AI fills missing details. Company size. Industry. Decision makers. Contact patterns.</p>
           </div>
           
           <div class="feature-block geometric-block">
             <h3>Action</h3>
-            <p>Clear actions for outreach with instant messaging templates</p>
+            <p>Ready-to-send outreach templates. WhatsApp. Email. Call scripts. Context-aware.</p>
           </div>
         </div>
       </div>
@@ -133,8 +132,8 @@
     <!-- CTA Section -->
     <section class="cta horizontal-band">
       <div class="container">
-        <h2>Ready to discover leads?</h2>
-        <router-link to="/signin" class="btn btn-accent">Start Free</router-link>
+        <h2>Start Discovering Leads</h2>
+        <router-link to="/signin" class="btn btn-accent">Get Started</router-link>
       </div>
     </section>
   </div>

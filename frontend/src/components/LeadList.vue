@@ -78,13 +78,16 @@
             <td>{{ lead.address || '—' }}</td>
             <td>
               <div class="score-cell">
-                <div class="score-bar">
+                <div v-if="lead.enrichmentStatus === 'skipped'" class="status-badge skipped">
+                  Skipped
+                </div>
+                <div v-else class="score-bar">
                   <div
                     class="score-bar-fill"
                     :style="{ width: (lead.enrichment?.signalStrength || 0) + '%' }"
                   ></div>
                 </div>
-                <span class="score-value">{{ lead.enrichment?.signalStrength || 0 }}</span>
+                <span v-if="lead.enrichmentStatus !== 'skipped'" class="score-value">{{ lead.enrichment?.signalStrength || 0 }}</span>
               </div>
             </td>
             <td @click.stop>
@@ -280,6 +283,22 @@ function handleExport(format) {
 
 .text-muted {
   color: #999;
+}
+
+.status-badge {
+  display: inline-block;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.75rem;
+  font-weight: var(--font-weight-semibold);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border: var(--border-thin) solid var(--neutral-2);
+}
+
+.status-badge.skipped {
+  background: #fff3cd;
+  color: #856404;
+  border-color: #ffc107;
 }
 </style>
 
