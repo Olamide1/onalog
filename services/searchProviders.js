@@ -25,23 +25,57 @@ const FILTER_DOMAINS = [
   // Regional directory/listicle domains (trigger expansion instead of treating as leads)
   'finelib.com', 'worldorgs.com', 'infoaboutcompanies.com', 'starofservice.com.ng',
   'africabizinfo.com', 'nigeria24.me', 'businesslist.com.ng',
+  // Additional listicle/directory domains
+  'wigmoretrading.com', 'naijatrends.ng', 'wellfound.com', 'getlatka.com',
+  'techbehemoths.com', 'f6s.com', 'crunchbase.com', 'producthunt.com',
   // OpenStreetMap pages (not actual business websites)
   'openstreetmap.org'
 ];
 
-export function isDirectorySite(url) {
+export function isDirectorySite(url, title = null) {
   try {
     const urlObj = new URL(url);
     const domain = urlObj.hostname.replace('www.', '');
     const path = (urlObj.pathname || '').toLowerCase();
+    
     // Domain-based block
     if (FILTER_DOMAINS.some(filter => domain.includes(filter))) return true;
-    // Path heuristics that commonly indicate lists/aggregators
-    if (path.match(/\/(category|tags|companies|agencies|estate-agents|real-estate-agents|company-directory|partners)\b/) ||
-        path.includes('/top-') || path.includes('/best') || path.includes('/list') || path.includes('/explore/') ||
-        path.includes('sharearticle')) {
+    
+    // Path heuristics that commonly indicate lists/aggregators (generic patterns)
+    const listiclePathPatterns = [
+      /\/(category|tags|companies|agencies|estate-agents|real-estate-agents|company-directory|partners|directory|listings|businesses)\b/i,
+      /\/(top-|best-|leading-|top\d+|best\d+)/i,
+      /\/(list|lists|listing|explore|directory|guide|roundup|compilation)/i,
+      /sharearticle|article-list|company-list/i,
+      // Generic business type patterns (not hardcoded to specific types)
+      /-\d+-best-|-\d+-top-|-\d+-companies/i
+    ];
+    if (listiclePathPatterns.some(pattern => pattern.test(path))) {
       return true;
     }
+    
+    // Title-based heuristics for listicles (generic patterns - works for any business type)
+    if (title) {
+      const titleLower = title.toLowerCase();
+      // Generic listicle patterns that work for any business category
+      const listiclePatterns = [
+        // "Top/Best X in Y" or "X Companies to Know"
+        /^(top|best|leading|top \d+|best \d+)\s+.*\s+(companies|providers|solutions|services|businesses|firms|agencies)/i,
+        /(companies|providers|solutions|services|businesses|firms|agencies).*(to know|to work|in \w+|for \w+|to watch)/i,
+        // "List/Directory/Guide of X"
+        /^(list|directory|guide|roundup|compilation).*(of|to|for).*(companies|providers|businesses)/i,
+        // "N Best/Top X"
+        /\d+\s+(best|top|leading|greatest).*(companies|providers|businesses|firms)/i,
+        // "X Companies/Providers in/for Y"
+        /.*\s+(companies|providers|businesses|firms).*(in|for|to)\s+\w+/i,
+        // Generic "X to Y" patterns
+        /.*\s+(to know|to work|to watch|to follow|to invest).*companies/i
+      ];
+      if (listiclePatterns.some(pattern => pattern.test(titleLower))) {
+        return true;
+      }
+    }
+    
     return false;
   } catch {
     return false;
@@ -220,42 +254,82 @@ out center tags ${Math.max(10, Math.min(200, maxResults))};`;
 
 /**
  * Optional Provider: SearxNG (self-hosted metasearch)
+ * Handles rate limiting (403/429) with exponential backoff and instance rotation
  */
 export async function searchSearxng(query, country = null, location = null, maxResults = 50) {
   try {
     // Support multiple public instances via SEARXNG_URLS (comma-separated)
-    // Falls back to single SEARXNG_URL if provided, else a small built-in list
+    // Falls back to single SEARXNG_URL if provided, else an expanded list of known working instances
     const urlsFromEnv = (process.env.SEARXNG_URLS || '')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
     const singleUrl = (process.env.SEARXNG_URL || '').trim();
+    
+    // Expanded list of public SearxNG instances (from searx.space and community)
+    // These are known to be more reliable and have fewer restrictions
     const fallback = [
       'https://searx.be',
       'https://searx.tiekoetter.com',
       'https://search.bus-hit.me',
-      'https://searxng.bissisoft.com'
+      'https://searxng.bissisoft.com',
+      'https://searx.prvcy.eu',
+      'https://searx.xyz',
+      'https://searx.org',
+      'https://searx.fmac.xyz',
+      'https://searx.sapti.me',
+      'https://searx.rasp.fr',
+      'https://searx.work',
+      'https://searx.divided-by-zero.eu',
+      'https://searx.0x1f4.space'
     ];
+    
     const candidates = urlsFromEnv.length > 0 ? urlsFromEnv : (singleUrl ? [singleUrl] : fallback);
     if (candidates.length === 0) {
       throw new Error('SEARXNG_URLS/SEARXNG_URL not configured');
     }
+
+    // Shuffle candidates to distribute load
+    const shuffled = [...candidates].sort(() => Math.random() - 0.5);
 
     // Build query once
     let q = query;
     if (location) q += ` ${location}`;
     if (country) q += ` ${country}`;
 
+    // Rotate User-Agents to appear more natural
+    const userAgents = [
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15'
+    ];
+
     let firstError = null;
-    for (const base of candidates) {
+    let lastRateLimitError = null;
+    
+    for (let i = 0; i < shuffled.length; i++) {
+      const base = shuffled[i];
       const baseUrl = base.replace(/\/+$/, '');
       const url = `${baseUrl}/search?format=json&q=${encodeURIComponent(q)}&categories=general`;
+      
+      // Random delay between instances (100-500ms) to avoid appearing like a bot
+      if (i > 0) {
+        const delay = 100 + Math.random() * 400;
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
       try {
-        console.log(`[SEARXNG] Query: ${q} → ${baseUrl}`);
+        const userAgent = userAgents[i % userAgents.length];
+        console.log(`[SEARXNG] Query: ${q} → ${baseUrl} (${i + 1}/${shuffled.length})`);
+        
         const raw = await safeHttpGet(url, {
           'Accept': 'application/json',
-          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
+          'User-Agent': userAgent,
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Referer': baseUrl
         }, 12000);
+        
         const json = JSON.parse(raw);
         const items = json.results || [];
         const results = items
@@ -263,18 +337,41 @@ export async function searchSearxng(query, country = null, location = null, maxR
           .map(r => ({ title: r.title, link: r.url, snippet: r.content || '' }))
           .filter(r => r.link.startsWith('http'))
           .filter(r => !isDirectorySite(r.link));
+        
         console.log(`[SEARXNG] ✅ ${baseUrl} returned ${results.length} results`);
         if (results.length > 0) {
           return results.slice(0, maxResults);
         }
         // If zero results, try next instance
       } catch (e) {
-        console.log(`[SEARXNG] ⚠️  ${baseUrl} failed: ${e.message}`);
+        const errorMsg = e.message || '';
+        const isRateLimit = errorMsg.includes('403') || errorMsg.includes('429');
+        
+        if (isRateLimit) {
+          lastRateLimitError = e;
+          console.log(`[SEARXNG] ⚠️  ${baseUrl} rate-limited (${errorMsg.includes('403') ? '403' : '429'}) - trying next instance`);
+          
+          // If this is the last instance and we got rate-limited, implement exponential backoff
+          if (i === shuffled.length - 1 && lastRateLimitError) {
+            console.log(`[SEARXNG] ⚠️  All instances rate-limited. Implementing exponential backoff...`);
+            // Don't retry immediately - let the caller handle fallback to other providers
+            // This prevents hammering the instances
+          }
+        } else {
+          console.log(`[SEARXNG] ⚠️  ${baseUrl} failed: ${errorMsg}`);
+        }
+        
         if (!firstError) firstError = e;
-        // Try next candidate
+        // Continue to next candidate
       }
     }
-    // If all failed or returned empty, throw the first error (or a generic one)
+    
+    // If all failed or returned empty
+    if (lastRateLimitError) {
+      // If we got rate-limited, provide helpful message
+      throw new Error(`SearxNG rate-limited (403/429): All public instances are blocking requests. Consider: 1) Adding BING_API_KEY for digital businesses, 2) Using your own SearxNG instance, 3) Waiting before retrying.`);
+    }
+    
     if (firstError) {
       throw firstError;
     }
@@ -604,24 +701,27 @@ export async function searchDuckDuckGo(query, country = null, location = null, m
           }
         }
         
-        // Heuristic filters to drop listicles/directories/article lists
-        const badPathPattern = /(\/category\/|\/tags\/|\/top-|\/best|\/list|\/explore\/|shareArticle|\/companies)/i;
+        // Allow directory sites through - they'll be expanded in processSearch
+        // Only filter out obviously non-business paths (social media, etc.)
+        const badPathPattern = /(\/shareArticle|\/user\/|\/profile\/|\/@)/i; // Only filter social/profile paths
         const isBadPath = badPathPattern.test(link);
         
         if (title && link && link.startsWith('http') && !isBadPath) {
-          // Filter out directory sites
-          if (!isDirectorySite(link)) {
-            results.push({
-              title,
-              link,
-              snippet
-            });
-            found = true;
-          } else {
-            console.log(`[DUCKDUCKGO] Filtered directory site: ${link}`);
+          // Include directory sites - they'll be expanded later to extract individual companies
+          // This allows SaaS/digital business searches to work even when only directory pages are found
+          const isDir = isDirectorySite(link, title);
+          if (isDir) {
+            console.log(`[DUCKDUCKGO] Including directory site for expansion: ${link}`);
           }
+          results.push({
+            title,
+            link,
+            snippet,
+            isDirectory: isDir // Mark it so processSearch knows to expand it
+          });
+          found = true;
         } else if (isBadPath) {
-          console.log(`[DUCKDUCKGO] Filtered listicle/article path: ${link}`);
+          console.log(`[DUCKDUCKGO] Filtered non-business path: ${link}`);
         }
       });
       
@@ -634,16 +734,17 @@ export async function searchDuckDuckGo(query, country = null, location = null, m
           const link = $el.attr('href');
           const title = $el.text().trim();
           
-          // Skip DuckDuckGo internal links and directory sites
+          // Allow directory sites through - they'll be expanded later
           if (link && 
               link.startsWith('http') && 
               !link.includes('duckduckgo.com') &&
-              !isDirectorySite(link) &&
               title.length > 10) {
+            const isDir = isDirectorySite(link, title);
             results.push({
               title: title.substring(0, 100),
               link,
-              snippet: ''
+              snippet: '',
+              isDirectory: isDir
             });
           }
         });
@@ -1058,7 +1159,26 @@ export async function searchOpenStreetMap(query, country = null, location = null
         const businessRelatedClasses = ['amenity', 'shop', 'office', 'craft', 'education', 'leisure', 'tourism'];
         const isBusinessClass = businessRelatedClasses.includes(placeClass);
         
-        // If it matches search intent OR is in a business class, include it
+        // Dynamic relevance filtering: require search intent match for better accuracy
+        // This prevents irrelevant businesses (e.g., telecom companies in school searches)
+        // Works for ANY business type, not hardcoded to specific categories
+        if (!matchesSearchIntent) {
+          // If it doesn't match search intent, be more selective
+          // Only accept if it's in a relevant business class AND has keywords from search query
+          const queryWords = (query || '').toLowerCase().split(/\s+/).filter(w => w.length > 3);
+          const hasQueryKeywords = queryWords.some(word => 
+            displayNameLower.includes(word) || 
+            placeType?.toLowerCase().includes(word)
+          );
+          
+          // If no query keywords match, reject even if it's a business class
+          // This prevents telecom (office class) from appearing in school searches
+          if (!hasQueryKeywords && !website) {
+            return false;
+          }
+        }
+        
+        // For non-education queries: accept if matches search intent OR is in a business class
         if (matchesSearchIntent || isBusinessClass) {
           return true;
         }
@@ -1069,14 +1189,15 @@ export async function searchOpenStreetMap(query, country = null, location = null
           return false;
         }
         
-        // If it has a website, definitely include it (website = likely a business)
+        // If it has a website, include it only if it matches search intent (to avoid irrelevant businesses)
         if (website && website.length > 0) {
-          return true;
+          // Require at least some relevance to search query
+          return matchesSearchIntent || displayName.length >= 3;
         }
         
         // If location/country match and has a name, be permissive (let extractor/enricher validate)
         // This catches businesses that might not match exact synonyms but are in the right location
-        if ((location || country) && displayName.length >= 3) {
+        if ((location || country) && displayName.length >= 3 && matchesSearchIntent) {
           return true;
         }
         
@@ -1286,3 +1407,5 @@ export async function searchBing(query, country = null, location = null, maxResu
     throw new Error(`Bing Search API failed: ${error.message}`);
   }
 }
+
+

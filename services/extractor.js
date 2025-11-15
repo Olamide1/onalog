@@ -502,15 +502,46 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
     html = await res.text();
     const $ = cheerio.load(html);
     const anchors = $('a[href]');
+    // Only filter out well-known social/aggregator platforms (universal, not business-type specific)
     const badDomains = [
       'facebook.com','instagram.com','twitter.com','x.com','linkedin.com','youtube.com',
-      'wikipedia.org','tracxn.com','ghanayello.com','techcartel.net','yen.com.gh','tremhost.com',
-      'f6s.com','ensun.io'
+      'wikipedia.org'
     ];
-    const badPath = /(\/category\/|\/tags\/|\/top-|\/best|\/list|\/explore\/|shareArticle|\/companies)/i;
+    // Generic path patterns for listicles (works for any business type)
+    const badPath = /(\/category\/|\/tags\/|\/top-|\/best|\/list|\/explore\/|shareArticle|\/companies|\/directory|\/listings)/i;
     const seenHosts = new Set();
     const results = [];
     const baseHost = new URL(listPageUrl).hostname.replace('www.','');
+    
+    // Also try to extract from structured data (JSON-LD, microdata)
+    try {
+      $('script[type="application/ld+json"]').each((_, el) => {
+        try {
+          const json = JSON.parse($(el).html());
+          const items = Array.isArray(json) ? json : [json];
+          items.forEach(item => {
+            if (item['@type'] === 'Organization' || item['@type'] === 'LocalBusiness' || item['@type'] === 'Corporation') {
+              const url = item.url || item.sameAs?.[0] || item.website;
+              if (url && url.startsWith('http')) {
+                try {
+                  const u = new URL(url);
+                  const host = u.hostname.replace('www.', '');
+                  if (host !== baseHost && !badDomains.some(d => host.includes(d)) && !seenHosts.has(host)) {
+                    seenHosts.add(host);
+                    results.push({
+                      title: item.name || item.legalName || host,
+                      link: u.toString(),
+                      snippet: item.description || ''
+                    });
+                  }
+                } catch {}
+              }
+            }
+          });
+        } catch {}
+      });
+    } catch {}
+    
     anchors.each((_, el) => {
       const href = ($(el).attr('href') || '').trim();
       if (!href.startsWith('http')) return;
@@ -523,6 +554,14 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
         if (seenHosts.has(host)) return;
         seenHosts.add(host);
         const title = ($(el).text() || host).trim() || host;
+        // Skip if title looks like a listicle pattern (generic, works for any business type)
+        const titleLower = title.toLowerCase();
+        const isListicleTitle = /^(top|best|leading|list|directory|guide|roundup|compilation)/i.test(titleLower) && 
+            (titleLower.includes('companies') || titleLower.includes('providers') || titleLower.includes('businesses') || 
+             titleLower.includes('firms') || titleLower.includes('agencies') || titleLower.includes('services'));
+        if (isListicleTitle) {
+          return; // Skip listicle titles
+        }
         results.push({
           title: title,
           link: u.toString(),
@@ -620,11 +659,45 @@ function scoreTitle(title = '') {
 }
 function isDirectoryDomain(url) {
   try {
-    const domain = new URL(url).hostname.replace('www.', '');
-    const blocked = ['google.com','yelp.com','yellowpages.com','opencorporates.com','zoominfo.com','dnb.com','linkedin.com','facebook.com','instagram.com','twitter.com','openstreetmap.org'];
-    return blocked.some(b => domain.includes(b));
+    // Fully dynamic pattern-based detection (no hardcoded business-type-specific domains)
+    // Uses path and domain pattern matching that works for any business type
+    const urlObj = new URL(url);
+    const domain = urlObj.hostname.replace('www.', '').toLowerCase();
+    const path = (urlObj.pathname || '').toLowerCase();
+    
+    // Only block universal social/aggregator platforms (not business-type specific)
+    const universalBlocked = ['google.com', 'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com', 'youtube.com', 'wikipedia.org'];
+    if (universalBlocked.some(b => domain.includes(b))) return true;
+    
+    // Pattern-based path detection (works for any business type, not hardcoded)
+    const listiclePathPatterns = [
+      /\/(category|tags|companies|agencies|directory|listings|businesses|list|explore|locations)\b/i,
+      /\/(top-|best-|leading-|top\d+|best\d+)/i,
+      /\/(list|lists|listing|directory|guide|roundup|compilation)/i,
+      /sharearticle|article-list|company-list|location-list/i,
+      // Generic numbered list patterns
+      /-\d+-best-|-\d+-top-|-\d+-companies/i
+    ];
+    if (listiclePathPatterns.some(pattern => pattern.test(path))) return true;
+    
+    // Dynamic domain pattern detection (looks for directory indicators in domain names)
+    // Uses generic patterns, not specific domain names
+    const directoryDomainIndicators = [
+      /directory/i,
+      /listings?/i,
+      /businesslist/i,
+      /yellow/i,
+      /map/i,  // Generic map/directory sites
+      /place/i, // Generic place listing sites
+      /bizinfo/i, // Generic business info sites
+      /college.*list/i, // Generic college/school listing patterns
+      /school.*list/i
+    ];
+    if (directoryDomainIndicators.some(pattern => pattern.test(domain))) return true;
+    
+    return false;
   } catch {
-    return true;
+    return false;
   }
 }
 

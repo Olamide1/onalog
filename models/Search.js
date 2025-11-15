@@ -23,7 +23,7 @@ const searchSchema = new mongoose.Schema({
   // Status tracking
   status: {
     type: String,
-    enum: ['pending', 'queued', 'searching', 'extracting', 'enriching', 'completed', 'failed'],
+    enum: ['pending', 'queued', 'searching', 'extracting', 'enriching', 'processing_backfill', 'completed', 'failed'],
     default: 'pending'
   },
   

@@ -231,10 +231,90 @@ async function buildAdaptiveExpansions(query, country, maxVariants = 8) {
 }
 
 /**
+ * Dynamically detect if query is for digital/software businesses (not physical locations)
+ * Uses LLM to classify query type - no hardcoded keywords
+ * These need web search APIs, not location-based APIs like OSM
+ */
+async function isDigitalBusinessQuery(query) {
+  try {
+    const cacheKey = `digital:${normalizeStr(query)}`;
+    const hit = EXPANSION_CACHE.get(cacheKey);
+    if (hit && Date.now() < hit.expiresAt) {
+      return hit.isDigital === true;
+    }
+    
+    // If no OpenAI key, default to false (use location-based APIs)
+    if (!process.env.OPENAI_API_KEY) {
+      return false;
+    }
+    
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const prompt = `Analyze this business search query: "${query}"
+
+Determine if this query is for:
+- DIGITAL/SOFTWARE businesses (SaaS, apps, platforms, web services, digital agencies, online marketplaces, tech companies, etc.)
+- OR physical/location-based businesses (stores, restaurants, clinics, offices with physical addresses, etc.)
+
+Return ONLY a JSON object with this exact structure:
+{
+  "isDigital": true or false,
+  "confidence": 0.0 to 1.0,
+  "reason": "brief explanation"
+}
+
+Examples:
+- "SaaS companies" → {"isDigital": true, "confidence": 0.95, "reason": "SaaS is software-as-a-service"}
+- "Coffee shops" → {"isDigital": false, "confidence": 0.95, "reason": "Physical retail locations"}
+- "Marketing agencies" → {"isDigital": true, "confidence": 0.7, "reason": "Can be digital/remote agencies"}
+- "Banks" → {"isDigital": false, "confidence": 0.8, "reason": "Physical branch locations"}`;
+
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.1,
+      messages: [
+        { role: 'system', content: 'You classify business search queries as digital/software vs physical/location-based.' },
+        { role: 'user', content: prompt }
+      ]
+    });
+    
+    const text = resp.choices?.[0]?.message?.content?.trim() || '{}';
+    let result = { isDigital: false, confidence: 0, reason: '' };
+    
+    try {
+      result = JSON.parse(text);
+    } catch {
+      // Try to salvage JSON object
+      const m = text.match(/\{[\s\S]*?\}/);
+      if (m) {
+        result = JSON.parse(m[0]);
+      }
+    }
+    
+    const isDigital = result.isDigital === true && (result.confidence || 0) >= 0.6;
+    
+    // Cache result for 30 minutes
+    EXPANSION_CACHE.set(cacheKey, { isDigital, expiresAt: Date.now() + (30 * 60 * 1000) });
+    
+    return isDigital;
+  } catch (error) {
+    console.log(`[SEARCH] ⚠️  LLM digital detection failed: ${error.message}, defaulting to physical`);
+    // On error, default to physical (location-based APIs)
+    return false;
+  }
+}
+
+/**
  * Fetch search results - Cost-optimal: OpenStreetMap (free) → Bing (free) → Google Places API (paid, only when needed)
+ * For digital businesses, prioritizes web search APIs (Bing, Google Custom Search) over location-based APIs
  */
 export async function fetchGoogleResults(query, country = null, location = null, maxResults = 50) {
   console.log(`[SEARCH] Starting: "${query}", Country: ${country || 'none'}, Location: ${location || 'none'}, Max: ${maxResults}`);
+  
+  // Dynamically detect if this is a digital/software business query using LLM
+  const isDigital = await isDigitalBusinessQuery(query);
+  if (isDigital) {
+    console.log(`[SEARCH] 🔍 LLM detected digital/software business query - prioritizing web search APIs`);
+  }
   
   const minResults = Math.min(20, Math.floor(maxResults * 0.4));
   let overpassResults = [];
@@ -243,6 +323,7 @@ export async function fetchGoogleResults(query, country = null, location = null,
   let bingResults = [];
   let placesResults = [];
   let ddgSupplement = [];
+  let customSearchResults = [];
 
   // Step 1: Kick off Overpass + SearxNG + OSM in parallel with strict timeouts
   const withTimeout = (p, label, ms = 15000) => Promise.race([
@@ -307,27 +388,79 @@ export async function fetchGoogleResults(query, country = null, location = null,
       return [];
     }
   })();
-  const [ovr, sx, osm] = await Promise.allSettled([overpassPromise, searxPromise, osmPromise]);
-  overpassResults = ovr.status === 'fulfilled' ? (ovr.value || []) : [];
-  searxResults = sx.status === 'fulfilled' ? (sx.value || []) : [];
-  osmResults = osm.status === 'fulfilled' ? (osm.value || []) : [];
-  const freeEarly = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0);
-  console.log(`[SEARCH] Free results after parallel stage: ${freeEarly}`);
-  
-  // Step 4: Bing Search API (FREE, 3,000/month) - SUPPLEMENT
-  try {
-    if (process.env.BING_API_KEY) {
-      console.log('[SEARCH] 🔍 Bing Search API (free supplement)...');
-      bingResults = await searchBing(query, country, location, maxResults);
-    } else {
-      console.log('[SEARCH] 💡 Bing API key not set (3,000 free/month)');
+  // For digital businesses, prioritize web search APIs (Bing, Google Custom Search) early
+  // For physical businesses, try location-based APIs first
+  if (isDigital) {
+    // Digital businesses: Try Bing and Google Custom Search early (in parallel with location APIs)
+    const bingPromise = (async () => {
+      try {
+        if (process.env.BING_API_KEY) {
+          console.log('[SEARCH] 🔍 Bing Search API (prioritized for digital businesses)...');
+          return await withTimeout(searchBing(query, country, location, maxResults), 'Bing', 15000);
+        } else {
+          console.log('[SEARCH] ⚠️  Bing API key missing (CRITICAL for digital businesses)');
+          console.log('[SEARCH] 💡 Get free key: https://www.microsoft.com/en-us/bing/apis/bing-web-search-api');
+          console.log('[SEARCH] 💡 Add to .env: BING_API_KEY=your_key');
+        }
+        return [];
+      } catch (e) {
+        console.log(`[SEARCH] ⚠️  Bing failed: ${e.message}`);
+        return [];
+      }
+    })();
+    
+    const customSearchPromise = (async () => {
+      try {
+        if (process.env.GOOGLE_CSE_ID && process.env.GOOGLE_API_KEY) {
+          const { searchGoogleCustomSearch } = await import('./searchProviders.js');
+          console.log('[SEARCH] 🔍 Google Custom Search (prioritized for digital businesses)...');
+          return await withTimeout(searchGoogleCustomSearch(query, country, location, maxResults), 'Google Custom Search', 15000);
+        }
+        return [];
+      } catch (e) {
+        console.log(`[SEARCH] ⚠️  Google Custom Search failed: ${e.message}`);
+        return [];
+      }
+    })();
+    
+    // Wait for web search APIs and location APIs in parallel
+    const [ovr, sx, osm, bing, custom] = await Promise.allSettled([
+      overpassPromise, 
+      searxPromise, 
+      osmPromise,
+      bingPromise,
+      customSearchPromise
+    ]);
+    overpassResults = ovr.status === 'fulfilled' ? (ovr.value || []) : [];
+    searxResults = sx.status === 'fulfilled' ? (sx.value || []) : [];
+    osmResults = osm.status === 'fulfilled' ? (osm.value || []) : [];
+    bingResults = bing.status === 'fulfilled' ? (bing.value || []) : [];
+    customSearchResults = custom.status === 'fulfilled' ? (custom.value || []) : [];
+  } else {
+    // Physical businesses: Try location APIs first, then web search APIs
+    const [ovr, sx, osm] = await Promise.allSettled([overpassPromise, searxPromise, osmPromise]);
+    overpassResults = ovr.status === 'fulfilled' ? (ovr.value || []) : [];
+    searxResults = sx.status === 'fulfilled' ? (sx.value || []) : [];
+    osmResults = osm.status === 'fulfilled' ? (osm.value || []) : [];
+    
+    // Try Bing as supplement for physical businesses
+    try {
+      if (process.env.BING_API_KEY) {
+        console.log('[SEARCH] 🔍 Bing Search API (free supplement)...');
+        bingResults = await searchBing(query, country, location, maxResults);
+      } else {
+        console.log('[SEARCH] 💡 Bing API key not set (3,000 free/month)');
+      }
+    } catch (bingError) {
+      console.log(`[SEARCH] ⚠️  Bing failed: ${bingError.message}`);
     }
-  } catch (bingError) {
-    console.log(`[SEARCH] ⚠️  Bing failed: ${bingError.message}`);
   }
   
+  const freeEarly = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0);
+  console.log(`[SEARCH] Free results after parallel stage: ${freeEarly}`);
+  
   // Step 5: Google Places API (PAID, use when free methods fail or need more)
-  const freeResultsCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0);
+  const freeResultsCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0);
   
   // Use Google Places API if:
   // 1. Free methods returned < minResults, OR
@@ -413,6 +546,16 @@ export async function fetchGoogleResults(query, country = null, location = null,
     });
   }
   
+  // Add Google Custom Search (FREE tier: 100 queries/day) - for digital businesses
+  if (customSearchResults?.length > 0) {
+    customSearchResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+  
   // Add Google Places (PAID)
   if (placesResults?.length > 0) {
     placesResults.forEach(result => {
@@ -425,15 +568,16 @@ export async function fetchGoogleResults(query, country = null, location = null,
   
   if (allResults.length > 0) {
     const finalResults = allResults.slice(0, maxResults);
-    const freeCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (ddgSupplement?.length || 0);
+    const freeCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0) + (ddgSupplement?.length || 0);
     const paidCount = placesResults?.length || 0;
-    console.log(`[SEARCH] ✅ Combined: ${freeCount} FREE (${overpassResults?.length || 0} Overpass + ${searxResults?.length || 0} SearxNG + ${osmResults?.length || 0} OSM + ${bingResults?.length || 0} Bing + ${ddgSupplement?.length || 0} DDG) + ${paidCount} PAID = ${finalResults.length} total`);
+    console.log(`[SEARCH] ✅ Combined: ${freeCount} FREE (${overpassResults?.length || 0} Overpass + ${searxResults?.length || 0} SearxNG + ${osmResults?.length || 0} OSM + ${bingResults?.length || 0} Bing + ${customSearchResults?.length || 0} Custom Search + ${ddgSupplement?.length || 0} DDG) + ${paidCount} PAID = ${finalResults.length} total`);
     // Build provider telemetry and shortfall reason
     const telemetry = {
       overpass: overpassResults?.length || 0,
       searxng: searxResults?.length || 0,
       osm: osmResults?.length || 0,
       bing: bingResults?.length || 0,
+      customSearch: customSearchResults?.length || 0,
       ddg: ddgSupplement?.length || 0,
       places: placesResults?.length || 0
     };
@@ -506,13 +650,14 @@ export async function fetchGoogleResults(query, country = null, location = null,
   }
   
   // All methods failed
-  const errorMsg = `All search methods failed. 
+  const isDigitalHint = isDigital ? '\n⚠️  CRITICAL: This is a digital/software business query. Bing Search API is REQUIRED for reliable results.\n' : '';
+  const errorMsg = `All search methods failed.${isDigitalHint}
 
 🔧 SOLUTIONS:
-1. ✅ OpenStreetMap should work (free, unlimited) - check logs above
-2. ✅ Set up Bing Search API (3,000 queries/month free):
+1. ✅ Set up Bing Search API (3,000 queries/month free) - ${isDigital ? 'CRITICAL for digital businesses' : 'Recommended'}:
    - Get key: https://www.microsoft.com/en-us/bing/apis/bing-web-search-api
    - Add to .env: BING_API_KEY=your_key
+2. ✅ OpenStreetMap should work (free, unlimited) - check logs above
 3. ✅ Optional: Google Places API ($200 free/month):
    - Add to .env: GOOGLE_PLACES_API_KEY=your_key`;
   
