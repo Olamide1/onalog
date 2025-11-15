@@ -192,6 +192,7 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue';
 import api from '../services/api';
+import { useAuthStore } from '../stores/auth';
 
 const emit = defineEmits(['search']);
 
@@ -207,6 +208,7 @@ const savedSearches = ref([]);
 const showTemplates = ref(false);
 const loadingTemplates = ref(false);
 const currentSearchId = ref(null);
+const authStore = useAuthStore();
 
 async function handleSubmit() {
   if (!formData.value.query.trim()) return;
@@ -320,6 +322,13 @@ watch(showTemplates, async (newVal) => {
 });
 
 onMounted(() => {
+  // Initialize default result count from user preference if available
+  // (User can still change per-search via the selector.)
+  try {
+    if (authStore?.user?.defaultResultCount) {
+      formData.value.resultCount = Number(authStore.user.defaultResultCount) || 50;
+    }
+  } catch {}
   // Don't load templates on mount - only when user opens the section
   // This improves initial page load
 });

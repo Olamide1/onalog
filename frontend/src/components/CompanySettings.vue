@@ -62,10 +62,31 @@
       <div v-if="saving" class="saving-indicator">
         Saving...
       </div>
+      <div v-if="saved" class="saved-indicator">
+        Saved
+      </div>
     </div>
     
     <div v-else class="settings-readonly">
       <p>Contact your company admin to change these settings</p>
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3>Share Searches</h3>
+        </div>
+        <span class="badge" :class="{ on: settings.shareSearches }">{{ settings.shareSearches ? 'On' : 'Off' }}</span>
+      </div>
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3>Share Leads</h3>
+        </div>
+        <span class="badge" :class="{ on: settings.shareLeads }">{{ settings.shareLeads ? 'On' : 'Off' }}</span>
+      </div>
+      <div class="setting-item">
+        <div class="setting-info">
+          <h3>Share Templates</h3>
+        </div>
+        <span class="badge" :class="{ on: settings.shareTemplates }">{{ settings.shareTemplates ? 'On' : 'Off' }}</span>
+      </div>
     </div>
   </div>
 </template>
@@ -91,6 +112,7 @@ const settings = ref({
   shareTemplates: true
 });
 const saving = ref(false);
+const saved = ref(false);
 
 async function loadSettings() {
   try {
@@ -109,6 +131,8 @@ async function updateSettings() {
     await api.put('/company/settings', settings.value);
     // Reload to get updated settings
     await loadSettings();
+    saved.value = true;
+    setTimeout(() => { saved.value = false; }, 1500);
   } catch (error) {
     console.error('Error updating settings:', error);
     alert('Failed to update settings. Please try again.');
@@ -256,11 +280,27 @@ input:disabled + .toggle-slider {
   padding: var(--spacing-md);
   color: #666;
 }
+.saved-indicator {
+  text-align: center;
+  padding: var(--spacing-xs);
+  color: #2e7d32;
+  font-weight: var(--font-weight-semibold);
+}
 
 .settings-readonly {
   padding: var(--spacing-lg);
   text-align: center;
   color: #666;
+}
+.badge {
+  border: var(--border-medium) solid var(--neutral-2);
+  padding: 4px 10px;
+  border-radius: 16px;
+  font-weight: var(--font-weight-semibold);
+}
+.badge.on {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>
 
