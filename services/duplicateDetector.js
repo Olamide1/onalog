@@ -2,30 +2,67 @@ import Lead from '../models/Lead.js';
 
 /**
  * Detect and mark duplicate leads
+ * FIXED: Now checks within the same search AND other searches
  */
 export async function detectDuplicates(newLead, searchId) {
   try {
-    // Check for duplicates by website (most reliable)
-    if (newLead.website) {
+    // Normalize website URL for comparison
+    const normalizeUrl = (url) => {
+      if (!url) return '';
+      try {
+        const urlObj = new URL(url);
+        return urlObj.hostname.replace('www.', '').toLowerCase();
+      } catch {
+        return url.toLowerCase();
+      }
+    };
+    
+    const normalizedWebsite = normalizeUrl(newLead.website);
+    
+    // Check for duplicates by website (most reliable) - WITHIN SAME SEARCH
+    if (normalizedWebsite) {
       const websiteDuplicate = await Lead.findOne({
-        website: newLead.website,
-        searchId: { $ne: searchId },
-        isDuplicate: false
+        $or: [
+          { website: newLead.website },
+          { website: { $regex: new RegExp(normalizedWebsite.replace(/\./g, '\\.'), 'i') } }
+        ],
+        searchId: searchId, // Check within same search
+        isDuplicate: false,
+        _id: { $ne: newLead._id }
       });
       
       if (websiteDuplicate) {
+        console.log(`[DUPLICATE] Found duplicate by website in same search: ${newLead.website}`);
         return {
           isDuplicate: true,
           duplicateOf: websiteDuplicate._id
         };
       }
+      
+      // Also check other searches
+      const websiteDuplicateOther = await Lead.findOne({
+        $or: [
+          { website: newLead.website },
+          { website: { $regex: new RegExp(normalizedWebsite.replace(/\./g, '\\.'), 'i') } }
+        ],
+        searchId: { $ne: searchId },
+        isDuplicate: false
+      });
+      
+      if (websiteDuplicateOther) {
+        console.log(`[DUPLICATE] Found duplicate by website in other search: ${newLead.website}`);
+        return {
+          isDuplicate: true,
+          duplicateOf: websiteDuplicateOther._id
+        };
+      }
     }
     
-    // Check for duplicates by company name (fuzzy match)
-    if (newLead.companyName) {
+    // Check for duplicates by company name (fuzzy match) - WITHIN SAME SEARCH
+    if (newLead.companyName && newLead.companyName.length > 3) {
       const nameDuplicate = await Lead.findOne({
-        companyName: { $regex: new RegExp(newLead.companyName, 'i') },
-        searchId: { $ne: searchId },
+        companyName: { $regex: new RegExp(newLead.companyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') },
+        searchId: searchId, // Check within same search
         isDuplicate: false,
         _id: { $ne: newLead._id }
       });
@@ -38,9 +75,33 @@ export async function detectDuplicates(newLead, searchId) {
         );
         
         if (similarity > 0.85) {
+          console.log(`[DUPLICATE] Found duplicate by name in same search: ${newLead.companyName} (similarity: ${similarity.toFixed(2)})`);
           return {
             isDuplicate: true,
             duplicateOf: nameDuplicate._id
+          };
+        }
+      }
+      
+      // Also check other searches
+      const nameDuplicateOther = await Lead.findOne({
+        companyName: { $regex: new RegExp(newLead.companyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') },
+        searchId: { $ne: searchId },
+        isDuplicate: false,
+        _id: { $ne: newLead._id }
+      });
+      
+      if (nameDuplicateOther) {
+        const similarity = calculateSimilarity(
+          newLead.companyName.toLowerCase(),
+          nameDuplicateOther.companyName.toLowerCase()
+        );
+        
+        if (similarity > 0.85) {
+          console.log(`[DUPLICATE] Found duplicate by name in other search: ${newLead.companyName} (similarity: ${similarity.toFixed(2)})`);
+          return {
+            isDuplicate: true,
+            duplicateOf: nameDuplicateOther._id
           };
         }
       }
@@ -52,7 +113,7 @@ export async function detectDuplicates(newLead, searchId) {
     };
     
   } catch (error) {
-    console.error('❌ Duplicate detection error:', error.message);
+    console.error('[DUPLICATE] ❌ Error:', error.message);
     return {
       isDuplicate: false,
       duplicateOf: null

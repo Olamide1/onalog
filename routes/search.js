@@ -3,7 +3,8 @@ import Search from '../models/Search.js';
 import Lead from '../models/Lead.js';
 import Company from '../models/Company.js';
 import { fetchGoogleResults } from '../services/googleSearch.js';
-import { extractContactInfo } from '../services/extractor.js';
+import { isDirectorySite } from '../services/searchProviders.js';
+import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives } from '../services/extractor.js';
 import { enrichLead } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
 import jwt from 'jsonwebtoken';
@@ -129,6 +130,26 @@ router.get('/:id', async (req, res) => {
     
   } catch (error) {
     console.error('Search fetch error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/search - List searches (most recent first)
+ * Optional query params: limit, status
+ */
+router.get('/', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const status = req.query.status;
+    
+    const filter = {};
+    if (status) filter.status = status;
+    
+    const searches = await Search.find(filter).sort({ createdAt: -1 }).limit(limit);
+    res.json({ searches });
+  } catch (error) {
+    console.error('List searches error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -269,30 +290,143 @@ router.get('/templates/list', async (req, res) => {
  * Async search processing function
  */
 async function processSearch(searchId) {
+  const startTime = Date.now();
+  console.log(`[PROCESS] ========================================`);
+  console.log(`[PROCESS] Starting search processing: ${searchId}`);
+  console.log(`[PROCESS] ========================================`);
+  
   try {
     const search = await Search.findById(searchId);
-    if (!search) return;
+    if (!search) {
+      console.error(`[PROCESS] ❌ Search not found: ${searchId}`);
+      return;
+    }
     
-    // Step 1: Google Search
+    console.log(`[PROCESS] Search params:`, {
+      query: search.query,
+      country: search.country,
+      location: search.location,
+      resultCount: search.resultCount
+    });
+    
+    // Step 1: Google Search / Google Places
     search.status = 'searching';
     await search.save();
+    console.log(`[PROCESS] Step 1/3: Searching...`);
     
-    console.log(`🔍 Starting search: ${search.query}`);
-    const googleResults = await fetchGoogleResults(
+    const searchStartTime = Date.now();
+    const fetchedResults = await fetchGoogleResults(
       search.query,
       search.country,
       search.location,
       search.resultCount
     );
+    const googleResults = Array.isArray(fetchedResults) ? fetchedResults : (fetchedResults.results || []);
+    if (!Array.isArray(fetchedResults)) {
+      search.providers = fetchedResults.telemetry || {};
+      search.reasonShortfall = fetchedResults.reasonShortfall || '';
+      await search.save();
+    }
+    const searchDuration = Date.now() - searchStartTime;
     
-    search.totalResults = googleResults.length;
+    console.log(`[PROCESS] ✅ Search completed in ${searchDuration}ms`);
+    console.log(`[PROCESS] Found ${googleResults.length} raw results (requested: ${search.resultCount})`);
+    
+    if (googleResults.length === 0) {
+      console.warn(`[PROCESS] ⚠️  No results found for query: ${search.query}`);
+      search.status = 'completed';
+      search.totalResults = 0;
+      search.extractedCount = 0;
+      search.enrichedCount = 0;
+      search.completedAt = new Date();
+      await search.save();
+      return;
+    }
+    
+    // Deduplicate results at search level BEFORE extraction
+    // IMPORTANT: For Google search links (OSM results without websites), dedupe by business name + location
+    // For real websites, dedupe by hostname
+    console.log(`[PROCESS] Deduplicating ${googleResults.length} search results...`);
+    const seenUrls = new Set();
+    const seenBusinessNames = new Set(); // For Google search links
+    const uniqueResults = [];
+    
+    for (const result of googleResults) {
+      try {
+        const url = new URL(result.link);
+        const isGoogleSearchLink = url.hostname.includes('google.com') && url.pathname.includes('/search');
+        
+        if (isGoogleSearchLink) {
+          // For Google search links, deduplicate by business name + snippet (location)
+          const businessKey = `${result.title.toLowerCase().trim()}_${(result.snippet || '').toLowerCase().trim()}`;
+          if (!seenBusinessNames.has(businessKey)) {
+            seenBusinessNames.add(businessKey);
+            uniqueResults.push(result);
+          } else {
+            console.log(`[PROCESS] Skipping duplicate business: ${result.title} (${result.snippet})`);
+          }
+        } else {
+          // For real websites, deduplicate by hostname
+          const normalizedUrl = url.hostname.replace('www.', '').toLowerCase();
+          if (!seenUrls.has(normalizedUrl)) {
+            seenUrls.add(normalizedUrl);
+            uniqueResults.push(result);
+          } else {
+            console.log(`[PROCESS] Skipping duplicate URL: ${result.link}`);
+          }
+        }
+      } catch (e) {
+        // If URL parsing fails, include it anyway (might be a business name search)
+        uniqueResults.push(result);
+      }
+    }
+    
+    console.log(`[PROCESS] After deduplication: ${uniqueResults.length} unique results (removed ${googleResults.length - uniqueResults.length} duplicates)`);
+    
+    search.totalResults = uniqueResults.length;
     search.status = 'extracting';
     await search.save();
     
-    // Step 2: Extract contact info
+    // Pre-process: expand directory/list pages into individual company links
+    const expandedResults = [];
+    for (const r of uniqueResults) {
+      const shouldExpand = (() => {
+        try { return isDirectorySite(r.link); } catch { return false; }
+      })();
+      if (shouldExpand) {
+        try {
+          console.log(`[PROCESS] Expanding directory/list page: ${r.link}`);
+          const derived = await expandDirectoryCompanies(r.link, Math.max(10, Math.min(40, search.resultCount)));
+          if (derived && derived.length > 0) {
+            expandedResults.push(...derived);
+            continue;
+          }
+        } catch (e) {
+          console.log(`[PROCESS] Directory expansion failed: ${e.message}`);
+        }
+        // Skip the directory entry if no derived items
+        continue;
+      }
+      expandedResults.push(r);
+    }
+    
+    // Step 2: Extract contact info (early-return at 20, background fill)
+    const initialTarget = Math.min(30, expandedResults.length);
+    const MAX_WORKERS = 4; // cap parallelism
+    const TIME_BUDGET_MS = 25000; // ~25s budget for initial reveal
+    const deadline = Date.now() + TIME_BUDGET_MS;
+    const initialBatch = expandedResults.slice(0, initialTarget);
+    const backgroundBatch = expandedResults.slice(initialTarget);
+    console.log(`[PROCESS] Step 2/3: Extracting up to ${initialBatch.length} initially (budget ${TIME_BUDGET_MS}ms, of ${expandedResults.length})...`);
     const leads = [];
-    for (let i = 0; i < googleResults.length; i++) {
-      const result = googleResults[i];
+    let extractedCount = 0;
+    let errorCount = 0;
+
+    async function processOne(result, i, total) {
+      const itemStartTime = Date.now();
+      
+      console.log(`[PROCESS] [${i + 1}/${total}] Processing: ${result.title}`);
+      console.log(`[PROCESS] [${i + 1}/${total}] URL: ${result.link}`);
       
       try {
         // Create lead record
@@ -306,70 +440,260 @@ async function processSearch(searchId) {
           extractionStatus: 'extracting'
         });
         
-        // Extract contact info
-        const extracted = await extractContactInfo(result.link);
+        // Extract contact info (pass search country for phone formatting)
+        const extractStartTime = Date.now();
+        const extracted = await extractContactInfo(result.link, search.country);
+        const extractDuration = Date.now() - extractStartTime;
+        
+        console.log(`[PROCESS] [${i + 1}/${total}] Extraction took ${extractDuration}ms`);
         
         // Merge extracted data
         lead.companyName = extracted.companyName || lead.companyName;
-        lead.emails = extracted.emails;
-        lead.phoneNumbers = extracted.phoneNumbers;
+        // Use extracted website if it's better (canonical URL, etc.)
+        if (extracted.website && extracted.website !== result.link) {
+          lead.website = extracted.website;
+          console.log(`[PROCESS] [${i + 1}/${total}] Using extracted website: ${extracted.website}`);
+        } else {
+          lead.website = result.link;
+        }
+        
+        // Guard: first‑party vs directory classifier
+        try {
+          if (lead.website) {
+            const { quickClassifyUrl } = await import('../services/extractor.js');
+            const cls = await quickClassifyUrl(lead.website);
+            // Only skip when strongly directory (negative score). Borderline (0) proceeds.
+            if (cls && typeof cls.score === 'number' && cls.score < 0) {
+              console.log(`[PROCESS] [${i + 1}/${total}] Classified as directory/list (score=${cls.score}): ${lead.website}. Skipping.`);
+              return;
+            }
+          }
+        } catch (clsErr) {
+          console.log(`[PROCESS] [${i + 1}/${total}] Classifier error (continuing): ${clsErr.message}`);
+        }
+        
+        // If result has phone/address from Places API, use it
+        if (result.phone && (!extracted.phoneNumbers || extracted.phoneNumbers.length === 0)) {
+          const countryCode = search.country || null;
+          const formattedPhone = formatPhone(result.phone, countryCode);
+          lead.phoneNumbers = [{
+            phone: formattedPhone,
+            country: detectCountry(formattedPhone),
+            formatted: formattedPhone,
+            source: 'google_places_api',
+            confidence: 0.95
+          }];
+          console.log(`[PROCESS] [${i + 1}/${total}] Using phone from Places API: ${formattedPhone}`);
+        }
+        
+        if (result.address && !extracted.address) {
+          lead.address = result.address;
+          console.log(`[PROCESS] [${i + 1}/${total}] Using address from Places API: ${result.address}`);
+        }
+        
+        // Filter emails - only keep valid business emails
+        lead.emails = (extracted.emails || []).filter(email => {
+          const emailStr = email.email || email;
+          // Filter out generic/non-business emails
+          return !emailStr.includes('noreply') && 
+                 !emailStr.includes('no-reply') &&
+                 !emailStr.includes('donotreply') &&
+                 !emailStr.includes('example.com');
+        });
+        
+        // Filter phone numbers - only keep valid ones
+        lead.phoneNumbers = (extracted.phoneNumbers || []).filter(phone => {
+          const phoneStr = phone.phone || phone;
+          // Additional validation
+          if (!phoneStr || phoneStr.length < 10) return false;
+          // Reject obviously wrong numbers
+          if (phoneStr.match(/^[01]{8,}$/)) return false; // All 0s or 1s
+          if (phoneStr.match(/^\d{1,3}$/)) return false; // Too short
+          return true;
+        });
         lead.whatsappLinks = extracted.whatsappLinks;
         lead.socials = extracted.socials;
         lead.address = extracted.address;
         lead.aboutText = extracted.aboutText;
         lead.categorySignals = extracted.categorySignals;
+        
+        // Process decision makers and generate emails
+        if (extracted.decisionMakers && extracted.decisionMakers.length > 0) {
+          console.log(`[PROCESS] [${i + 1}/${total}] Found ${extracted.decisionMakers.length} decision makers from website`);
+          
+          // Generate emails for decision makers if we have email pattern
+          lead.decisionMakers = extracted.decisionMakers.map(dm => {
+            // Will be enriched with email pattern later
+            return {
+              name: dm.name,
+              title: dm.title,
+              email: null, // Will be generated during enrichment
+              source: dm.source,
+              confidence: dm.confidence
+            };
+          });
+        }
+        
+        // Executive discovery (business execs) if we still have few/no names
+        try {
+          const siteForDiscovery = lead.website || extracted.website || result.link;
+          if ((!lead.decisionMakers || lead.decisionMakers.length < 3) && siteForDiscovery) {
+            console.log(`[PROCESS] [${i + 1}/${total}] Discovering executives on ${siteForDiscovery}...`);
+            const execs = await discoverExecutives(siteForDiscovery);
+            if (execs && execs.length > 0) {
+              const existing = new Set((lead.decisionMakers || []).map(dm => (dm.name || '').toLowerCase()));
+              const merged = [...(lead.decisionMakers || [])];
+              for (const e of execs) {
+                const key = (e.name || '').toLowerCase();
+                if (!existing.has(key)) {
+                  merged.push({ name: e.name, title: e.title, email: null, source: e.source, confidence: e.confidence || 0.6 });
+                  existing.add(key);
+                }
+                if (merged.length >= 12) break;
+              }
+              lead.decisionMakers = merged;
+            }
+          }
+        } catch (discErr) {
+            console.log(`[PROCESS] [${i + 1}/${total}] Exec discovery skipped: ${discErr.message}`);
+        }
+        
         lead.extractionStatus = 'extracted';
         
         // Check for duplicates
         const duplicateCheck = await detectDuplicates(lead, search._id);
-        lead.isDuplicate = duplicateCheck.isDuplicate;
-        lead.duplicateOf = duplicateCheck.duplicateOf;
+        // Only treat as duplicate if it's a duplicate within THIS search.
+        // Cross-search duplicates are allowed so users can run fresh queries and still see results.
+        const dupOf = duplicateCheck.duplicateOf;
+        const isSameSearchDup = duplicateCheck.isDuplicate &&
+          dupOf && String(dupOf) === String(search._id);
+        lead.isDuplicate = isSameSearchDup;
+        lead.duplicateOf = dupOf || null;
         
         await lead.save();
         
         if (!lead.isDuplicate) {
           leads.push(lead);
-        }
-        
-        // Step 3: Enrich lead
-        if (!lead.isDuplicate) {
+          extractedCount++;
+          
+          // Step 3: Enrich lead
+          console.log(`[PROCESS] [${i + 1}/${total}] Enriching lead...`);
           lead.enrichmentStatus = 'enriching';
           await lead.save();
           
-          const enrichment = await enrichLead({
-            companyName: lead.companyName,
-            website: lead.website,
-            aboutText: lead.aboutText,
-            categorySignals: lead.categorySignals,
-            emails: lead.emails,
-            phoneNumbers: lead.phoneNumbers,
-            socials: lead.socials
-          });
-          
-          lead.enrichment = enrichment;
-          lead.enrichmentStatus = 'enriched';
-          await lead.save();
+          try {
+            const enrichStartTime = Date.now();
+            const enrichment = await enrichLead({
+              companyName: lead.companyName,
+              website: lead.website,
+              aboutText: lead.aboutText,
+              categorySignals: lead.categorySignals,
+              emails: lead.emails,
+              phoneNumbers: lead.phoneNumbers,
+              socials: lead.socials,
+              decisionMakers: lead.decisionMakers || [] // Pass extracted decision makers
+            });
+            const enrichDuration = Date.now() - enrichStartTime;
+            
+            lead.enrichment = enrichment;
+            
+            // Update decision makers with enriched data (emails generated)
+            if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
+              lead.decisionMakers = enrichment.decisionMakers;
+            console.log(`[PROCESS] [${i + 1}/${total}] Enriched ${enrichment.decisionMakers.length} decision makers with emails`);
+            }
+            
+            lead.enrichmentStatus = 'enriched';
+            await lead.save();
+            
+          console.log(`[PROCESS] [${i + 1}/${total}] ✅ Enrichment complete (${enrichDuration}ms)`);
+          } catch (enrichError) {
+          console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error:`, enrichError.message);
+            lead.enrichmentStatus = 'failed';
+            await lead.save();
+          }
+        } else {
+        console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate detected, skipping`);
         }
         
-        console.log(`✅ Processed ${i + 1}/${googleResults.length}: ${lead.companyName}`);
+        const itemDuration = Date.now() - itemStartTime;
+      console.log(`[PROCESS] [${i + 1}/${total}] ✅ Complete in ${itemDuration}ms: ${lead.companyName}`);
+      console.log(`[PROCESS] [${i + 1}/${total}]   - Emails: ${lead.emails.length}, Phones: ${lead.phoneNumbers.length}, Website: ${lead.website ? 'Yes' : 'No'}`);
         
-      } catch (error) {
-        console.error(`❌ Error processing ${result.link}:`, error.message);
+        // Update search progress
+        search.extractedCount = extractedCount;
+        search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
+      if (i % 5 === 0 || i === total - 1) {
+          await search.save();
+        }
+        
+    } catch (error) {
+        errorCount++;
+      console.error(`[PROCESS] [${i + 1}/${total}] ❌ Error processing ${result.link}:`, error.message);
+      console.error(`[PROCESS] [${i + 1}/${total}] Error stack:`, error.stack);
       }
     }
+
+    // Run initial batch with a small worker pool and a time budget
+    let scheduled = 0;
+    let completed = 0;
+    const totalInit = initialBatch.length;
+    async function worker(wid) {
+      while (scheduled < totalInit && Date.now() < deadline) {
+        const idx = scheduled++;
+        await processOne(initialBatch[idx], idx, totalInit);
+        completed++;
+      }
+    }
+    const workers = [];
+    const pool = Math.min(MAX_WORKERS, totalInit);
+    for (let w = 0; w < pool; w++) workers.push(worker(w));
+    await Promise.all(workers);
+    // Anything not processed in the initial batch due to time is moved to background
+    const leftoverFromInitial = initialBatch.slice(completed);
+    const bgList = [...leftoverFromInitial, ...backgroundBatch];
     
-    // Update search status
-    search.status = 'enriching';
-    search.extractedCount = leads.length;
-    search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
+    // Mark as completed for UX; background fill continues
     search.status = 'completed';
+    search.extractedCount = extractedCount;
+    search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
     search.completedAt = new Date();
     await search.save();
+
+    if (bgList.length > 0) {
+      console.log(`[PROCESS] 🔄 Background fill: remaining ${bgList.length} results...`);
+      setImmediate(async () => {
+        for (let j = 0; j < bgList.length; j++) {
+          await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
+        }
+        const s = await Search.findById(search._id);
+        if (s) {
+          s.extractedCount = extractedCount;
+          s.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
+          s.completedAt = new Date();
+          await s.save();
+        }
+        console.log(`[PROCESS] 🔄 Background fill complete.`);
+      });
+    }
     
-    console.log(`✅ Search completed: ${search.query} - ${leads.length} leads`);
+    const totalDuration = Date.now() - startTime;
+    console.log(`[PROCESS] ========================================`);
+    console.log(`[PROCESS] ✅ Search processing complete!`);
+    console.log(`[PROCESS] Total time: ${totalDuration}ms (${(totalDuration / 1000).toFixed(2)}s)`);
+    console.log(`[PROCESS] Results: ${uniqueResults.length} found (${googleResults.length} before dedup), ${extractedCount} extracted, ${search.enrichedCount} enriched`);
+    console.log(`[PROCESS] Duplicates removed: ${googleResults.length - uniqueResults.length}`);
+    console.log(`[PROCESS] Errors: ${errorCount}`);
+    console.log(`[PROCESS] ========================================`);
     
   } catch (error) {
-    console.error('❌ Search processing error:', error);
+    const totalDuration = Date.now() - startTime;
+    console.error(`[PROCESS] ========================================`);
+    console.error(`[PROCESS] ❌ Search processing error after ${totalDuration}ms:`);
+    console.error(`[PROCESS] Error:`, error.message);
+    console.error(`[PROCESS] Stack:`, error.stack);
+    console.error(`[PROCESS] ========================================`);
+    
     const search = await Search.findById(searchId);
     if (search) {
       search.status = 'failed';
@@ -379,4 +703,5 @@ async function processSearch(searchId) {
 }
 
 export default router;
+
 
