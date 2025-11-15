@@ -1,9 +1,11 @@
-import puppeteer from 'puppeteer';
-import { fetchGoogleResultsHTTP } from './googleSearchFallback.js';
-import { searchDuckDuckGo, searchGoogleCustomSearch, searchBing, searchGooglePlaces } from './searchProviders.js';
+// Cost-optimal search: Overpass (free) → SearxNG (free, optional) → OpenStreetMap (free) → Bing (free) → Google Places API (paid, only when needed)
+import { searchDuckDuckGo, searchBing, searchGooglePlaces, searchOpenStreetMap, searchOverpass, searchSearxng } from './searchProviders.js';
+import OpenAI from 'openai';
+import dotenv from 'dotenv';
+dotenv.config();
 
 /**
- * Build optimized Google search query
+ * Build optimized search query (kept for compatibility)
  */
 export function buildGoogleQuery(query, country = null, location = null) {
   let searchQuery = query;
@@ -24,268 +26,455 @@ export function buildGoogleQuery(query, country = null, location = null) {
   return searchQuery;
 }
 
+// Expand category terms for locales (lightweight)
+function getExpandedCategoryTerms(query, country = null) {
+  // New adaptive expansion uses the ontology below; this is retained for backward compatibility
+  const q = (query || '').toLowerCase().trim();
+  const terms = [query];
+  const isSpanish = ['es','mx','ar','co','cl','pe','uy','bo','ec','ve','cr','do','gt','hn','ni','pa','pr','sv'].includes((country || '').toLowerCase());
+  const isPortuguese = ['pt','br'].includes((country || '').toLowerCase());
+  const push = (t) => { if (!terms.some(x => x.toLowerCase() === t.toLowerCase())) terms.push(t); };
+  if (q.includes('hospital')) {
+    push('hospitals'); push('medical center'); push('healthcare group');
+    if (isSpanish) { push('clínica'); push('clinica'); push('centro médico'); push('grupo sanitario'); }
+    if (isPortuguese) { push('clínica'); push('clinica'); push('centro médico'); push('grupo de saúde'); }
+  }
+  if (q.includes('fintech')) {
+    push('fintech'); push('fintech startup'); push('payments company'); push('payment processor');
+    push('mobile money'); push('digital bank'); push('neo bank'); push('lending platform');
+    push('loan app'); push('microfinance'); push('remittance');
+    if (isSpanish) { push('empresa de pagos'); push('banca digital'); push('plataforma de préstamos'); push('microfinanzas'); push('remesas'); }
+    if (isPortuguese) { push('empresa de pagamentos'); push('banco digital'); push('plataforma de empréstimos'); push('microfinanças'); push('remessas'); }
+  }
+  // Real estate
+  if (q.includes('real estate') || q.includes('estate agent') || q.includes('realtor') || q.includes('imobili') || q.includes('agência imobili')) {
+    push('real estate'); push('estate agents'); push('estate agent'); push('realtor'); push('property agency'); push('broker');
+    if (isSpanish) { push('inmobiliaria'); push('agencia inmobiliaria'); push('corredor de bienes raíces'); }
+    if (isPortuguese) { push('imobiliária'); push('agência imobiliária'); push('corretor'); push('mediação imobiliária'); }
+  }
+  return terms;
+}
+
+// ---------------------------
+// Concept Ontology (minimal)
+// ---------------------------
+const ONTOLOGY = {
+  Cafe: {
+    labels: ['coffee shop', 'cafe', 'café', 'cafeteria', 'roastery', 'espresso bar'],
+    locales: {
+      pt: ['café', 'cafeteria', 'torrefação'],
+      es: ['cafetería', 'tostaduría'],
+      fr: ['café', 'cafétéria'],
+    },
+    osm: {
+      tags: [{ amenity: 'cafe' }, { shop: 'coffee' }],
+      nameHints: ['cafe', 'café', 'cafeteria', 'roastery', 'espresso']
+    }
+  },
+  RealEstateAgency: {
+    labels: ['real estate', 'estate agent', 'realtor', 'property agency'],
+    locales: {
+      pt: ['imobiliária', 'agência imobiliária', 'corretor'],
+      es: ['inmobiliaria', 'agencia inmobiliaria', 'corredor'],
+    },
+    osm: {
+      tags: [{ office: 'estate_agent' }],
+      nameHints: ['real estate', 'imobili', 'inmobili', 'realtor', 'agency']
+    }
+  },
+  GelatoIceCream: {
+    labels: ['gelato', 'ice cream', 'gelateria', 'ice-cream'],
+    locales: {
+      it: ['gelato', 'gelateria'],
+      es: ['helado', 'heladería'],
+      pt: ['sorvete', 'gelado', 'geladaria']
+    },
+    osm: {
+      tags: [{ amenity: 'ice_cream' }, { shop: 'ice_cream' }, { cuisine: 'ice_cream' }],
+      nameHints: ['gelato','ice cream','gelateria','helado','sorvete','gelado']
+    }
+  },
+  Bank: {
+    labels: ['bank', 'commercial bank', 'retail bank'],
+    locales: { es: ['banco'], pt: ['banco'] },
+    osm: { tags: [{ amenity: 'bank' }], nameHints: ['bank','banco'] }
+  },
+  Hospital: {
+    labels: ['hospital', 'medical center', 'clinic'],
+    locales: { es: ['hospital','centro médico','clínica'], pt: ['hospital','centro médico','clínica'] },
+    osm: {
+      tags: [{ amenity: 'hospital' }, { healthcare: 'hospital' }, { building: 'hospital' }],
+      nameHints: ['hospital','clinica','clínica','medical']
+    }
+  }
+};
+
+// In-memory short cache to avoid recomputing expansions repeatedly within a session
+const EXPANSION_CACHE = new Map(); // key -> { expansions, expiresAt }
+const EXPANSION_TTL = 15 * 60 * 1000;
+
+function getLocale(country) {
+  const c = (country || '').toLowerCase();
+  if (['pt','br'].includes(c)) return 'pt';
+  if (['es','mx','co','ar','cl','pe','uy','bo','ec','ve','cr','do','gt','hn','ni','pa','pr','sv'].includes(c)) return 'es';
+  if (['fr'].includes(c)) return 'fr';
+  return 'en';
+}
+
+function normalizeStr(s) {
+  return (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+async function llmExpandTerms(query, country, maxVariants = 8) {
+  try {
+    if (!process.env.OPENAI_API_KEY) return null;
+    const cacheKey = `llm:${normalizeStr(query)}|${getLocale(country)}`;
+    const hit = EXPANSION_CACHE.get(cacheKey);
+    if (hit && Date.now() < hit.expiresAt) return hit.expansions;
+
+    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+    const locale = getLocale(country);
+    const prompt = `Given the business search intent: "${query}" and locale "${locale}", return a concise JSON array of 4-10 short, distinct category/phrase variants that would help find more first‑party business results across the web and OpenStreetMap. 
+Rules:
+- Return ONLY a JSON array of strings, no prose.
+- Include localized terms if applicable.
+- Include singular/plural and close synonyms (avoid brand names or generic words like "best", "top").`;
+    const resp = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.15,
+      messages: [
+        { role: 'system', content: 'You generate compact category synonyms/variants for business search.' },
+        { role: 'user', content: prompt }
+      ]
+    });
+    const text = resp.choices?.[0]?.message?.content?.trim() || '[]';
+    let arr = [];
+    try {
+      arr = JSON.parse(text);
+    } catch {
+      // Try to salvage JSON array inside content
+      const m = text.match(/\[([\s\S]*?)\]/);
+      if (m) {
+        arr = JSON.parse(m[0]);
+      }
+    }
+    const cleaned = (Array.isArray(arr) ? arr : [])
+      .map(x => String(x).trim())
+      .filter(x => x.length > 0)
+      .slice(0, maxVariants);
+    if (cleaned.length > 0) {
+      EXPANSION_CACHE.set(cacheKey, { expansions: cleaned, expiresAt: Date.now() + EXPANSION_TTL });
+      return cleaned;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function detectConcept(query) {
+  const qn = normalizeStr(query);
+  for (const [concept, cfg] of Object.entries(ONTOLOGY)) {
+    const labels = (cfg.labels || []).map(normalizeStr);
+    if (labels.some(l => qn.includes(l))) return concept;
+  }
+  // heuristic fallbacks
+  if (qn.includes('gelato') || qn.includes('ice cream') || qn.includes('gelateria')) return 'GelatoIceCream';
+  if (qn.includes('coffee')) return 'Cafe';
+  if (qn.includes('estate') || qn.includes('imobili') || qn.includes('inmobili')) return 'RealEstateAgency';
+  if (qn.includes('bank')) return 'Bank';
+  if (qn.includes('hospital') || qn.includes('clinic')) return 'Hospital';
+  return null;
+}
+
+async function buildAdaptiveExpansions(query, country, maxVariants = 8) {
+  const cacheKey = `${normalizeStr(query)}|${getLocale(country)}`;
+  const hit = EXPANSION_CACHE.get(cacheKey);
+  if (hit && Date.now() < hit.expiresAt) return hit.expansions;
+
+  const locale = getLocale(country);
+  const concept = detectConcept(query);
+  const set = new Set([query]);
+  // 1) Try LLM expansions first
+  const llm = await llmExpandTerms(query, country, maxVariants);
+  if (llm && llm.length > 0) llm.forEach(t => set.add(t));
+  // add ontology variants
+  if (concept && ONTOLOGY[concept]) {
+    const cfg = ONTOLOGY[concept];
+    (cfg.labels || []).forEach(t => set.add(t));
+    (cfg.locales?.[locale] || []).forEach(t => set.add(t));
+    // light morphological variants
+    Array.from(set).forEach(t => {
+      if (!t.endsWith('s')) set.add(`${t}s`);
+    });
+  }
+  // de-diacriticized forms
+  const withPlain = new Set(Array.from(set).concat(Array.from(set).map(t => normalizeStr(t))));
+  const expansions = Array.from(withPlain).slice(0, maxVariants);
+  EXPANSION_CACHE.set(cacheKey, { expansions, expiresAt: Date.now() + EXPANSION_TTL });
+  return expansions;
+}
+
 /**
- * Fetch Google search results using Puppeteer
+ * Fetch search results - Cost-optimal: OpenStreetMap (free) → Bing (free) → Google Places API (paid, only when needed)
  */
 export async function fetchGoogleResults(query, country = null, location = null, maxResults = 50) {
-  let browser = null;
-  const maxRetries = 3;
-  let lastError = null;
+  console.log(`[SEARCH] Starting: "${query}", Country: ${country || 'none'}, Location: ${location || 'none'}, Max: ${maxResults}`);
   
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  const minResults = Math.min(20, Math.floor(maxResults * 0.4));
+  let overpassResults = [];
+  let searxResults = [];
+  let osmResults = [];
+  let bingResults = [];
+  let placesResults = [];
+  let ddgSupplement = [];
+
+  // Step 1: Kick off Overpass + SearxNG + OSM in parallel with strict timeouts
+  const withTimeout = (p, label, ms = 15000) => Promise.race([
+    p,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms))
+  ]);
+  console.log('[SEARCH] 🚀 Starting free providers in parallel (hard cutoffs)...');
+  // Use adaptive expansions
+  const overpassTerms = await buildAdaptiveExpansions(query, country, 8);
+  const osmTerms = overpassTerms;
+  const overpassPromise = (async () => {
     try {
-      browser = await puppeteer.launch({
-        headless: 'new',
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--disable-gpu',
-          '--disable-web-security',
-          '--disable-features=IsolateOrigins,site-per-process',
-          '--disable-blink-features=AutomationControlled',
-          '--window-size=1920,1080'
-        ],
-        timeout: 60000,
-        protocolTimeout: 120000,
-        ignoreHTTPSErrors: true
-      });
-      
-      const page = await browser.newPage();
-      
-      // Set longer timeouts
-      page.setDefaultNavigationTimeout(45000);
-      page.setDefaultTimeout(45000);
-      
-      // Stealth techniques to avoid detection
-      await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-      
-      // Remove webdriver property
-      await page.evaluateOnNewDocument(() => {
-        Object.defineProperty(navigator, 'webdriver', {
-          get: () => false,
-        });
-      });
-      
-      // Add Chrome property
-      await page.evaluateOnNewDocument(() => {
-        window.chrome = {
-          runtime: {},
-        };
-      });
-      
-      // Override permissions
-      await page.evaluateOnNewDocument(() => {
-        const originalQuery = window.navigator.permissions.query;
-        window.navigator.permissions.query = (parameters) => (
-          parameters.name === 'notifications' ?
-            Promise.resolve({ state: Notification.permission }) :
-            originalQuery(parameters)
-        );
-      });
-      
-      // Set viewport
-      await page.setViewport({ width: 1920, height: 1080 });
-      
-      // Set extra headers
-      await page.setExtraHTTPHeaders({
-        'Accept-Language': 'en-US,en;q=0.9',
-      });
-      
-      // Ignore WebSocket errors and other non-critical errors
-      page.on('error', (err) => {
-        console.warn('Page error (non-critical):', err.message);
-      });
-      
-      page.on('requestfailed', (request) => {
-        // Log but don't fail on resource loading errors
-        if (!request.url().includes('google.com')) {
-          console.warn('Request failed:', request.url());
+      console.log('[SEARCH] 🗺️ Overpass (parallel)...');
+      const seen = new Set();
+      const acc = [];
+      for (const term of overpassTerms) {
+        const chunk = await withTimeout(searchOverpass(term, country, location, maxResults), 'Overpass', 12000);
+        for (const r of (chunk || [])) {
+          if (r.link && !seen.has(r.link)) { seen.add(r.link); acc.push(r); }
         }
-      });
-      
-      const searchQuery = buildGoogleQuery(query, country, location);
-      const googleUrl = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}&num=${maxResults}`;
-      
-      console.log(`🔍 Searching (attempt ${attempt}/${maxRetries}): ${searchQuery}`);
-      
-      // Add random delay to appear more human-like
-      await page.waitForTimeout(Math.random() * 1000 + 500);
-      
-      try {
-        await page.goto(googleUrl, { 
-          waitUntil: 'domcontentloaded', 
-          timeout: 45000 
-        });
-        
-        // Wait a bit for page to fully load
-        await page.waitForTimeout(2000);
-        
-        // Check if we got blocked or redirected
-        const currentUrl = page.url();
-        if (currentUrl.includes('sorry') || currentUrl.includes('blocked') || currentUrl.includes('captcha')) {
-          throw new Error('Google blocked the request (CAPTCHA or rate limit)');
+        if (acc.length >= maxResults) break;
+      }
+      console.log(`[SEARCH] Overpass done: ${acc.length}`);
+      return acc;
+    } catch (e) {
+      console.log(`[SEARCH] ⚠️  Overpass skipped: ${e.message}`);
+      return [];
+    }
+  })();
+  const searxPromise = (async () => {
+    try {
+      if (process.env.SEARXNG_URL || process.env.SEARXNG_URLS) {
+        console.log('[SEARCH] 🧭 SearxNG (parallel)...');
+        const res = await withTimeout(searchSearxng(query, country, location, maxResults), 'SearxNG', 12000);
+        console.log(`[SEARCH] SearxNG done: ${res?.length || 0}`);
+        return res || [];
+      }
+      console.log('[SEARCH] 💡 SearxNG not configured');
+      return [];
+    } catch (e) {
+      console.log(`[SEARCH] ⚠️  SearxNG skipped: ${e.message}`);
+      return [];
+    }
+  })();
+  const osmPromise = (async () => {
+    try {
+      console.log('[SEARCH] 🌍 OpenStreetMap (parallel)...');
+      const seen = new Set();
+      const acc = [];
+      for (const term of osmTerms) {
+        const chunk = await withTimeout(searchOpenStreetMap(term, country, location, maxResults), 'OpenStreetMap', 12000);
+        for (const r of (chunk || [])) {
+          if (r.link && !seen.has(r.link)) { seen.add(r.link); acc.push(r); }
         }
-      } catch (navError) {
-        // If navigation fails, try with networkidle0
-        try {
-          await page.goto(googleUrl, { waitUntil: 'networkidle0', timeout: 45000 });
-          await page.waitForTimeout(2000);
-        } catch (navError2) {
-          // Last resort: just wait for load
-          await page.goto(googleUrl, { waitUntil: 'load', timeout: 45000 });
-          await page.waitForTimeout(2000);
+        if (acc.length >= maxResults) break;
+      }
+      console.log(`[SEARCH] OpenStreetMap done: ${acc.length}`);
+      return acc;
+    } catch (e) {
+      console.log(`[SEARCH] ⚠️  OpenStreetMap skipped: ${e.message}`);
+      return [];
+    }
+  })();
+  const [ovr, sx, osm] = await Promise.allSettled([overpassPromise, searxPromise, osmPromise]);
+  overpassResults = ovr.status === 'fulfilled' ? (ovr.value || []) : [];
+  searxResults = sx.status === 'fulfilled' ? (sx.value || []) : [];
+  osmResults = osm.status === 'fulfilled' ? (osm.value || []) : [];
+  const freeEarly = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0);
+  console.log(`[SEARCH] Free results after parallel stage: ${freeEarly}`);
+  
+  // Step 4: Bing Search API (FREE, 3,000/month) - SUPPLEMENT
+  try {
+    if (process.env.BING_API_KEY) {
+      console.log('[SEARCH] 🔍 Bing Search API (free supplement)...');
+      bingResults = await searchBing(query, country, location, maxResults);
+    } else {
+      console.log('[SEARCH] 💡 Bing API key not set (3,000 free/month)');
+    }
+  } catch (bingError) {
+    console.log(`[SEARCH] ⚠️  Bing failed: ${bingError.message}`);
+  }
+  
+  // Step 5: Google Places API (PAID, use when free methods fail or need more)
+  const freeResultsCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0);
+  
+  // Use Google Places API if:
+  // 1. Free methods returned < minResults, OR
+  // 2. Free methods returned 0 results (complete failure)
+  if (process.env.GOOGLE_PLACES_API_KEY && (freeResultsCount < minResults || freeResultsCount === 0)) {
+    try {
+      if (freeResultsCount === 0) {
+        console.log(`[SEARCH] 📍 Google Places API (free methods failed, trying paid option)...`);
+      } else {
+        console.log(`[SEARCH] 📍 Google Places API (paid supplement - ${freeResultsCount} free results, need ${minResults}+)...`);
+      }
+      placesResults = await searchGooglePlaces(query, country, location, maxResults);
+      console.log(`[SEARCH] ✅ Google Places API: ${placesResults?.length || 0} results`);
+    } catch (placesApiError) {
+      console.log(`[SEARCH] ⚠️  Google Places API failed: ${placesApiError.message}`);
+    }
+  } else if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount >= minResults) {
+    console.log(`[SEARCH] 💰 Skipping Google Places API (cost-saving: ${freeResultsCount} free results >= ${minResults})`);
+  } else if (!process.env.GOOGLE_PLACES_API_KEY) {
+    console.log('[SEARCH] 💡 Google Places API key not set. Add GOOGLE_PLACES_API_KEY to .env for paid option ($200 free/month)');
+  }
+  
+  // If we still have fewer than minResults, try DuckDuckGo as a supplement (not only last resort)
+  if (freeResultsCount < minResults) {
+    try {
+      console.log(`[SEARCH] 🦆 DuckDuckGo supplement (need at least ${minResults}, have ${freeResultsCount})...`);
+      ddgSupplement = await searchDuckDuckGo(query, country, location, maxResults);
+    } catch (e) {
+      console.log(`[SEARCH] ⚠️  DuckDuckGo supplement failed: ${e.message}`);
+    }
+  }
+
+  // Combine results: FREE sources first, then paid
+  const allResults = [];
+  const seenUrls = new Set();
+  
+  // Add Overpass (FREE)
+  if (overpassResults?.length > 0) {
+    overpassResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+
+  // Add SearxNG (FREE)
+  if (searxResults?.length > 0) {
+    searxResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+
+  // Add OSM (FREE)
+  if (osmResults?.length > 0) {
+    osmResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+  // Add DuckDuckGo supplement
+  if (ddgSupplement?.length > 0) {
+    ddgSupplement.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+  
+  // Add Bing (FREE)
+  if (bingResults?.length > 0) {
+    bingResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+  
+  // Add Google Places (PAID)
+  if (placesResults?.length > 0) {
+    placesResults.forEach(result => {
+      if (result.link && !seenUrls.has(result.link)) {
+        seenUrls.add(result.link);
+        allResults.push(result);
+      }
+    });
+  }
+  
+  if (allResults.length > 0) {
+    const finalResults = allResults.slice(0, maxResults);
+    const freeCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (ddgSupplement?.length || 0);
+    const paidCount = placesResults?.length || 0;
+    console.log(`[SEARCH] ✅ Combined: ${freeCount} FREE (${overpassResults?.length || 0} Overpass + ${searxResults?.length || 0} SearxNG + ${osmResults?.length || 0} OSM + ${bingResults?.length || 0} Bing + ${ddgSupplement?.length || 0} DDG) + ${paidCount} PAID = ${finalResults.length} total`);
+    // Build provider telemetry and shortfall reason
+    const telemetry = {
+      overpass: overpassResults?.length || 0,
+      searxng: searxResults?.length || 0,
+      osm: osmResults?.length || 0,
+      bing: bingResults?.length || 0,
+      ddg: ddgSupplement?.length || 0,
+      places: placesResults?.length || 0
+    };
+    const reasons = [];
+    if (!process.env.BING_API_KEY) reasons.push('Bing API key missing');
+    if (!process.env.GOOGLE_PLACES_API_KEY) reasons.push('Places disabled');
+    if ((ddgSupplement?.length || 0) === 0 && freeCount < minResults) reasons.push('DuckDuckGo rate-limited/blocked');
+    if ((overpassResults?.length || 0) === 0) reasons.push('Overpass timed out or no results');
+    const reasonShortfall = finalResults.length < maxResults ? reasons.join('; ') : '';
+    return { results: finalResults, telemetry, reasonShortfall };
+  }
+  
+  // If we have Google Places results but they weren't combined (shouldn't happen, but safety check)
+  if (placesResults && placesResults.length > 0) {
+    console.log(`[SEARCH] ✅ Using Google Places API results: ${placesResults.length} results`);
+    return { results: placesResults.slice(0, maxResults), telemetry: { overpass: 0, searxng: 0, osm: 0, bing: 0, ddg: 0, places: placesResults.length }, reasonShortfall: '' };
+  }
+  
+  // Try 4: DuckDuckGo (completely free, no API key needed) - LAST RESORT
+  // ⚠️  WARNING: Gets rate limited frequently (HTTP 202)
+  // Retry with exponential backoff if rate limited
+  let ddgRetries = 0;
+  const maxDdgRetries = 3;
+  while (ddgRetries < maxDdgRetries) {
+    try {
+      console.log(`[SEARCH] 🦆 Trying DuckDuckGo${ddgRetries > 0 ? ` (retry ${ddgRetries}/${maxDdgRetries})` : ''}...`);
+      const results = await searchDuckDuckGo(query, country, location, maxResults);
+      if (results && results.length > 0) {
+        console.log(`[SEARCH] ✅ DuckDuckGo found ${results.length} results`);
+        return results;
+      }
+      break; // If we got results (even if empty), don't retry
+    } catch (ddgError) {
+      ddgRetries++;
+      if (ddgError.message.includes('202') || ddgError.message.includes('Rate limited')) {
+        if (ddgRetries < maxDdgRetries) {
+          const waitTime = ddgRetries * 30000; // 30s, 60s, 90s (longer delays)
+          console.log(`[SEARCH] ⚠️  DuckDuckGo rate limited, waiting ${waitTime/1000}s before retry...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          continue; // Retry
         }
       }
-      
-      // Wait for results to load - try multiple selectors as Google changes their structure
-      try {
-        await page.waitForSelector('div#search, div#rso, div[data-ved]', { timeout: 15000 });
-      } catch (e) {
-        // If main selector fails, wait a bit and try to find any result elements
-        await page.waitForTimeout(2000);
-        const hasResults = await page.evaluate(() => {
-          return document.querySelectorAll('div.g, div[data-ved], div#rso > div').length > 0;
-        });
-        if (!hasResults) {
-          throw new Error('No search results found - Google may have blocked the request or changed their structure');
-        }
-      }
-      
-      // Extract search results - try multiple selectors as Google changes structure
-      const results = await page.evaluate((max) => {
-        const items = [];
-        // Try multiple selectors for Google's changing structure
-        let resultElements = document.querySelectorAll('div.g');
-        if (resultElements.length === 0) {
-          resultElements = document.querySelectorAll('div[data-ved]');
-        }
-        if (resultElements.length === 0) {
-          resultElements = document.querySelectorAll('div#rso > div');
-        }
-        if (resultElements.length === 0) {
-          // Last resort: find divs that contain both h3 and a[href]
-          const allDivs = document.querySelectorAll('div');
-          resultElements = Array.from(allDivs).filter(div => 
-            div.querySelector('h3') && div.querySelector('a[href]')
-          );
-        }
-        
-        for (const element of resultElements) {
-          if (items.length >= max) break;
-          
-          const titleElement = element.querySelector('h3, h2, a[href] h3');
-          const linkElement = element.querySelector('a[href]');
-          const snippetElement = element.querySelector('span[style*="-webkit-line-clamp"]') || 
-                                element.querySelector('.VwiC3b') ||
-                                element.querySelector('.aCOpRe') ||
-                                element.querySelector('span');
-          
-          if (titleElement && linkElement) {
-            const title = titleElement.innerText.trim();
-            let link = linkElement.href;
-            // Clean up Google redirect URLs
-            if (link.startsWith('/url?q=')) {
-              const match = link.match(/\/url\?q=([^&]+)/);
-              if (match) link = decodeURIComponent(match[1]);
-            }
-            const snippet = snippetElement ? snippetElement.innerText.trim() : '';
-            
-            if (title && link && link.startsWith('http')) {
-              items.push({
-                title,
-                link,
-                snippet
-              });
-            }
-          }
-        }
-        
-        return items;
-      }, maxResults);
-      
-      console.log(`✅ Found ${results.length} results`);
-      
-      // Close browser before returning
-      await browser.close();
-      browser = null;
-      
-      return results;
-      
-    } catch (error) {
-      lastError = error;
-      console.error(`❌ Google search error (attempt ${attempt}/${maxRetries}):`, error.message);
-      
-      // Close browser if it exists
-      if (browser) {
-        try {
-          await browser.close();
-        } catch (closeError) {
-          // Ignore close errors
-        }
-        browser = null;
-      }
-      
-      // If this is the last attempt, try free alternatives
-      if (attempt === maxRetries) {
-        console.log('⚠️  Puppeteer failed, trying free alternatives...');
-        
-        // Try 1: Google Places API (good for local businesses, $200 free credit/month)
-        try {
-          if (process.env.GOOGLE_PLACES_API_KEY) {
-            console.log('📍 Trying Google Places API...');
-            return await searchGooglePlaces(query, country, location, maxResults);
-          }
-        } catch (placesError) {
-          console.log('⚠️  Google Places API failed or not configured...');
-        }
-        
-        // Try 2: DuckDuckGo (completely free, no API key needed)
-        try {
-          console.log('🦆 Trying DuckDuckGo...');
-          return await searchDuckDuckGo(query, country, location, maxResults);
-        } catch (ddgError) {
-          console.log('⚠️  DuckDuckGo failed, trying other options...');
-        }
-        
-        // Try 3: Google Custom Search API (free tier: 100/day)
-        try {
-          if (process.env.GOOGLE_API_KEY && process.env.GOOGLE_CSE_ID) {
-            console.log('🔍 Trying Google Custom Search API...');
-            return await searchGoogleCustomSearch(query, country, location, maxResults);
-          }
-        } catch (gcsError) {
-          console.log('⚠️  Google Custom Search API failed or not configured...');
-        }
-        
-        // Try 4: Bing Search API (free tier: 3,000/month)
-        try {
-          if (process.env.BING_API_KEY) {
-            console.log('🔍 Trying Bing Search API...');
-            return await searchBing(query, country, location, maxResults);
-          }
-        } catch (bingError) {
-          console.log('⚠️  Bing Search API failed or not configured...');
-        }
-        
-        // Try 5: HTTP fallback as last resort
-        try {
-          console.log('🌐 Trying HTTP fallback...');
-          return await fetchGoogleResultsHTTP(query, country, location, maxResults);
-        } catch (httpError) {
-          throw new Error(`All search methods failed. Last error: ${error.message}. Consider setting up Google Places API ($200 free credit/month) or Google Custom Search API (free: 100 queries/day) for reliable results.`);
-        }
-      }
-      
-      // Wait before retrying (exponential backoff)
-      const waitTime = attempt * 2000;
-      console.log(`⏳ Retrying in ${waitTime}ms...`);
-      await new Promise(resolve => setTimeout(resolve, waitTime));
+      console.log(`[SEARCH] ⚠️  DuckDuckGo failed: ${ddgError.message}`);
+      break; // Don't retry for other errors
     }
   }
   
-  // Should never reach here, but just in case
-  throw new Error(`Failed to fetch Google results: ${lastError?.message || 'Unknown error'}`);
-}
+  // All methods failed
+  const errorMsg = `All search methods failed. 
 
+🔧 SOLUTIONS:
+1. ✅ OpenStreetMap should work (free, unlimited) - check logs above
+2. ✅ Set up Bing Search API (3,000 queries/month free):
+   - Get key: https://www.microsoft.com/en-us/bing/apis/bing-web-search-api
+   - Add to .env: BING_API_KEY=your_key
+3. ✅ Optional: Google Places API ($200 free/month):
+   - Add to .env: GOOGLE_PLACES_API_KEY=your_key`;
+  
+  throw new Error(errorMsg);
+}

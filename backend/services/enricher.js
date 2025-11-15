@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { enrichLinkedInContacts } from './linkedinEnricher.js';
 
 dotenv.config();
 
@@ -12,6 +13,12 @@ const openai = new OpenAI({
  */
 export async function enrichLead(leadData) {
   try {
+    // Check if OpenAI API key is configured
+    if (!process.env.OPENAI_API_KEY) {
+      console.warn('[ENRICH] ⚠️  OPENAI_API_KEY not found in environment variables');
+      throw new Error('OpenAI API key not configured. Please add OPENAI_API_KEY to your .env file.');
+    }
+    
     const prompt = buildEnrichmentPrompt(leadData);
     
     const response = await openai.chat.completions.create({
@@ -32,6 +39,40 @@ export async function enrichLead(leadData) {
     
     const enrichment = JSON.parse(response.choices[0].message.content);
     
+    // Enrich with LinkedIn contacts
+    let linkedinContacts = null;
+    try {
+      console.log('[ENRICH] Enriching LinkedIn contacts...');
+      linkedinContacts = await enrichLinkedInContacts({
+        companyName: leadData.companyName,
+        website: leadData.website,
+        aboutText: leadData.aboutText,
+        socials: leadData.socials,
+        decisionMakers: leadData.decisionMakers || [], // Pass extracted decision makers
+        enrichment: {
+          industry: enrichment.industry,
+          companySize: enrichment.companySize
+        }
+      });
+      console.log(`[ENRICH] ✅ Found ${linkedinContacts.contacts?.length || 0} suggested contacts`);
+    } catch (linkedinError) {
+      console.log(`[ENRICH] ⚠️  LinkedIn enrichment failed: ${linkedinError.message}`);
+    }
+    
+    // Generate emails for decision makers using email pattern
+    const enrichedDecisionMakers = (leadData.decisionMakers || []).map(dm => {
+      if (enrichment.emailPattern && dm.name) {
+        // Generate email from name + pattern
+        const email = generateEmailFromName(dm.name, enrichment.emailPattern, leadData.website);
+        return {
+          ...dm,
+          email: email,
+          source: dm.source === 'website' ? 'website' : 'ai_inferred'
+        };
+      }
+      return dm;
+    });
+    
     return {
       businessSummary: enrichment.businessSummary || '',
       companySize: enrichment.companySize || 'unknown',
@@ -40,6 +81,8 @@ export async function enrichLead(leadData) {
       emailPattern: enrichment.emailPattern || '',
       contactRelevance: enrichment.contactRelevance || 50,
       signalStrength: enrichment.signalStrength || 50,
+      linkedinContacts: linkedinContacts || null,
+      decisionMakers: enrichedDecisionMakers.length > 0 ? enrichedDecisionMakers : null,
       enrichedAt: new Date()
     };
     
@@ -54,8 +97,53 @@ export async function enrichLead(leadData) {
       emailPattern: '',
       contactRelevance: 50,
       signalStrength: 50,
+      linkedinContacts: null,
+      decisionMakers: null,
       enrichedAt: new Date()
     };
+  }
+}
+
+/**
+ * Generate email address from name and email pattern
+ */
+function generateEmailFromName(name, emailPattern, website) {
+  if (!name || !emailPattern || !website) return null;
+  
+  try {
+    // Extract domain from website
+    const domain = new URL(website).hostname.replace('www.', '');
+    
+    // Parse name into parts
+    const nameParts = name.trim().split(/\s+/).filter(p => p.length > 0);
+    if (nameParts.length === 0) return null;
+    
+    const firstName = nameParts[0].toLowerCase();
+    const lastName = nameParts[nameParts.length - 1].toLowerCase();
+    const firstInitial = firstName[0];
+    const lastInitial = lastName[0];
+    
+    // Common email patterns
+    let email = emailPattern
+      .replace(/{firstname}/gi, firstName)
+      .replace(/{lastname}/gi, lastName)
+      .replace(/{firstinitial}/gi, firstInitial)
+      .replace(/{lastinitial}/gi, lastInitial)
+      .replace(/{firstname\.lastname}/gi, `${firstName}.${lastName}`)
+      .replace(/{firstname_lastname}/gi, `${firstName}_${lastName}`)
+      .replace(/{firstname-lastname}/gi, `${firstName}-${lastName}`)
+      .replace(/{firstinitiallastname}/gi, `${firstInitial}${lastName}`)
+      .replace(/{firstnamelastinitial}/gi, `${firstName}${lastInitial}`)
+      .toLowerCase();
+    
+    // If pattern doesn't have domain, add it
+    if (!email.includes('@')) {
+      email = `${email}@${domain}`;
+    }
+    
+    return email;
+  } catch (e) {
+    return null;
   }
 }
 

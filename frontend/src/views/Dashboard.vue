@@ -14,6 +14,9 @@
             </div>
           </div>
           <div class="header-actions">
+            <button class="btn btn-outline" @click="viewAllSearches" style="margin-right: var(--spacing-sm);">
+              View All Searches
+            </button>
             <span class="user-name">{{ authStore.user?.name || 'User' }}</span>
             <span v-if="authStore.user?.role === 'admin'" class="admin-badge">Admin</span>
             <router-link
@@ -88,19 +91,41 @@
       </div>
 
       <!-- Loading State - When processing but no leads yet -->
-      <div v-if="leadsStore.currentSearch && leadsStore.currentSearch.status === 'processing' && leadsStore.filteredLeads.length === 0" class="loading-leads geometric-block">
+      <div v-if="leadsStore.currentSearch && leadsStore.currentSearch.status !== 'completed'" class="loading-leads geometric-block">
         <div class="loading-content">
           <div class="loading-spinner"></div>
-          <h3>Discovering Leads...</h3>
-          <p>We're searching and extracting business information. This may take a moment.</p>
+          <h3 v-if="progressPercent < 33">Finding results…</h3>
+          <h3 v-else-if="progressPercent < 66">Extracting websites…</h3>
+          <h3 v-else>Enriching contacts…</h3>
           <div class="loading-stats">
-            <div>Found: {{ leadsStore.currentSearch.totalResults || 0 }} results</div>
-            <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }} leads</div>
+            <div>Found: {{ leadsStore.currentSearch.totalResults || 0 }}</div>
+            <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }}</div>
+            <div>Progress: {{ Math.floor(progressPercent) }}%</div>
+          </div>
+          <div v-if="leadsStore.currentSearch?.providers" class="loading-stats">
+            <div>Overpass: {{ leadsStore.currentSearch.providers.overpass || 0 }}</div>
+            <div>OSM: {{ leadsStore.currentSearch.providers.osm || 0 }}</div>
+            <div>SearxNG: {{ leadsStore.currentSearch.providers.searxng || 0 }}</div>
+            <div v-if="leadsStore.currentSearch.providers.bing">Bing: {{ leadsStore.currentSearch.providers.bing }}</div>
+            <div v-if="leadsStore.currentSearch.providers.ddg">DDG: {{ leadsStore.currentSearch.providers.ddg }}</div>
+          </div>
+          <div v-if="leadsStore.currentSearch?.reasonShortfall" class="loading-stats">
+            <div>Why fewer results: {{ leadsStore.currentSearch.reasonShortfall }}</div>
+          </div>
+          <div class="skeleton-list">
+            <div v-for="i in 5" :key="i" class="skeleton-row">
+              <div class="skeleton-bar" style="width: 40%"></div>
+              <div class="skeleton-bar" style="width: 20%"></div>
+              <div class="skeleton-bar" style="width: 15%"></div>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- Lead List -->
+      <div v-if="leadsStore.currentSearch?.status === 'completed' && leadsStore.filteredLeads.length > 0" class="fill-banner">
+        <span v-if="leadsStore.filteredLeads.length < Math.min(30, leadsStore.currentSearch?.resultCount || 50)">Filling more results in background…</span>
+      </div>
       <LeadList 
         v-if="leadsStore.filteredLeads.length > 0"
         :leads="leadsStore.filteredLeads"
@@ -133,6 +158,21 @@
       :search-query="leadsStore.currentSearch?.query"
       @close="closeLeadDetail"
     />
+      
+      <!-- View All Searches Modal -->
+      <div v-if="showAllSearches" class="modal-backdrop" @click.self="closeAllSearches">
+        <div class="modal geometric-block">
+          <div class="modal-header">
+            <h3>All Searches</h3>
+            <button class="btn-link" @click="closeAllSearches">Close</button>
+          </div>
+          <RecentSearches
+            :searches="allSearches"
+            :loading="loadingAll"
+            @select-search="selectFromAll"
+          />
+        </div>
+      </div>
   </div>
 </template>
 
@@ -155,12 +195,16 @@ const selectedLead = ref(null);
 const searchFormRef = ref(null);
 const dashboardStats = ref(null);
 const loadingStats = ref(false);
+const showAllSearches = ref(false);
+const loadingAll = ref(false);
+const allSearches = ref([]);
 let pollInterval = null;
 let statsInterval = null;
 
 // Check auth on mount
 onMounted(async () => {
-  authStore.initAuth();
+  // Ensure auth is initialized before we decide on navigation or data loads
+  await authStore.initAuth();
   if (!authStore.isAuthenticated) {
     router.push('/login');
     return;
@@ -197,6 +241,8 @@ async function handleSearch(searchData) {
     // Start polling for updates
     if (search.searchId) {
       startPolling(search.searchId);
+      // Prime UI immediately (don't wait 2s for first tick)
+      await leadsStore.fetchSearch(search.searchId);
     }
   } catch (error) {
     console.error('Search error:', error);
@@ -209,11 +255,16 @@ function startPolling(searchId) {
   pollInterval = setInterval(async () => {
     try {
       const data = await leadsStore.fetchSearch(searchId);
-      
-      // Stop polling if completed or failed
-      if (data.search.status === 'completed' || data.search.status === 'failed') {
-        stopPolling();
-      }
+      const requested = data?.search?.resultCount || 50;
+      const have = (leadsStore.filteredLeads || []).length;
+      const status = (data?.search?.status || '').toLowerCase();
+      // Keep polling while not failed and either not completed yet, or completed but list is short
+      const shouldKeepPolling =
+        status !== 'failed' && (
+          status !== 'completed' ||
+          have < requested
+        );
+      if (!shouldKeepPolling) stopPolling();
     } catch (error) {
       console.error('Polling error:', error);
       stopPolling();
@@ -264,16 +315,48 @@ async function loadDashboardStats() {
 async function loadSearch(search) {
   try {
     const data = await leadsStore.fetchSearch(search._id);
-    startPolling(search._id);
+    
+    // If the selected search is still processing, start polling; otherwise stop
+    const status = data?.search?.status || leadsStore.currentSearch?.status;
+    if (status === 'processing') {
+      startPolling(search._id);
+    } else {
+      stopPolling();
+    }
   } catch (error) {
     console.error('Error loading search:', error);
   }
 }
 
 function viewAllSearches() {
-  // Could navigate to a searches page or show all in a modal
-  // For now, just scroll to search form
-  document.querySelector('.search-section')?.scrollIntoView({ behavior: 'smooth' });
+  showAllSearches.value = true;
+  loadAllSearches();
+  document.body.style.overflow = 'hidden';
+}
+
+async function loadAllSearches() {
+  loadingAll.value = true;
+  try {
+    const res = await api.get('/search', { params: { limit: 200 } });
+    allSearches.value = res.data.searches || [];
+  } catch (e) {
+    console.error('Error loading all searches:', e);
+  } finally {
+    loadingAll.value = false;
+  }
+}
+
+function closeAllSearches() {
+  showAllSearches.value = false;
+  document.body.style.overflow = '';
+}
+
+async function selectFromAll(search) {
+  showAllSearches.value = false;
+  document.body.style.overflow = '';
+  await loadSearch(search);
+  // Scroll to top to show the selected search header and lead list
+  window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 function clearSearch() {
@@ -492,6 +575,26 @@ onUnmounted(() => {
   color: var(--neutral-3);
 }
 
+.skeleton-list {
+  margin-top: var(--spacing-lg);
+  display: grid;
+  gap: var(--spacing-sm);
+}
+
+.skeleton-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.skeleton-bar {
+  height: 12px;
+  background: var(--neutral-1);
+  border: var(--border-thin) solid var(--neutral-2);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
 .progress-indicator {
   margin-top: var(--spacing-md);
 }
@@ -517,6 +620,39 @@ onUnmounted(() => {
 
 .empty-state h2 {
   margin-bottom: var(--spacing-md);
+}
+
+/* Full-screen modal for All Searches */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--spacing-xl);
+  z-index: 9999;
+}
+
+.modal {
+  width: 100%;
+  max-width: 1200px;
+  height: 80vh;
+  overflow: auto;
+  background: var(--neutral-0);
+  border: var(--border-medium) solid var(--neutral-3);
+}
+
+.modal-header {
+  position: sticky;
+  top: 0;
+  background: var(--neutral-0);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--spacing-md) var(--spacing-lg);
+  border-bottom: var(--border-thin) solid var(--neutral-2);
+  z-index: 1;
 }
 </style>
 

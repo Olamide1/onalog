@@ -79,9 +79,18 @@ async function generate() {
   generating.value = true;
   
   try {
+    // Send richer context so the backend can craft higher-quality outreach
     const response = await api.post(`/leads/${props.lead._id}/outreach`, {
       searchQuery: props.searchQuery,
-      icpDescription: null
+      companyName: props.lead.companyName,
+      website: props.lead.website,
+      location: props.lead.address,
+      industry: props.lead.enrichment?.industry,
+      aboutText: props.lead.aboutText,
+      phones: (props.lead.phoneNumbers || []).map(p => p.formatted || p.phone),
+      emails: (props.lead.emails || []).map(e => e.email),
+      decisionMakers: props.lead.decisionMakers || [],
+      enrichment: props.lead.enrichment || null
     });
     
     outreach.value = response.data;

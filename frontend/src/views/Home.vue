@@ -96,6 +96,8 @@ async function handleSearch(searchData) {
     
     // Start polling for updates
     startPolling(search.searchId);
+    // Prime UI immediately (don't wait 2s for first tick)
+    await leadsStore.fetchSearch(search.searchId);
   } catch (error) {
     console.error('Search error:', error);
   }
@@ -107,11 +109,16 @@ function startPolling(searchId) {
   pollInterval = setInterval(async () => {
     try {
       const data = await leadsStore.fetchSearch(searchId);
-      
-      // Stop polling if completed or failed
-      if (data.search.status === 'completed' || data.search.status === 'failed') {
-        stopPolling();
-      }
+      const requested = data?.search?.resultCount || 50;
+      const have = (leadsStore.filteredLeads || []).length;
+      const status = (data?.search?.status || '').toLowerCase();
+      // Keep polling while not failed and either not completed yet, or completed but list is short
+      const shouldKeepPolling =
+        status !== 'failed' && (
+          status !== 'completed' ||
+          have < requested
+        );
+      if (!shouldKeepPolling) stopPolling();
     } catch (error) {
       console.error('Polling error:', error);
       stopPolling();

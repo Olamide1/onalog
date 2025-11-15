@@ -55,6 +55,15 @@ const leadSchema = new mongoose.Schema({
   aboutText: String,
   categorySignals: [String],
   
+  // Decision makers extracted from website
+  decisionMakers: [{
+    name: String,
+    title: String,
+    email: String, // Generated from name + pattern
+    source: String, // 'website', 'structured_data', 'ai_inferred'
+    confidence: Number // 0-100
+  }],
+  
   // AI Enrichment
   enrichment: {
     businessSummary: String,
@@ -64,6 +73,19 @@ const leadSchema = new mongoose.Schema({
     emailPattern: String,
     contactRelevance: Number, // 0-100
     signalStrength: Number, // 0-100
+    linkedinContacts: {
+      contacts: [{
+        name: String,
+        title: String,
+        department: String,
+        relevance: Number, // 0-100
+        suggestedEmail: String,
+        linkedinSearchQuery: String,
+        notes: String
+      }],
+      linkedinCompanyUrl: String,
+      enrichedAt: Date
+    },
     enrichedAt: Date
   },
   
