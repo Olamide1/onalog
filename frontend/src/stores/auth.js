@@ -10,6 +10,9 @@ export const useAuthStore = defineStore('auth', () => {
   function setUser(userData) {
     user.value = userData;
     isAuthenticated.value = true;
+    try {
+      localStorage.setItem('onalog_user', JSON.stringify(userData));
+    } catch {}
   }
   
   function setToken(tokenData) {
@@ -17,6 +20,9 @@ export const useAuthStore = defineStore('auth', () => {
     // Set token in API client
     if (tokenData) {
       api.defaults.headers.common['Authorization'] = `Bearer ${tokenData}`;
+      try {
+        localStorage.setItem('onalog_token', tokenData);
+      } catch {}
     }
   }
   
@@ -38,6 +44,7 @@ export const useAuthStore = defineStore('auth', () => {
         token.value = storedToken;
         user.value = JSON.parse(storedUser);
         api.defaults.headers.common['Authorization'] = `Bearer ${storedToken}`;
+        isAuthenticated.value = true; // assume valid until proven otherwise
         
         // Verify token is still valid
         try {
@@ -45,12 +52,18 @@ export const useAuthStore = defineStore('auth', () => {
           if (response.data.user) {
             isAuthenticated.value = true;
             user.value = response.data.user;
+            localStorage.setItem('onalog_user', JSON.stringify(response.data.user));
           } else {
-            clearUser();
+            // unexpected shape; keep session but log
+            console.warn('Auth init: /auth/me returned no user');
           }
         } catch (error) {
-          // Token invalid, clear auth
-          clearUser();
+          // Only clear session on explicit 401/403; keep session on transient errors
+          if (error?.response?.status === 401 || error?.response?.status === 403) {
+            clearUser();
+          } else {
+            console.warn('Auth init: transient error, keeping local session');
+          }
         }
       } catch (error) {
         console.error('Auth init error:', error);

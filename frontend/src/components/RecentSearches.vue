@@ -23,9 +23,10 @@
 
     <div v-else class="searches-list">
       <div
-        v-for="search in searches"
+        v-for="search in items"
         :key="search._id"
         class="search-item geometric-block-thin"
+        :class="{ deleting: deletingId === search._id }"
         @click="$emit('select-search', search)"
       >
         <div class="search-content">
@@ -50,6 +51,9 @@
           <span class="status-badge" :class="search.status">
             {{ search.status }}
           </span>
+          <button class="btn-link small danger" @click.stop="onDelete(search)" :disabled="deletingId === search._id">
+            {{ deletingId === search._id ? 'Deleting…' : 'Delete' }}
+          </button>
         </div>
       </div>
     </div>
@@ -57,7 +61,8 @@
 </template>
 
 <script setup>
-import { computed } from 'vue';
+import { ref, watch } from 'vue';
+import api from '../services/api';
 
 const props = defineProps({
   searches: {
@@ -70,7 +75,15 @@ const props = defineProps({
   }
 });
 
-defineEmits(['select-search', 'view-all']);
+const emit = defineEmits(['select-search', 'view-all','deleted']);
+
+// Local copy for optimistic UI updates
+const items = ref([...props.searches]);
+const deletingId = ref(null);
+
+watch(() => props.searches, (v) => {
+  items.value = [...(v || [])];
+}, { immediate: true, deep: true });
 
 function formatCountry(code) {
   const countries = {
@@ -96,6 +109,21 @@ function formatDate(date) {
   if (days < 7) return `${days} days ago`;
   if (days < 30) return `${Math.floor(days / 7)} weeks ago`;
   return d.toLocaleDateString();
+}
+
+async function onDelete(search) {
+  if (!confirm(`Delete search "${search.query}"?`)) return;
+  try {
+    deletingId.value = search._id;
+    await api.delete(`/search/${search._id}`);
+    // Optimistically remove from local list
+    items.value = items.value.filter(s => s._id !== search._id);
+    emit('deleted', search._id); // parent can refresh if desired
+  } catch (e) {
+    alert(e.response?.data?.error || 'Failed to delete search');
+  } finally {
+    deletingId.value = null;
+  }
 }
 </script>
 
@@ -196,6 +224,10 @@ function formatDate(date) {
   border-color: var(--accent);
   background: var(--neutral-1);
 }
+.search-item.deleting {
+  opacity: 0.5;
+  pointer-events: none;
+}
 
 .search-content {
   flex: 1;
@@ -269,6 +301,12 @@ function formatDate(date) {
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
+.btn-link.small.danger {
+  margin-left: var(--spacing-sm);
+  color: #d32f2f;
+  text-decoration: none;
+}
+.btn-link.small.danger:hover { text-decoration: underline; }
 
 .status-badge.completed {
   border-color: var(--accent);

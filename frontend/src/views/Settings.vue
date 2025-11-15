@@ -217,7 +217,14 @@
         
         <CompanySettings />
       </section>
+      <!-- Billing & Usage (Admin only) -->
+      <section v-if="authStore.user?.role === 'admin'" class="settings-section geometric-block">
+        <h2>Billing & Usage</h2>
+        <p class="section-subtitle">Manage currency and provider, view balance, and buy credits</p>
+        <BillingSettings @open-buy="openBuy" />
+      </section>
     </div>
+    <BuyCreditsModal v-if="showBuy" @close="closeBuy" />
   </div>
 </template>
 
@@ -226,6 +233,8 @@ import { ref, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '../stores/auth';
 import CompanySettings from '../components/CompanySettings.vue';
+import BillingSettings from '../components/BillingSettings.vue';
+import BuyCreditsModal from '../components/BuyCreditsModal.vue';
 import api from '../services/api';
 
 const router = useRouter();
@@ -248,6 +257,7 @@ const passwordForm = ref({
 const fieldErrors = ref({});
 const userSaveMessage = ref(null);
 const passwordMessage = ref(null);
+const showBuy = ref(false);
 
 function clearFieldError(field) {
   if (fieldErrors.value[field]) {
@@ -400,6 +410,15 @@ onMounted(async () => {
   
   await loadUserSettings();
 });
+
+function openBuy() {
+  showBuy.value = true;
+  document.body.style.overflow = 'hidden';
+}
+function closeBuy() {
+  showBuy.value = false;
+  document.body.style.overflow = '';
+}
 </script>
 
 <style scoped>
