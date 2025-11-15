@@ -13,6 +13,88 @@ import { billingEnabled, reserveCredit, refundCredit } from '../services/billing
 const router = express.Router();
 
 /**
+ * Search Queue - Process searches sequentially to avoid rate limiting
+ */
+const searchQueue = {
+  queue: [],
+  processing: false,
+  currentSearchId: null,
+  
+  async add(searchId) {
+    this.queue.push(searchId);
+    console.log(`[QUEUE] Added search ${searchId} to queue. Queue length: ${this.queue.length}`);
+    
+    // Update search status to queued if not the first one
+    if (this.processing || this.queue.length > 1) {
+      try {
+        const search = await Search.findById(searchId);
+        if (search && search.status === 'pending') {
+          search.status = 'queued';
+          await search.save();
+        }
+      } catch (err) {
+        // Ignore errors updating status
+      }
+    }
+    
+    this.process();
+  },
+  
+  async process() {
+    // If already processing or queue is empty, do nothing
+    if (this.processing || this.queue.length === 0) {
+      return;
+    }
+    
+    this.processing = true;
+    const searchId = this.queue.shift();
+    this.currentSearchId = searchId;
+    console.log(`[QUEUE] Processing search ${searchId}. Remaining in queue: ${this.queue.length}`);
+    
+    try {
+      await processSearch(searchId);
+    } catch (error) {
+      console.error(`[QUEUE] Error processing search ${searchId}:`, error.message);
+      // Update search status to failed
+      try {
+        const search = await Search.findById(searchId);
+        if (search) {
+          search.status = 'failed';
+          search.error = error.message;
+          await search.save();
+        }
+      } catch (saveError) {
+        console.error(`[QUEUE] Failed to update search status:`, saveError.message);
+      }
+    } finally {
+      this.processing = false;
+      this.currentSearchId = null;
+      console.log(`[QUEUE] Search ${searchId} completed. Processing next...`);
+      // Process next item in queue
+      if (this.queue.length > 0) {
+        // Longer delay to let rate limits recover (especially DuckDuckGo)
+        // DuckDuckGo rate limits can last 1-5 minutes, so we wait 30 seconds minimum
+        // This gives rate limits time to expire between searches
+        const delay = 30000; // 30 seconds
+        console.log(`[QUEUE] Waiting ${delay/1000}s before processing next search to avoid rate limits...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        this.process();
+      } else {
+        console.log(`[QUEUE] Queue empty. Waiting for new searches...`);
+      }
+    }
+  },
+  
+  getStatus() {
+    return {
+      queueLength: this.queue.length,
+      processing: this.processing,
+      currentSearch: this.currentSearchId
+    };
+  }
+};
+
+/**
  * POST /api/search - Create new search and start processing
  */
 router.post('/', async (req, res) => {
@@ -48,15 +130,20 @@ router.post('/', async (req, res) => {
     });
     await search.save();
     
-    // Start async processing
-    processSearch(search._id).catch(err => {
-      console.error('Search processing error:', err);
-    });
+    // Add to queue for sequential processing
+    searchQueue.add(search._id);
+    
+    const queueStatus = searchQueue.getStatus();
+    const isFirstInQueue = !queueStatus.processing && queueStatus.queueLength === 1;
+    const queuePosition = queueStatus.processing ? queueStatus.queueLength + 1 : queueStatus.queueLength;
     
     res.json({
       searchId: search._id,
-      status: 'processing',
-      message: 'Search started'
+      status: isFirstInQueue ? 'processing' : 'queued',
+      message: isFirstInQueue 
+        ? 'Search started' 
+        : `Search queued (${queueStatus.queueLength} ${queueStatus.queueLength === 1 ? 'search' : 'searches'} ahead)`,
+      queuePosition: queuePosition
     });
     
   } catch (error) {
@@ -769,8 +856,19 @@ async function processSearch(searchId) {
     
     const search = await Search.findById(searchId);
     if (search) {
+      // Save partial results even on failure - better than showing nothing
       search.status = 'failed';
+      search.error = error.message;
+      // Update counts with whatever was extracted before the error
+      if (typeof extractedCount !== 'undefined') {
+        search.extractedCount = extractedCount;
+      }
+      if (typeof leads !== 'undefined' && Array.isArray(leads)) {
+        search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
+      }
+      search.completedAt = new Date();
       await search.save();
+      console.log(`[PROCESS] 💾 Saved partial results: ${search.extractedCount || 0} extracted, ${search.enrichedCount || 0} enriched`);
     }
   }
 }

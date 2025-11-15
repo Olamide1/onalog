@@ -49,8 +49,11 @@
         </div>
         <div class="search-status">
           <span class="status-badge" :class="search.status">
-            {{ search.status }}
+            {{ formatStatus(search.status) }}
           </span>
+          <div v-if="isProcessing(search.status)" class="processing-indicator">
+            <div class="spinner"></div>
+          </div>
           <button class="btn-link small danger" @click.stop="onDelete(search)" :disabled="deletingId === search._id">
             {{ deletingId === search._id ? 'Deleting…' : 'Delete' }}
           </button>
@@ -109,6 +112,15 @@ function formatDate(date) {
   if (days < 7) return `${days} days ago`;
   if (days < 30) return `${Math.floor(days / 7)} weeks ago`;
   return d.toLocaleDateString();
+}
+
+function formatStatus(status) {
+  if (!status) return 'unknown';
+  return status.charAt(0).toUpperCase() + status.slice(1);
+}
+
+function isProcessing(status) {
+  return status === 'processing' || status === 'queued' || status === 'searching' || status === 'extracting' || status === 'enriching';
 }
 
 async function onDelete(search) {
@@ -314,6 +326,7 @@ async function onDelete(search) {
 }
 
 .status-badge.processing,
+.status-badge.queued,
 .status-badge.searching,
 .status-badge.extracting,
 .status-badge.enriching {
@@ -324,6 +337,25 @@ async function onDelete(search) {
 .status-badge.failed {
   border-color: #ff4444;
   color: #ff4444;
+}
+
+.processing-indicator {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--spacing-sm);
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--neutral-2);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 
 @media (max-width: 768px) {

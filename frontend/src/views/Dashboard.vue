@@ -45,6 +45,10 @@
         <div v-if="leadsStore.currentSearch?.previewLimited" class="credit-banner warn geometric-block">
           Showing first {{ leadsStore.currentSearch.previewLimit }} results. Buy credits to see all.
         </div>
+        <div v-if="leadsStore.activeBackgroundSearches.length > 0" class="background-searches-banner geometric-block">
+          <strong>{{ leadsStore.activeBackgroundSearches.length }} search{{ leadsStore.activeBackgroundSearches.length > 1 ? 'es' : '' }} processing in background</strong>
+          <span class="banner-hint">Check "Recent Searches" for updates</span>
+        </div>
         <SearchForm ref="searchFormRef" @search="handleSearch" />
       </div>
     </section>
@@ -88,7 +92,7 @@
             <span class="stat-value">{{ leadsStore.enrichedCount }}</span>
           </div>
         </div>
-        <div v-if="leadsStore.currentSearch.status === 'processing'" class="progress-indicator">
+        <div v-if="leadsStore.currentSearch.status === 'processing' || leadsStore.currentSearch.status === 'queued' || leadsStore.currentSearch.status === 'searching' || leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching'" class="progress-indicator">
           <div class="progress-label">
             Processing leads... {{ leadsStore.currentSearch.extractedCount || 0 }} / {{ leadsStore.currentSearch.totalResults || 0 }}
           </div>
@@ -171,6 +175,18 @@
     />
   
   <BuyCreditsModal v-if="showBuyModal" @close="showBuyModal = false" @updated="refreshCredits" />
+  
+  <!-- Completion Notifications -->
+  <div v-if="completedNotifications.length > 0" class="completion-notifications">
+    <div
+      v-for="notif in completedNotifications"
+      :key="notif.id"
+      class="completion-notification"
+      :class="notif.success ? 'success' : 'failed'"
+    >
+      <strong>{{ notif.success ? '✓' : '✗' }} Search Complete:</strong> "{{ notif.search }}"
+    </div>
+  </div>
       
       <!-- View All Searches Modal -->
       <div v-if="showAllSearches" class="modal-backdrop" @click.self="closeAllSearches">
@@ -215,9 +231,11 @@ const showAllSearches = ref(false);
 const loadingAll = ref(false);
 const allSearches = ref([]);
 let pollInterval = null;
+let backgroundPollInterval = null;
 let statsInterval = null;
 const showBuyModal = ref(false);
 const creditBalance = ref(null);
+const completedNotifications = ref([]);
 
 // Check auth on mount
 onMounted(async () => {
@@ -243,6 +261,17 @@ onMounted(async () => {
   
   // Refresh stats every 30 seconds
   statsInterval = setInterval(loadDashboardStats, 30000);
+  
+  // Start background polling if there are active background searches
+  if (leadsStore.activeBackgroundSearches.length > 0) {
+    startBackgroundPolling();
+  }
+});
+
+onUnmounted(() => {
+  stopPolling();
+  stopBackgroundPolling();
+  if (statsInterval) clearInterval(statsInterval);
 });
 
 const progressPercent = computed(() => {
@@ -269,6 +298,10 @@ async function handleSearch(searchData) {
     // Start polling for updates
     if (search.searchId) {
       startPolling(search.searchId);
+      // Start background polling if not already running
+      if (!backgroundPollInterval) {
+        startBackgroundPolling();
+      }
       // Prime UI immediately (don't wait 2s for first tick)
       await leadsStore.fetchSearch(search.searchId);
     }
@@ -279,6 +312,7 @@ async function handleSearch(searchData) {
 
 function startPolling(searchId) {
   if (pollInterval) clearInterval(pollInterval);
+  let failedFetchCount = 0;
   
   pollInterval = setInterval(async () => {
     try {
@@ -286,16 +320,40 @@ function startPolling(searchId) {
       const requested = data?.search?.resultCount || 50;
       const have = (leadsStore.filteredLeads || []).length;
       const status = (data?.search?.status || '').toLowerCase();
+      
+      // Refresh credits after each fetch (in case enrichment completed)
+      refreshCredits();
+      
+      // If failed, fetch one more time to get partial results, then stop
+      if (status === 'failed') {
+        failedFetchCount++;
+        if (failedFetchCount >= 2) {
+          // Fetched twice after failure - stop polling but keep showing results
+          stopPolling();
+          return;
+        }
+        // Continue one more time to get any partial results
+      }
+      
       // Keep polling while not failed and either not completed yet, or completed but list is short
+      // Also continue polling for queued/searching/extracting/enriching statuses
       const shouldKeepPolling =
         status !== 'failed' && (
-          status !== 'completed' ||
-          have < requested
+          status === 'queued' ||
+          status === 'searching' ||
+          status === 'extracting' ||
+          status === 'enriching' ||
+          status === 'processing' ||
+          (status === 'completed' && have < requested)
         );
-      if (!shouldKeepPolling) stopPolling();
+      if (!shouldKeepPolling && status !== 'failed') stopPolling();
     } catch (error) {
       console.error('Polling error:', error);
-      stopPolling();
+      // Don't stop immediately on error - might be transient
+      failedFetchCount++;
+      if (failedFetchCount >= 3) {
+        stopPolling();
+      }
     }
   }, 2000); // Poll every 2 seconds
 }
@@ -305,6 +363,57 @@ function stopPolling() {
     clearInterval(pollInterval);
     pollInterval = null;
   }
+}
+
+function startBackgroundPolling() {
+  if (backgroundPollInterval) clearInterval(backgroundPollInterval);
+  
+  backgroundPollInterval = setInterval(async () => {
+    const active = leadsStore.activeBackgroundSearches;
+    if (active.length === 0) {
+      stopBackgroundPolling();
+      return;
+    }
+    
+    // Poll each background search (less frequently - every 5s)
+    for (const search of active) {
+      try {
+        const searchId = search._id || search.searchId;
+        const data = await leadsStore.fetchSearch(searchId, true);
+        const status = (data?.search?.status || '').toLowerCase();
+        
+        // If search completed or failed, show notification and remove from background
+        if (status === 'completed' || status === 'failed') {
+          showCompletionNotification(search, status === 'completed');
+          leadsStore.removeBackgroundSearch(searchId);
+        }
+      } catch (error) {
+        console.error('Background polling error:', error);
+      }
+    }
+  }, 5000); // Poll every 5 seconds for background searches
+}
+
+function stopBackgroundPolling() {
+  if (backgroundPollInterval) {
+    clearInterval(backgroundPollInterval);
+    backgroundPollInterval = null;
+  }
+}
+
+function showCompletionNotification(search, success) {
+  const notification = {
+    id: Date.now(),
+    search: search.query,
+    success,
+    timestamp: new Date()
+  };
+  completedNotifications.value.push(notification);
+  
+  // Auto-remove after 5 seconds
+  setTimeout(() => {
+    completedNotifications.value = completedNotifications.value.filter(n => n.id !== notification.id);
+  }, 5000);
 }
 
 async function openLeadDetail(lead) {
@@ -354,14 +463,23 @@ function onRecentDeleted(id) {
 }
 async function loadSearch(search) {
   try {
+    // Switch to this search (moves current to background if needed)
+    leadsStore.switchToSearch(search);
+    
+    // Fetch fresh data
     const data = await leadsStore.fetchSearch(search._id);
     
     // If the selected search is still processing, start polling; otherwise stop
-    const status = data?.search?.status || leadsStore.currentSearch?.status;
-    if (status === 'processing') {
+    const status = data?.search?.status || search.status;
+    if (status === 'processing' || status === 'queued' || status === 'searching' || status === 'extracting' || status === 'enriching') {
       startPolling(search._id);
     } else {
       stopPolling();
+    }
+    
+    // Ensure background polling is running
+    if (!backgroundPollInterval && leadsStore.activeBackgroundSearches.length > 0) {
+      startBackgroundPolling();
     }
   } catch (error) {
     console.error('Error loading search:', error);
@@ -420,13 +538,6 @@ function handleLogout() {
   authStore.clearUser();
   router.push('/');
 }
-
-onUnmounted(() => {
-  stopPolling();
-  if (statsInterval) {
-    clearInterval(statsInterval);
-  }
-});
 </script>
 
 <style scoped>
@@ -455,6 +566,65 @@ onUnmounted(() => {
 }
 .credit-banner.danger {
   border-color: #d32f2f;
+}
+
+.background-searches-banner {
+  padding: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  background: #e3f2fd;
+  border-color: #2196f3;
+  color: #1565c0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+}
+
+.background-searches-banner .banner-hint {
+  font-size: 0.875rem;
+  opacity: 0.8;
+}
+
+/* Completion Notifications */
+.completion-notifications {
+  position: fixed;
+  top: var(--spacing-lg);
+  right: var(--spacing-lg);
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  max-width: 400px;
+}
+
+.completion-notification {
+  padding: var(--spacing-md);
+  background: white;
+  border: var(--border-medium) solid var(--neutral-2);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  animation: slideIn 0.3s ease-out;
+}
+
+.completion-notification.success {
+  border-color: #4caf50;
+  background: #e8f5e9;
+}
+
+.completion-notification.failed {
+  border-color: #f44336;
+  background: #ffebee;
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
 }
 
 .header-content {

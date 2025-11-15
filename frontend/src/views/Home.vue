@@ -30,7 +30,7 @@
           <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }}</div>
           <div>Enriched: {{ leadsStore.enrichedCount }}</div>
         </div>
-        <div v-if="leadsStore.currentSearch.status === 'processing'" class="progress-indicator">
+        <div v-if="leadsStore.currentSearch.status === 'processing' || leadsStore.currentSearch.status === 'queued' || leadsStore.currentSearch.status === 'searching' || leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching'" class="progress-indicator">
           <div class="progress-bar">
             <div class="progress-fill" :style="{ width: progressPercent + '%' }"></div>
           </div>
@@ -113,10 +113,15 @@ function startPolling(searchId) {
       const have = (leadsStore.filteredLeads || []).length;
       const status = (data?.search?.status || '').toLowerCase();
       // Keep polling while not failed and either not completed yet, or completed but list is short
+      // Also continue polling for queued/searching/extracting/enriching statuses
       const shouldKeepPolling =
         status !== 'failed' && (
-          status !== 'completed' ||
-          have < requested
+          status === 'queued' ||
+          status === 'searching' ||
+          status === 'extracting' ||
+          status === 'enriching' ||
+          status === 'processing' ||
+          (status === 'completed' && have < requested)
         );
       if (!shouldKeepPolling) stopPolling();
     } catch (error) {

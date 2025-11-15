@@ -134,11 +134,26 @@ async function llmExpandTerms(query, country, maxVariants = 8) {
 
     const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const locale = getLocale(country);
-    const prompt = `Given the business search intent: "${query}" and locale "${locale}", return a concise JSON array of 4-10 short, distinct category/phrase variants that would help find more first‑party business results across the web and OpenStreetMap. 
+    const prompt = `Given the business search intent: "${query}" and locale "${locale}", return a concise JSON array of 4-10 short, distinct category/phrase variants that would help find more first‑party business results across the web and OpenStreetMap.
+
+CRITICAL: Generate terms that work well with OpenStreetMap's tagging system. OSM uses standard business categories like but not limited to:
+- "aviation school" (not "flight school" or "plane school")
+- "bank" (not "commercial bank")
+- "cafe" (not "coffee shop")
+- "hospital" (not "medical center")
+- "hotel" (not "lodging")
+- "restaurant" (not "dining")
+- "pharmacy" (not "drugstore")
+- "shop" or specific shop types (not "store")
+
 Rules:
 - Return ONLY a JSON array of strings, no prose.
-- Include localized terms if applicable.
-- Include singular/plural and close synonyms (avoid brand names or generic words like "best", "top").`;
+- Prefer standard OSM business category terms over colloquial or marketing terms.
+- Include localized terms if applicable (e.g., "café" for coffee, "imobiliária" for real estate in Portuguese).
+- Include singular/plural variants.
+- Include close synonyms but prioritize terms that match OSM's amenity/shop/office tags.
+- Avoid brand names or generic words like "best", "top", "commercial", "professional".
+- If the query is a colloquial term (e.g., "flight school"), include the standard OSM term (e.g., "aviation school") as the first variant.`;
     const resp = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       temperature: 0.15,
@@ -277,8 +292,9 @@ export async function fetchGoogleResults(query, country = null, location = null,
       console.log('[SEARCH] 🌍 OpenStreetMap (parallel)...');
       const seen = new Set();
       const acc = [];
+      // Pass all LLM-generated terms to each search for better dynamic matching
       for (const term of osmTerms) {
-        const chunk = await withTimeout(searchOpenStreetMap(term, country, location, maxResults), 'OpenStreetMap', 12000);
+        const chunk = await withTimeout(searchOpenStreetMap(term, country, location, maxResults, osmTerms), 'OpenStreetMap', 12000);
         for (const r of (chunk || [])) {
           if (r.link && !seen.has(r.link)) { seen.add(r.link); acc.push(r); }
         }
@@ -462,6 +478,30 @@ export async function fetchGoogleResults(query, country = null, location = null,
       }
       console.log(`[SEARCH] ⚠️  DuckDuckGo failed: ${ddgError.message}`);
       break; // Don't retry for other errors
+    }
+  }
+  
+  // All methods failed - try one more time with a simplified query
+  // Sometimes OSM/DuckDuckGo work better with simplified queries
+  if (freeEarly === 0 && !placesResults.length && !ddgSupplement.length) {
+    console.log(`[SEARCH] ⚠️  All methods failed. Trying simplified query as last resort...`);
+    try {
+      // Simplify query: remove location-specific terms, just use base query + location
+      const simplifiedQuery = query.split(' ').slice(0, 2).join(' '); // Take first 2 words
+      console.log(`[SEARCH] 🔄 Retrying with simplified query: "${simplifiedQuery}"`);
+      
+      // Try OSM one more time with simplified query
+      const simplifiedOsm = await Promise.race([
+        searchOpenStreetMap(simplifiedQuery, country, location, Math.min(20, maxResults)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('OSM timeout')), 10000))
+      ]).catch(() => []);
+      
+      if (simplifiedOsm && simplifiedOsm.length > 0) {
+        console.log(`[SEARCH] ✅ Simplified query found ${simplifiedOsm.length} results`);
+        return { results: simplifiedOsm, telemetry: { 'OSM (simplified)': simplifiedOsm.length }, reasonShortfall: 'Used simplified query fallback' };
+      }
+    } catch (fallbackError) {
+      console.log(`[SEARCH] ⚠️  Simplified query fallback also failed: ${fallbackError.message}`);
     }
   }
   

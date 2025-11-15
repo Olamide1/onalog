@@ -5,6 +5,7 @@ import api from '../services/api';
 export const useLeadsStore = defineStore('leads', () => {
   const leads = ref([]);
   const currentSearch = ref(null);
+  const backgroundSearches = ref([]); // Track searches processing in background
   const selectedLeads = ref([]);
   const loading = ref(false);
   const error = ref(null);
@@ -15,6 +16,12 @@ export const useLeadsStore = defineStore('leads', () => {
   
   const enrichedCount = computed(() => {
     return leads.value.filter(l => l.enrichmentStatus === 'enriched').length;
+  });
+  
+  const activeBackgroundSearches = computed(() => {
+    return backgroundSearches.value.filter(s => 
+      s.status === 'processing' || s.status === 'queued' || s.status === 'searching' || s.status === 'extracting' || s.status === 'enriching'
+    );
   });
   
   async function createSearch(query, country, location, resultCount) {
@@ -29,6 +36,18 @@ export const useLeadsStore = defineStore('leads', () => {
         resultCount: parseInt(resultCount)
       });
       
+      // If there's already a current search, move it to background
+      if (currentSearch.value && currentSearch.value._id) {
+        const oldSearch = {
+          ...currentSearch.value,
+          _id: currentSearch.value._id || currentSearch.value.searchId
+        };
+        // Only add to background if it's still processing
+        if (oldSearch.status === 'processing' || oldSearch.status === 'queued' || oldSearch.status === 'searching' || oldSearch.status === 'extracting' || oldSearch.status === 'enriching') {
+          backgroundSearches.value.push(oldSearch);
+        }
+      }
+      
       currentSearch.value = response.data;
       return response.data;
     } catch (err) {
@@ -39,21 +58,77 @@ export const useLeadsStore = defineStore('leads', () => {
     }
   }
   
-  async function fetchSearch(searchId) {
-    loading.value = true;
+  async function fetchSearch(searchId, updateBackground = false) {
+    // Only set loading for current search updates, not background
+    if (!updateBackground) {
+      loading.value = true;
+    }
     error.value = null;
     
     try {
       const response = await api.get(`/search/${searchId}`);
-      currentSearch.value = response.data.search;
-      leads.value = response.data.leads;
+      const search = response.data.search;
+      const searchLeads = response.data.leads;
+      
+      // If this is the current search, update it and leads
+      if (currentSearch.value && (currentSearch.value._id === searchId || currentSearch.value.searchId === searchId)) {
+        currentSearch.value = search;
+        leads.value = searchLeads;
+      } 
+      // If this is a background search, update it
+      else if (updateBackground) {
+        const bgIndex = backgroundSearches.value.findIndex(s => s._id === searchId || s.searchId === searchId);
+        if (bgIndex >= 0) {
+          backgroundSearches.value[bgIndex] = search;
+        } else {
+          // If not found in background, might be a new background search
+          // Only add if it's processing
+          if (search.status === 'processing' || search.status === 'queued' || search.status === 'searching' || search.status === 'extracting' || search.status === 'enriching') {
+            backgroundSearches.value.push(search);
+          }
+        }
+      }
+      
       return response.data;
     } catch (err) {
       error.value = err.message;
       throw err;
     } finally {
-      loading.value = false;
+      if (!updateBackground) {
+        loading.value = false;
+      }
     }
+  }
+  
+  function switchToSearch(search) {
+    // Move current search to background if it's still processing
+    if (currentSearch.value && currentSearch.value._id) {
+      const oldSearch = {
+        ...currentSearch.value,
+        _id: currentSearch.value._id || currentSearch.value.searchId
+      };
+      if (oldSearch.status === 'processing' || oldSearch.status === 'queued' || oldSearch.status === 'searching' || oldSearch.status === 'extracting' || oldSearch.status === 'enriching') {
+        // Remove from background if already there, then add
+        backgroundSearches.value = backgroundSearches.value.filter(s => 
+          s._id !== oldSearch._id && s.searchId !== oldSearch.searchId
+        );
+        backgroundSearches.value.push(oldSearch);
+      }
+    }
+    
+    // Remove from background if it's there
+    backgroundSearches.value = backgroundSearches.value.filter(s => 
+      s._id !== search._id && s.searchId !== search.searchId
+    );
+    
+    // Set as current
+    currentSearch.value = search;
+  }
+  
+  function removeBackgroundSearch(searchId) {
+    backgroundSearches.value = backgroundSearches.value.filter(s => 
+      s._id !== searchId && s.searchId !== searchId
+    );
   }
   
   async function fetchLeads(filters = {}) {
@@ -103,6 +178,8 @@ export const useLeadsStore = defineStore('leads', () => {
   return {
     leads,
     currentSearch,
+    backgroundSearches,
+    activeBackgroundSearches,
     selectedLeads,
     loading,
     error,
@@ -113,7 +190,9 @@ export const useLeadsStore = defineStore('leads', () => {
     fetchLeads,
     fetchLeadDetail,
     toggleLeadSelection,
-    clearSelection
+    clearSelection,
+    switchToSearch,
+    removeBackgroundSearch
   };
 });
 
