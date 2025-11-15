@@ -27,6 +27,15 @@ const searchSchema = new mongoose.Schema({
     default: 'pending'
   },
   
+  // Queue priority (higher = processed first)
+  // Default: 0 (free users), Premium: 10 (paying users)
+  priority: {
+    type: Number,
+    default: 0,
+    min: 0,
+    max: 100
+  },
+  
   // Results metadata
   totalResults: Number,
   extractedCount: Number,

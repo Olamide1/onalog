@@ -13,19 +13,70 @@ import { billingEnabled, reserveCredit, refundCredit } from '../services/billing
 const router = express.Router();
 
 /**
- * Search Queue - Process searches sequentially to avoid rate limiting
+ * Search Queue - Per-user queues with priority and round-robin processing
+ * - Each user has their own queue
+ * - Searches within a user's queue are sorted by priority (higher first)
+ * - Round-robin between users for fairness
  */
 const searchQueue = {
-  queue: [],
+  // Map<userId, Array<{searchId, priority, addedAt}>>
+  userQueues: new Map(),
+  // Track which users have been processed (for round-robin)
+  userOrder: [],
+  currentUserIndex: 0,
   processing: false,
   currentSearchId: null,
   
-  async add(searchId) {
-    this.queue.push(searchId);
-    console.log(`[QUEUE] Added search ${searchId} to queue. Queue length: ${this.queue.length}`);
+  async add(searchId, userId = null) {
+    // Get search to determine priority
+    let priority = 0;
+    try {
+      const search = await Search.findById(searchId);
+      if (search) {
+        priority = search.priority || 0;
+        userId = userId || search.userId || 'anonymous';
+      } else {
+        userId = userId || 'anonymous';
+      }
+    } catch (err) {
+      userId = userId || 'anonymous';
+    }
+    
+    // Convert userId to string for Map key
+    const userIdStr = userId ? String(userId) : 'anonymous';
+    
+    // Initialize user queue if needed
+    if (!this.userQueues.has(userIdStr)) {
+      this.userQueues.set(userIdStr, []);
+      // Add to round-robin order if new user
+      if (!this.userOrder.includes(userIdStr)) {
+        this.userOrder.push(userIdStr);
+      }
+    }
+    
+    // Add search to user's queue
+    const userQueue = this.userQueues.get(userIdStr);
+    const queueItem = {
+      searchId,
+      priority,
+      addedAt: Date.now()
+    };
+    userQueue.push(queueItem);
+    
+    // Sort user's queue by priority (higher first), then by addedAt (earlier first)
+    userQueue.sort((a, b) => {
+      if (b.priority !== a.priority) {
+        return b.priority - a.priority; // Higher priority first
+      }
+      return a.addedAt - b.addedAt; // Earlier first for same priority
+    });
+    
+    const totalQueued = Array.from(this.userQueues.values()).reduce((sum, q) => sum + q.length, 0);
+    const userQueuePosition = userQueue.length;
+    console.log(`[QUEUE] Added search ${searchId} to user ${userIdStr}'s queue (priority: ${priority}). User queue: ${userQueuePosition}, Total queued: ${totalQueued}`);
     
     // Update search status to queued if not the first one
-    if (this.processing || this.queue.length > 1) {
+    if (this.processing || totalQueued > 1) {
       try {
         const search = await Search.findById(searchId);
         if (search && search.status === 'pending') {
@@ -41,15 +92,83 @@ const searchQueue = {
   },
   
   async process() {
-    // If already processing or queue is empty, do nothing
-    if (this.processing || this.queue.length === 0) {
+    // If already processing, do nothing
+    if (this.processing) {
       return;
     }
     
+    // Find next search using round-robin across users
+    let nextItem = null;
+    let nextUserId = null;
+    let attempts = 0;
+    const maxAttempts = this.userOrder.length || 1;
+    
+    // Round-robin: try each user once, starting from current index
+    while (attempts < maxAttempts && !nextItem) {
+      if (this.userOrder.length === 0) {
+        break; // No users in queue
+      }
+      
+      const userIdStr = this.userOrder[this.currentUserIndex];
+      const userQueue = this.userQueues.get(userIdStr);
+      
+      if (userQueue && userQueue.length > 0) {
+        // Get highest priority item from this user's queue
+        nextItem = userQueue.shift();
+        nextUserId = userIdStr;
+        
+        // Clean up empty user queues
+        if (userQueue.length === 0) {
+          this.userQueues.delete(userIdStr);
+          // Remove from round-robin order
+          this.userOrder = this.userOrder.filter(id => id !== userIdStr);
+        }
+        break;
+      } else {
+        // This user's queue is empty, try next user
+        this.currentUserIndex = (this.currentUserIndex + 1) % this.userOrder.length;
+        attempts++;
+      }
+    }
+    
+    // If no item found, check if there are any queues left
+    if (!nextItem) {
+      // Check all queues (in case userOrder is out of sync)
+      for (const [userIdStr, userQueue] of this.userQueues.entries()) {
+        if (userQueue && userQueue.length > 0) {
+          nextItem = userQueue.shift();
+          nextUserId = userIdStr;
+          if (userQueue.length === 0) {
+            this.userQueues.delete(userIdStr);
+            this.userOrder = this.userOrder.filter(id => id !== userIdStr);
+          }
+          break;
+        }
+      }
+    }
+    
+    // If still no item, queue is empty
+    if (!nextItem) {
+      this.userQueues.clear();
+      this.userOrder = [];
+      this.currentUserIndex = 0;
+      console.log(`[QUEUE] Queue empty. Waiting for new searches...`);
+      return;
+    }
+    
+    // Update round-robin index for next iteration
+    if (this.userOrder.length > 0) {
+      this.currentUserIndex = (this.currentUserIndex + 1) % this.userOrder.length;
+    } else {
+      this.currentUserIndex = 0;
+    }
+    
     this.processing = true;
-    const searchId = this.queue.shift();
+    const searchId = nextItem.searchId;
     this.currentSearchId = searchId;
-    console.log(`[QUEUE] Processing search ${searchId}. Remaining in queue: ${this.queue.length}`);
+    
+    const totalQueued = Array.from(this.userQueues.values()).reduce((sum, q) => sum + q.length, 0);
+    console.log(`[QUEUE] Processing search ${searchId} (user: ${nextUserId}, priority: ${nextItem.priority}). Remaining: ${totalQueued}`);
     
     try {
       await processSearch(searchId);
@@ -70,8 +189,10 @@ const searchQueue = {
       this.processing = false;
       this.currentSearchId = null;
       console.log(`[QUEUE] Search ${searchId} completed. Processing next...`);
+      
       // Process next item in queue
-      if (this.queue.length > 0) {
+      const remaining = Array.from(this.userQueues.values()).reduce((sum, q) => sum + q.length, 0);
+      if (remaining > 0) {
         // Longer delay to let rate limits recover (especially DuckDuckGo)
         // DuckDuckGo rate limits can last 1-5 minutes, so we wait 30 seconds minimum
         // This gives rate limits time to expire between searches
@@ -86,10 +207,18 @@ const searchQueue = {
   },
   
   getStatus() {
+    const totalQueued = Array.from(this.userQueues.values()).reduce((sum, q) => sum + q.length, 0);
+    const userQueueCounts = {};
+    for (const [userId, queue] of this.userQueues.entries()) {
+      userQueueCounts[userId] = queue.length;
+    }
+    
     return {
-      queueLength: this.queue.length,
+      queueLength: totalQueued,
       processing: this.processing,
-      currentSearch: this.currentSearchId
+      currentSearch: this.currentSearchId,
+      userQueues: userQueueCounts,
+      activeUsers: this.userOrder.length
     };
   }
 };
@@ -118,6 +247,41 @@ router.post('/', async (req, res) => {
       }
     }
     
+    // Determine priority based on user/company
+    // - Default: 0 (free users)
+    // - Priority 10: Users who have purchased credits (not just signup bonus)
+    // - Future: Priority 20+ for subscription users
+    let priority = 0;
+    if (userId) {
+      try {
+        const User = (await import('../models/User.js')).default;
+        const user = await User.findById(userId).populate('companyId');
+        
+        if (user?.companyId) {
+          const company = user.companyId;
+          
+          // Check if company has ever purchased credits (not just signup bonus)
+          // Look for ledger entries with reason: 'purchase'
+          const hasPurchasedCredits = company.ledger && Array.isArray(company.ledger) &&
+            company.ledger.some(entry => entry.reason === 'purchase' && entry.delta > 0);
+          
+          if (hasPurchasedCredits) {
+            priority = 10; // Purchased credits = priority 10
+          }
+          
+          // Future: Add subscription-based priority (e.g., priority 20+)
+          // if (company.billing?.subscription === 'premium') {
+          //   priority = 20;
+          // } else if (company.billing?.subscription === 'enterprise') {
+          //   priority = 30;
+          // }
+        }
+      } catch (err) {
+        // Ignore errors, use default priority
+        console.error('[PRIORITY] Error determining priority:', err.message);
+      }
+    }
+    
     // Create search record
     const search = new Search({
       query,
@@ -125,25 +289,31 @@ router.post('/', async (req, res) => {
       location,
       resultCount,
       userId,
+      priority,
       status: 'pending',
       startedAt: new Date()
     });
     await search.save();
     
-    // Add to queue for sequential processing
-    searchQueue.add(search._id);
+    // Add to queue for sequential processing (with userId for per-user queues)
+    searchQueue.add(search._id, userId);
     
     const queueStatus = searchQueue.getStatus();
+    const userIdStr = userId ? String(userId) : 'anonymous';
+    const userQueueLength = queueStatus.userQueues[userIdStr] || 0;
     const isFirstInQueue = !queueStatus.processing && queueStatus.queueLength === 1;
-    const queuePosition = queueStatus.processing ? queueStatus.queueLength + 1 : queueStatus.queueLength;
+    const userQueuePosition = queueStatus.processing && queueStatus.currentSearch === String(search._id) ? 0 : userQueueLength;
+    const totalQueuePosition = queueStatus.processing ? queueStatus.queueLength + 1 : queueStatus.queueLength;
     
     res.json({
       searchId: search._id,
       status: isFirstInQueue ? 'processing' : 'queued',
       message: isFirstInQueue 
         ? 'Search started' 
-        : `Search queued (${queueStatus.queueLength} ${queueStatus.queueLength === 1 ? 'search' : 'searches'} ahead)`,
-      queuePosition: queuePosition
+        : `Search queued (${userQueuePosition} in your queue, ${totalQueuePosition} total)`,
+      queuePosition: totalQueuePosition,
+      userQueuePosition: userQueuePosition,
+      priority: priority
     });
     
   } catch (error) {
