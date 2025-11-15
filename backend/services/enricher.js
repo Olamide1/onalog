@@ -233,6 +233,10 @@ function buildOutreachPrompt(leadData, searchQuery, icpDescription) {
 
 Company: ${leadData.companyName}
 Industry: ${leadData.enrichment?.industry || 'Unknown'}
+Website: ${leadData.website || 'Unknown'}
+Location: ${leadData.location || 'Unknown'}
+About: ${leadData.aboutText ? leadData.aboutText.slice(0, 400) : 'N/A'}
+Signals: ${(leadData.categorySignals || []).slice(0,5).join(', ')}
 Search Context: ${searchQuery}
 ${icpDescription ? `ICP: ${icpDescription}` : ''}
 
@@ -240,7 +244,7 @@ Provide JSON with:
 {
   "intro": "One-line introduction (max 100 chars)",
   "whatsapp": "WhatsApp opener message (friendly, concise)",
-  "email": "Email subject and body (professional, brief)",
+  "email": { "subject": "short subject", "body": "2-4 sentence body. Reference company context above." },
   "callScript": "30-second call script"
 }`;
 }

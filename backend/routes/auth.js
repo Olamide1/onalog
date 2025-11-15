@@ -3,6 +3,7 @@ import User from '../models/User.js';
 import Company from '../models/Company.js';
 import jwt from 'jsonwebtoken';
 import { normalizeCompanyName, findSimilarCompanies } from '../utils/companyMatcher.js';
+import { defaultCurrency } from '../services/billing.js';
 
 const router = express.Router();
 
@@ -105,6 +106,22 @@ router.post('/signup', async (req, res) => {
         },
         memberCount: 1
       });
+      // Seed free credits for new companies
+      try {
+        const freeCredits = parseInt(process.env.FREE_CREDITS_NEW || '0', 10);
+        if (freeCredits > 0) {
+          company.creditBalance = (company.creditBalance || 0) + freeCredits;
+          if (!company.billing) company.billing = {};
+          if (!company.billing.currency) company.billing.currency = defaultCurrency();
+          company.ledger = company.ledger || [];
+          company.ledger.push({
+            delta: freeCredits,
+            reason: 'signup_bonus',
+            byUserId: user._id,
+            currency: company.billing.currency
+          });
+        }
+      } catch {}
       await company.save();
       
       // Update user with companyId

@@ -36,6 +36,45 @@ const companySchema = new mongoose.Schema({
     }
   },
   
+  // Credits for enrichment (company-scoped)
+  creditBalance: {
+    type: Number,
+    default: 0
+  },
+  // Billing profile
+  billing: {
+    currency: {
+      type: String,
+      enum: ['usd', 'ngn'],
+      default: 'usd'
+    },
+    provider: {
+      type: String,
+      enum: ['mock', 'stripe', 'paystack'],
+      default: 'mock'
+    },
+    customerId: { type: String, default: null },
+    taxInfo: { type: Object, default: {} },
+    address: { type: Object, default: {} }
+  },
+  // Lightweight ledger (append-only)
+  ledger: {
+    type: [
+      {
+        ts: { type: Date, default: Date.now },
+        delta: { type: Number, required: true }, // +credits or -credits
+        reason: { type: String, required: true }, // purchase, reserve, consume, refund_invalid, adjust
+        byUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+        searchId: { type: mongoose.Schema.Types.ObjectId, ref: 'Search' },
+        leadId: { type: mongoose.Schema.Types.ObjectId, ref: 'Lead' },
+        currency: { type: String, enum: ['usd', 'ngn'], default: 'usd' },
+        packId: { type: String, default: null },
+        meta: { type: Object, default: {} }
+      }
+    ],
+    default: []
+  },
+  
   // Member count
   memberCount: {
     type: Number,

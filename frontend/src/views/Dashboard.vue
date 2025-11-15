@@ -14,6 +14,7 @@
             </div>
           </div>
           <div class="header-actions">
+            <CreditPill :balance="creditBalance" @open-buy="showBuyModal = true" />
             <button class="btn btn-outline" @click="viewAllSearches" style="margin-right: var(--spacing-sm);">
               View All Searches
             </button>
@@ -35,6 +36,15 @@
     <!-- Search Section - Wide rectangular band -->
     <section class="search-section horizontal-band">
       <div class="container">
+        <div v-if="creditBalance !== null && creditBalance <= 0" class="credit-banner danger geometric-block">
+          <strong>No credits:</strong> extraction is visible but enrichment is paused. Click “Buy Credits” to continue.
+        </div>
+        <div v-else-if="creditBalance !== null && creditBalance < 10" class="credit-banner warn geometric-block">
+          <strong>Low credits:</strong> enrichment may pause soon. Consider buying more credits.
+        </div>
+        <div v-if="leadsStore.currentSearch?.previewLimited" class="credit-banner warn geometric-block">
+          Showing first {{ leadsStore.currentSearch.previewLimit }} results. Buy credits to see all.
+        </div>
         <SearchForm ref="searchFormRef" @search="handleSearch" />
       </div>
     </section>
@@ -52,6 +62,7 @@
           :loading="loadingStats"
           @select-search="loadSearch"
           @view-all="viewAllSearches"
+          @deleted="onRecentDeleted"
         />
       </div>
 
@@ -158,6 +169,8 @@
       :search-query="leadsStore.currentSearch?.query"
       @close="closeLeadDetail"
     />
+  
+  <BuyCreditsModal v-if="showBuyModal" @close="showBuyModal = false" @updated="refreshCredits" />
       
       <!-- View All Searches Modal -->
       <div v-if="showAllSearches" class="modal-backdrop" @click.self="closeAllSearches">
@@ -170,6 +183,7 @@
             :searches="allSearches"
             :loading="loadingAll"
             @select-search="selectFromAll"
+            @deleted="onRecentDeleted"
           />
         </div>
       </div>
@@ -177,7 +191,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useRouter } from 'vue-router';
 import { useLeadsStore } from '../stores/leads';
 import { useAuthStore } from '../stores/auth';
@@ -186,6 +200,8 @@ import LeadList from '../components/LeadList.vue';
 import LeadDetailPanel from '../components/LeadDetailPanel.vue';
 import DashboardStats from '../components/DashboardStats.vue';
 import RecentSearches from '../components/RecentSearches.vue';
+import CreditPill from '../components/CreditPill.vue';
+import BuyCreditsModal from '../components/BuyCreditsModal.vue';
 import api from '../services/api';
 
 const router = useRouter();
@@ -200,6 +216,8 @@ const loadingAll = ref(false);
 const allSearches = ref([]);
 let pollInterval = null;
 let statsInterval = null;
+const showBuyModal = ref(false);
+const creditBalance = ref(null);
 
 // Check auth on mount
 onMounted(async () => {
@@ -212,6 +230,16 @@ onMounted(async () => {
   
   // Load dashboard stats
   await loadDashboardStats();
+  // Load credits (safe if billing disabled)
+  refreshCredits();
+  // Ensure body scroll locked when modal opens
+  watch(showBuyModal, (v) => {
+    if (v) {
+      document.body.style.overflow = 'hidden';
+    } else {
+      document.body.style.overflow = '';
+    }
+  });
   
   // Refresh stats every 30 seconds
   statsInterval = setInterval(loadDashboardStats, 30000);
@@ -312,6 +340,18 @@ async function loadDashboardStats() {
   }
 }
 
+function onRecentDeleted(id) {
+  // Optimistically remove from dashboard stats list
+  if (dashboardStats.value?.searches?.recent) {
+    dashboardStats.value.searches.recent = dashboardStats.value.searches.recent.filter(s => s._id !== id);
+  }
+  // If modal list open, remove there too
+  if (allSearches.value && allSearches.value.length) {
+    allSearches.value = allSearches.value.filter(s => s._id !== id);
+  }
+  // Refresh stats counts asynchronously
+  loadDashboardStats();
+}
 async function loadSearch(search) {
   try {
     const data = await leadsStore.fetchSearch(search._id);
@@ -332,6 +372,15 @@ function viewAllSearches() {
   showAllSearches.value = true;
   loadAllSearches();
   document.body.style.overflow = 'hidden';
+}
+
+async function refreshCredits() {
+  try {
+    const res = await api.get('/billing/usage');
+    creditBalance.value = res.data?.balance ?? null;
+  } catch {
+    creditBalance.value = null;
+  }
 }
 
 async function loadAllSearches() {
@@ -394,6 +443,18 @@ onUnmounted(() => {
   max-width: 1400px;
   margin: 0 auto;
   padding: var(--spacing-xl);
+}
+.credit-banner {
+  padding: var(--spacing-sm) var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+  border: var(--border-medium) solid var(--neutral-2);
+  background: var(--neutral-1);
+}
+.credit-banner.warn {
+  border-color: #e6a700;
+}
+.credit-banner.danger {
+  border-color: #d32f2f;
 }
 
 .header-content {
