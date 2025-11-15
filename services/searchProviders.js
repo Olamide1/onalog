@@ -560,8 +560,9 @@ export async function searchDuckDuckGo(query, country = null, location = null, m
         retryCount++;
         if (error.message.includes('202') || error.message.includes('Rate limited')) {
           if (retryCount < maxRetries) {
-            const waitTime = retryCount * 5000; // 5s, 10s, 15s
-            console.log(`[DUCKDUCKGO] Rate limited, waiting ${waitTime}ms before retry ${retryCount}/${maxRetries}...`);
+            // Exponential backoff: 30s, 60s, 120s (DuckDuckGo rate limits can last 1-5 minutes)
+            const waitTime = Math.min(30000 * Math.pow(2, retryCount - 1), 120000); // 30s, 60s, 120s max
+            console.log(`[DUCKDUCKGO] Rate limited, waiting ${waitTime/1000}s before retry ${retryCount}/${maxRetries}...`);
             await new Promise(resolve => setTimeout(resolve, waitTime));
           } else {
             throw new Error('DuckDuckGo rate limited after multiple retries');
@@ -876,43 +877,15 @@ export async function searchGoogleCustomSearch(query, country = null, location =
  * Best free option - no rate limits, no API key needed
  * Returns business locations with addresses and contact info
  */
-export async function searchOpenStreetMap(query, country = null, location = null, maxResults = 50) {
+export async function searchOpenStreetMap(query, country = null, location = null, maxResults = 50, allSearchTerms = null) {
   try {
     // Build search query - simplify for OSM (works better with simple queries)
     // OSM doesn't like complex queries like "Commercial Banks" - simplify to "bank" or "banks"
     let searchQuery = query.toLowerCase();
     
-    // Simplify common business terms for better OSM results
-    const querySimplifications = {
-      'commercial banks': 'bank',
-      'commercial bank': 'bank',
-      'banks': 'bank',
-      'hotels': 'hotel',
-      'restaurants': 'restaurant',
-      'pharmacies': 'pharmacy',
-  'hospitals': 'hospital',
-      'clinics': 'clinic',
-      'shops': 'shop',
-  'stores': 'store',
-  'coffee shops': 'cafe',
-  'coffee shop': 'cafe',
-  'coffees': 'cafe',
-  'cafes': 'cafe',
-  'café': 'cafe',
-  'cafeteria': 'cafe',
-  'gelato shops': 'ice cream',
-  'gelato shop': 'ice cream',
-  'gelato': 'ice cream',
-  'ice-cream': 'ice cream'
-    };
-    
-    // Apply simplifications
-    for (const [complex, simple] of Object.entries(querySimplifications)) {
-      if (searchQuery.includes(complex)) {
-        searchQuery = searchQuery.replace(complex, simple);
-        break;
-      }
-    }
+    // Note: We rely on LLM-generated expansions for query variations instead of hardcoded simplifications.
+    // The LLM in buildAdaptiveExpansions() generates OSM-friendly terms dynamically.
+    // This ensures we can handle any search query without maintaining a manual list.
     
     if (location) {
       searchQuery += ` ${location}`;
@@ -1051,35 +1024,14 @@ export async function searchOpenStreetMap(query, country = null, location = null
           return false;
         }
 
-        // Enforce location and country if provided
-        if (location) {
-          const loc = (location || '').toLowerCase();
-          const addrMatch = [addr.city, addr.town, addr.village, addr.state, addr.county]
-            .filter(Boolean).map(s => ('' + s).toLowerCase())
-            .some(s => s.includes(loc));
-          const nameMatch = dn.includes(loc);
-          if (!addrMatch && !nameMatch) {
-            return false;
-          }
-        }
-        if (country) {
-          const countryNames = {
-            'ng': 'nigeria', 'za': 'south africa', 'ke': 'kenya', 'gh': 'ghana',
-            'ug': 'uganda', 'tz': 'tanzania', 'et': 'ethiopia', 'eg': 'egypt',
-            'zm': 'zambia', 'zw': 'zimbabwe', 'rw': 'rwanda', 'sn': 'senegal',
-            'ci': 'ivory coast', 'cm': 'cameroon', 'ao': 'angola', 'ma': 'morocco',
-            'tn': 'tunisia', 'dz': 'algeria', 'mg': 'madagascar', 'mw': 'malawi',
-            'us': 'united states', 'gb': 'united kingdom', 'ie': 'ireland', 'pt': 'portugal'
-          };
-          const wantedCountry = (countryNames[country] || country).toLowerCase();
-          const addrCountry = (addr.country || '').toLowerCase();
-          if (wantedCountry && addrCountry && !addrCountry.includes(wantedCountry)) {
-            return false;
-          }
-          if (wantedCountry && !addrCountry && !dn.includes(wantedCountry)) {
-            return false;
-          }
-        }
+        // Prefer location and country matches, but be PERMISSIVE - don't reject everything if they don't match
+        // This handles cases like "Accra" (Ghana) with country "Nigeria" - still show results
+        // We'd rather show potentially relevant results than filter everything out
+        // The search intent matching below will still filter appropriately
+        
+        // Note: We used to strictly require location/country matches, but that caused 0 results
+        // when users selected mismatched location/country (e.g., Accra + Nigeria).
+        // Now we're permissive - if it matches search intent (salon, barber, etc.), show it.
 
         // Accept if it has a name and is a business-related place
         // Don't filter too strictly - accept most places with names
@@ -1087,44 +1039,44 @@ export async function searchOpenStreetMap(query, country = null, location = null
           return false;
         }
         
-        // For hair/salon queries, restrict to hair-related tags
-        const hairTerms = ['hairdresser','barber','barbershop','salon','beauty'];
-        const isHairQuery = Array.from(synonyms).some(t => /(hairdresser|barber|barbershop|salon|beauty)/i.test(t));
-
-        // Accept common business classes/types
-        const businessClasses = ['amenity', 'shop', 'office', 'craft'];
-        const businessTypes = ['hotel', 'restaurant', 'pharmacy', 'hospital', 'clinic', 'shop', 
-                              'supermarket', 'bank', 'cafe', 'bar', 'company', 'business', 'hairdresser', 'barber', 'beauty', 'ice_cream'];
+        // Dynamic filtering: Use LLM-generated synonyms to determine if place matches search intent
+        // This works for ANY business type (brick & mortar, software, services, etc.)
+        // Use all search terms if provided (from LLM expansion), otherwise use local synonyms
+        const allTerms = allSearchTerms ? allSearchTerms.map(t => t.toLowerCase()) : Array.from(synonyms).map(t => t.toLowerCase());
+        const displayNameLower = displayName.toLowerCase();
         
-        // If it matches business class/type, include it
-        let classOrTypeOk = (businessClasses.includes(placeClass) || businessTypes.some(bt => placeType.includes(bt)));
-        if (isHairQuery) {
-          // tighten for hair queries
-          classOrTypeOk = (['amenity','shop'].includes(placeClass) && (placeType.includes('hair') || placeType.includes('barber') || placeType.includes('beauty') || dn.includes('salon')));
-        }
-        // Gelato/Ice-cream specific tightening
-        const isIceCreamQuery = Array.from(synonyms).some(t => /(gelato|ice ?cream|gelateria)/i.test(t));
-        if (isIceCreamQuery) {
-          classOrTypeOk = (['amenity','shop'].includes(placeClass) && (placeType.includes('ice_cream') || dn.includes('gelato') || dn.includes('ice cream') || dn.includes('gelateria')));
-        }
-        if (classOrTypeOk) return true;
+        // Accept if place name/type matches any of the search synonyms (dynamic, not hardcoded)
+        const matchesSearchIntent = allTerms.some(term => {
+          const termWords = term.split(/\s+/).filter(w => w.length > 2); // Skip short words
+          return termWords.some(word => displayNameLower.includes(word)) ||
+                 placeType.toLowerCase().includes(term) ||
+                 placeClass.toLowerCase().includes(term);
+        });
         
-        // If no website and not a business class/type, be stricter when no country/location is provided
-        // This avoids geographic places named "Bank" (villages, regions, etc.)
-        if ((!country && !location) && !website) {
-          return false;
-        }
+        // Accept common business-related OSM classes (general enough for all business types)
+        // These are OSM's standard business categories - not hardcoded business types
+        const businessRelatedClasses = ['amenity', 'shop', 'office', 'craft', 'education', 'leisure', 'tourism'];
+        const isBusinessClass = businessRelatedClasses.includes(placeClass);
         
-        // Also accept if display_name suggests it's a business (has common business keywords)
-        const businessKeywords = ['hotel', 'restaurant', 'pharmacy', 'hospital', 'clinic', 
-                                  'shop', 'store', 'company', 'business', 'office', 'cafe', 'bar',
-                                  'bank', 'banks', 'commercial', 'financial', 'service', 'hair', 'salon', 'barber', 'beauty'];
-        if (businessKeywords.some(keyword => displayName.toLowerCase().includes(keyword))) {
+        // If it matches search intent OR is in a business class, include it
+        if (matchesSearchIntent || isBusinessClass) {
           return true;
         }
         
-        // If it has a website, definitely include it
+        // If no website and doesn't match search intent, be stricter when no country/location is provided
+        // This avoids geographic places named after businesses (e.g., "Bank" village)
+        if ((!country && !location) && !website && !matchesSearchIntent) {
+          return false;
+        }
+        
+        // If it has a website, definitely include it (website = likely a business)
         if (website && website.length > 0) {
+          return true;
+        }
+        
+        // If location/country match and has a name, be permissive (let extractor/enricher validate)
+        // This catches businesses that might not match exact synonyms but are in the right location
+        if ((location || country) && displayName.length >= 3) {
           return true;
         }
         
@@ -1152,14 +1104,15 @@ export async function searchOpenStreetMap(query, country = null, location = null
         const businessName = place.name || place.display_name?.split(',')[0] || 'Unknown Business';
         
         // For OSM results, we often don't have websites in extratags
-        // But we can still use the business - the extractor will try to find the website
-        // For now, use a placeholder that the extractor can work with
+        // But we can still use the business - the extractor will try to find the website using LLM
+        // Convert OSM node pages to Google search links so extractor can resolve them
         let link = website;
-        if (!link) {
-          // OSM results often don't have websites - that's okay
-          // We'll use the business name and the extractor will search for the website
-          // Use a searchable format that extractor can parse
-          link = `https://www.google.com/search?q=${encodeURIComponent(businessName + ' ' + (address || country || ''))}`;
+        if (!link || link.includes('openstreetmap.org')) {
+          // OSM results often don't have websites or only have OSM node pages - that's okay
+          // We'll use the business name and the extractor will search for the website using LLM
+          // Use a searchable format that extractor can parse (extractor.js handles google.com/search links)
+          const searchQuery = `${businessName} ${address || location || country || ''}`.trim();
+          link = `https://www.google.com/search?q=${encodeURIComponent(searchQuery)}`;
         }
         
         // Extract phone from extratags
@@ -1179,14 +1132,24 @@ export async function searchOpenStreetMap(query, country = null, location = null
         if (isDirectorySite(item.link)) {
           return false;
         }
-        // Filter out OpenStreetMap node pages (not real business websites)
-        if (isOSMNodePage(item.link)) {
-          console.log(`[OSM] Filtered OSM node page: ${item.link}`);
-          return false;
-        }
-        // Must have a valid link
+        // Don't filter out OSM node pages - we convert them to Google search links above
+        // The extractor will use LLM to resolve the actual website
+        // Must have a valid link (Google search links are valid - extractor handles them)
         if (!item.link || !item.link.startsWith('http')) {
           return false;
+        }
+        // Accept Google search links (they'll be resolved by extractor using LLM)
+        if (item.link.includes('google.com/search')) {
+          return true;
+        }
+        // Filter out raw OSM node pages (shouldn't happen after conversion above, but just in case)
+        if (isOSMNodePage(item.link)) {
+          console.log(`[OSM] Converting OSM node page to search link: ${item.link}`);
+          // Convert to Google search link instead of filtering out
+          const businessName = item.title || 'business';
+          const location = item.snippet || '';
+          item.link = `https://www.google.com/search?q=${encodeURIComponent(businessName + ' ' + location)}`;
+          return true;
         }
         return true;
       })
