@@ -112,12 +112,29 @@ export async function extractContactInfo(url, defaultCountry = null) {
         // Try to extract company name from URL as fallback
         let companyName = 'Unknown Company';
         try {
-          const domain = new URL(url).hostname.replace('www.', '');
-          companyName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+          const u = new URL(url);
+          const domain = u.hostname.replace('www.', '');
+          const baseName = domain.split('.')[0];
+          companyName = baseName.charAt(0).toUpperCase() + baseName.slice(1);
+          // Special handling for TripAdvisor-like paths: extract venue name from URL
+          if (/tripadvisor\./i.test(domain)) {
+            const m = decodeURIComponent(u.pathname).match(/Reviews?-.*?([A-Za-z0-9_]+(?:_[A-Za-z0-9_]+){0,6})/i);
+            if (m && m[1]) {
+              const pretty = m[1].replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+              if (pretty.length > 2) companyName = pretty;
+            }
+          }
         } catch (e) {
           // Keep default
         }
-        // Return minimal data - we'll use what we have from search results
+        // Attempt to resolve first‑party quickly using the derived name
+        let resolved = null;
+        try {
+          if (companyName && companyName !== 'Unknown Company') {
+            resolved = await resolveWebsiteFromQuery(`${companyName} official site`);
+          }
+        } catch (_) {}
+        // Return minimal data - prefer resolved site if found
         return {
           emails: [],
           phoneNumbers: [],
@@ -126,7 +143,7 @@ export async function extractContactInfo(url, defaultCountry = null) {
           aboutText: '',
           categorySignals: [],
           companyName: companyName,
-          website: url,
+          website: resolved || url,
           decisionMakers: []
         };
       }
@@ -188,12 +205,49 @@ export async function extractContactInfo(url, defaultCountry = null) {
     console.log(`[EXTRACT] Found ${categorySignals.length} category signals`);
     
     // Extract company name
-    const companyName = extractCompanyName($, url);
+    let companyName = extractCompanyName($, url);
     console.log(`[EXTRACT] Company name: ${companyName || 'not found'}`);
     
     // Extract website (improved)
-    const website = extractWebsite($, url);
+    let website = extractWebsite($, url);
     console.log(`[EXTRACT] Website: ${website || url}`);
+
+    // If this is a review/aggregator domain (e.g., TripAdvisor), derive the real business name
+    // and attempt to resolve the first‑party website so the UI shows the venue rather than the aggregator.
+    try {
+      const host = new URL(url).hostname.replace('www.', '');
+      const isTripAdvisor = /tripadvisor\./i.test(host);
+      const isAggregator = isTripAdvisor || /opentable\.|zomato\.|yelp\.|restaurantguru\./i.test(host);
+      if (isAggregator) {
+        // Derive name from title / og:title (e.g., "Plan B Bistro, Pretoria - Tripadvisor")
+        const pageTitle = ($('meta[property=\"og:title\"]').attr('content') || $('title').text() || '').trim();
+        const cleaned = pageTitle
+          .replace(/\s*-\s*Tripadvisor.*/i, '')
+          .replace(/\s*\|\s*Tripadvisor.*/i, '')
+          .replace(/\s*-\s*TripAdvisor.*/i, '')
+          .replace(/\s*\|\s*TripAdvisor.*/i, '')
+          .replace(/\s*\|\s*Zomato.*/i, '')
+          .replace(/\s*-\s*Zomato.*/i, '')
+          .replace(/\s*\|\s*Yelp.*/i, '')
+          .replace(/\s*-\s*Yelp.*/i, '')
+          .trim();
+        if (cleaned && cleaned.length > 2) {
+          companyName = companyName || cleaned;
+        }
+        // Try to resolve a first‑party site using the derived name + location
+        const locPart = (extractAddress($) || '').split(',').slice(-2).join(' ').trim();
+        const resolveQuery = [companyName, locPart].filter(Boolean).join(' ');
+        if (resolveQuery && (!website || /tripadvisor\.|zomato\.|yelp\.|restaurantguru\./i.test(new URL(website || url).hostname))) {
+          const resolvedUrl = await resolveWebsiteFromQuery(`${resolveQuery} official site`);
+          if (resolvedUrl && !isDirectoryDomain(resolvedUrl)) {
+            website = resolvedUrl;
+            console.log(`[EXTRACT] Resolved first‑party from aggregator: ${website}`);
+          }
+        }
+      }
+    } catch (_) {
+      // ignore derivation errors
+    }
     
     // Extract decision makers from About Us / Team pages
     console.log(`[EXTRACT] Extracting decision makers...`);
