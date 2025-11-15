@@ -183,8 +183,19 @@
       :key="notif.id"
       class="completion-notification"
       :class="notif.success ? 'success' : 'failed'"
+      @click="notif.success && notif.searchId ? loadSearch({ _id: notif.searchId }) : null"
+      :style="notif.success ? { cursor: 'pointer' } : {}"
     >
-      <strong>{{ notif.success ? '✓' : '✗' }} Search Complete:</strong> "{{ notif.search }}"
+      <strong>{{ notif.success ? '✓' : '✗' }} Search {{ notif.success ? 'Complete' : 'Failed' }}:</strong> "{{ notif.search }}"
+      <span v-if="notif.success && notif.totalResults > 0" class="notification-details">
+        ({{ notif.enrichedCount || 0 }}/{{ notif.totalResults }} enriched) — Ready for export
+      </span>
+      <span v-else-if="!notif.success && notif.totalResults > 0" class="notification-details">
+        — Click to view partial results ({{ notif.totalResults }} found)
+      </span>
+      <span v-else-if="!notif.success" class="notification-details">
+        — No results found. Try adjusting your search query or check API keys (Bing recommended for digital businesses)
+      </span>
     </div>
   </div>
       
@@ -233,6 +244,7 @@ const allSearches = ref([]);
 let pollInterval = null;
 let backgroundPollInterval = null;
 let statsInterval = null;
+let recentSearchesInterval = null;
 const showBuyModal = ref(false);
 const creditBalance = ref(null);
 const completedNotifications = ref([]);
@@ -262,6 +274,9 @@ onMounted(async () => {
   // Refresh stats every 30 seconds
   statsInterval = setInterval(loadDashboardStats, 30000);
   
+  // Poll recent searches every 10 seconds for real-time updates
+  startRecentSearchesPolling();
+  
   // Start background polling if there are active background searches
   if (leadsStore.activeBackgroundSearches.length > 0) {
     startBackgroundPolling();
@@ -271,6 +286,7 @@ onMounted(async () => {
 onUnmounted(() => {
   stopPolling();
   stopBackgroundPolling();
+  stopRecentSearchesPolling();
   if (statsInterval) clearInterval(statsInterval);
 });
 
@@ -320,15 +336,31 @@ function startPolling(searchId) {
       const requested = data?.search?.resultCount || 50;
       const have = (leadsStore.filteredLeads || []).length;
       const status = (data?.search?.status || '').toLowerCase();
+      const searchData = data?.search;
       
       // Refresh credits after each fetch (in case enrichment completed)
       refreshCredits();
+      
+      // If search just completed, show notification
+      if (status === 'completed' && searchData) {
+        const wasProcessing = leadsStore.currentSearch?.status === 'searching' || 
+                             leadsStore.currentSearch?.status === 'extracting' || 
+                             leadsStore.currentSearch?.status === 'enriching';
+        if (wasProcessing) {
+          // Only show notification if it was processing before (avoid duplicate notifications)
+          showCompletionNotification(searchData, true);
+        }
+      }
       
       // If failed, fetch one more time to get partial results, then stop
       if (status === 'failed') {
         failedFetchCount++;
         if (failedFetchCount >= 2) {
           // Fetched twice after failure - stop polling but keep showing results
+          // Show notification for failed search (with or without partial results)
+          if (searchData) {
+            showCompletionNotification(searchData, false);
+          }
           stopPolling();
           return;
         }
@@ -337,6 +369,11 @@ function startPolling(searchId) {
       
       // Keep polling while not failed and either not completed yet, or completed but list is short
       // Also continue polling for queued/searching/extracting/enriching statuses
+      // Continue polling if completed but we have fewer leads than totalResults (background fill still happening)
+      const totalResults = searchData?.totalResults || 0;
+      const extractedCount = searchData?.extractedCount || 0;
+      const isBackgroundFilling = status === 'completed' && (have < totalResults || extractedCount > have);
+      
       const shouldKeepPolling =
         status !== 'failed' && (
           status === 'queued' ||
@@ -344,7 +381,7 @@ function startPolling(searchId) {
           status === 'extracting' ||
           status === 'enriching' ||
           status === 'processing' ||
-          (status === 'completed' && have < requested)
+          isBackgroundFilling
         );
       if (!shouldKeepPolling && status !== 'failed') stopPolling();
     } catch (error) {
@@ -384,7 +421,9 @@ function startBackgroundPolling() {
         
         // If search completed or failed, show notification and remove from background
         if (status === 'completed' || status === 'failed') {
-          showCompletionNotification(search, status === 'completed');
+          // Use fresh data from fetch for accurate counts
+          const searchData = data?.search || search;
+          showCompletionNotification(searchData, status === 'completed');
           leadsStore.removeBackgroundSearch(searchId);
         }
       } catch (error) {
@@ -401,19 +440,42 @@ function stopBackgroundPolling() {
   }
 }
 
+function startRecentSearchesPolling() {
+  if (recentSearchesInterval) clearInterval(recentSearchesInterval);
+  
+  recentSearchesInterval = setInterval(async () => {
+    try {
+      // Refresh dashboard stats to update recent searches
+      await loadDashboardStats();
+    } catch (error) {
+      console.error('Recent searches polling error:', error);
+    }
+  }, 10000); // Poll every 10 seconds for real-time updates
+}
+
+function stopRecentSearchesPolling() {
+  if (recentSearchesInterval) {
+    clearInterval(recentSearchesInterval);
+    recentSearchesInterval = null;
+  }
+}
+
 function showCompletionNotification(search, success) {
   const notification = {
     id: Date.now(),
     search: search.query,
     success,
+    searchId: search._id || search.searchId,
+    totalResults: search.totalResults || 0,
+    enrichedCount: search.enrichedCount || 0,
     timestamp: new Date()
   };
   completedNotifications.value.push(notification);
   
-  // Auto-remove after 5 seconds
+  // Auto-remove after 10 seconds (longer for export-ready notification)
   setTimeout(() => {
     completedNotifications.value = completedNotifications.value.filter(n => n.id !== notification.id);
-  }, 5000);
+  }, 10000);
 }
 
 async function openLeadDetail(lead) {
@@ -614,6 +676,22 @@ function handleLogout() {
 .completion-notification.failed {
   border-color: #f44336;
   background: #ffebee;
+}
+
+.completion-notification .notification-details {
+  display: block;
+  margin-top: var(--spacing-xs);
+  font-size: 0.875rem;
+  color: var(--neutral-3);
+  font-weight: normal;
+}
+
+.completion-notification.success .notification-details {
+  color: #2e7d32;
+}
+
+.completion-notification.failed .notification-details {
+  color: #c62828;
 }
 
 @keyframes slideIn {

@@ -26,6 +26,8 @@ const searchQueue = {
   currentUserIndex: 0,
   processing: false,
   currentSearchId: null,
+  // Track active background fills: Map<searchId, {resume: Function, isPaused: boolean}>
+  backgroundFills: new Map(),
   
   async add(searchId, userId = null) {
     // Get search to determine priority
@@ -163,6 +165,9 @@ const searchQueue = {
       this.currentUserIndex = 0;
     }
     
+    // Pause any active background fills before starting new search
+    this.pauseBackgroundFills();
+    
     this.processing = true;
     const searchId = nextItem.searchId;
     this.currentSearchId = searchId;
@@ -190,18 +195,41 @@ const searchQueue = {
       this.currentSearchId = null;
       console.log(`[QUEUE] Search ${searchId} completed. Processing next...`);
       
+      // Resume any paused background fills
+      this.resumeBackgroundFills();
+      
       // Process next item in queue
       const remaining = Array.from(this.userQueues.values()).reduce((sum, q) => sum + q.length, 0);
       if (remaining > 0) {
         // Longer delay to let rate limits recover (especially DuckDuckGo)
-        // DuckDuckGo rate limits can last 1-5 minutes, so we wait 30 seconds minimum
-        // This gives rate limits time to expire between searches
-        const delay = 30000; // 30 seconds
+        // Increased to 60-90 seconds to give more time for rate limits to expire
+        const delay = 60000; // 60 seconds (increased from 30)
         console.log(`[QUEUE] Waiting ${delay/1000}s before processing next search to avoid rate limits...`);
         await new Promise(resolve => setTimeout(resolve, delay));
         this.process();
       } else {
         console.log(`[QUEUE] Queue empty. Waiting for new searches...`);
+      }
+    }
+  },
+  
+  pauseBackgroundFills() {
+    // Pause all active background fills
+    for (const [searchId, bgFill] of this.backgroundFills.entries()) {
+      if (!bgFill.isPaused) {
+        bgFill.isPaused = true;
+        console.log(`[QUEUE] ⏸️  Paused background fill for search ${searchId}`);
+      }
+    }
+  },
+  
+  resumeBackgroundFills() {
+    // Resume all paused background fills
+    for (const [searchId, bgFill] of this.backgroundFills.entries()) {
+      if (bgFill.isPaused && bgFill.resume) {
+        bgFill.isPaused = false;
+        console.log(`[QUEUE] ▶️  Resuming background fill for search ${searchId}`);
+        bgFill.resume();
       }
     }
   },
@@ -703,26 +731,33 @@ async function processSearch(searchId) {
     
     // Pre-process: expand directory/list pages into individual company links
     const expandedResults = [];
+    let directoryCount = 0;
     for (const r of uniqueResults) {
       const shouldExpand = (() => {
-        try { return isDirectorySite(r.link); } catch { return false; }
+        try { return isDirectorySite(r.link, r.title); } catch { return false; }
       })();
       if (shouldExpand) {
+        directoryCount++;
         try {
-          console.log(`[PROCESS] Expanding directory/list page: ${r.link}`);
-          const derived = await expandDirectoryCompanies(r.link, Math.max(10, Math.min(40, search.resultCount)));
+          console.log(`[PROCESS] Expanding directory/list page: "${r.title}" → ${r.link}`);
+          const maxExpand = Math.max(15, Math.min(50, Math.floor(search.resultCount / 2))); // Expand more aggressively
+          const derived = await expandDirectoryCompanies(r.link, maxExpand);
           if (derived && derived.length > 0) {
+            console.log(`[PROCESS] ✅ Expanded "${r.title}" into ${derived.length} companies`);
             expandedResults.push(...derived);
             continue;
+          } else {
+            console.log(`[PROCESS] ⚠️  Directory expansion returned 0 companies for "${r.title}"`);
           }
         } catch (e) {
-          console.log(`[PROCESS] Directory expansion failed: ${e.message}`);
+          console.log(`[PROCESS] Directory expansion failed for "${r.title}": ${e.message}`);
         }
         // Skip the directory entry if no derived items
         continue;
       }
       expandedResults.push(r);
     }
+    console.log(`[PROCESS] Directory expansion: Found ${directoryCount} directory pages, expanded to ${expandedResults.length} total results`);
     
     // Step 2: Extract contact info (early-return at 20, background fill)
     const initialTarget = Math.min(30, expandedResults.length);
@@ -771,10 +806,26 @@ async function processSearch(searchId) {
           lead.website = result.link;
         }
         
-        // Guard: first‑party vs directory classifier
+        // Guard: first‑party vs directory classifier (check both original link and extracted website)
+        // Uses dynamic pattern-based detection, not hardcoded domain lists
         try {
+          const { quickClassifyUrl } = await import('../services/extractor.js');
+          const { isDirectorySite } = await import('../services/searchProviders.js');
+          
+          // Check original link using dynamic pattern-based detection
+          if (isDirectorySite(result.link, result.title)) {
+            console.log(`[PROCESS] [${i + 1}/${total}] Original link is directory: ${result.link}. Skipping.`);
+            return;
+          }
+          
+          // Check extracted website using dynamic pattern-based detection
           if (lead.website) {
-            const { quickClassifyUrl } = await import('../services/extractor.js');
+            if (isDirectorySite(lead.website, lead.companyName)) {
+              console.log(`[PROCESS] [${i + 1}/${total}] Extracted website is directory: ${lead.website}. Skipping.`);
+              return;
+            }
+            
+            // Also use quickClassifyUrl for additional validation (pattern-based)
             const cls = await quickClassifyUrl(lead.website);
             // Only skip when strongly directory (negative score). Borderline (0) proceeds.
             if (cls && typeof cls.score === 'number' && cls.score < 0) {
@@ -979,32 +1030,139 @@ async function processSearch(searchId) {
     const pool = Math.min(MAX_WORKERS, totalInit);
     for (let w = 0; w < pool; w++) workers.push(worker(w));
     await Promise.all(workers);
-    // Anything not processed in the initial batch due to time is moved to background
-    const leftoverFromInitial = initialBatch.slice(completed);
-    const bgList = [...leftoverFromInitial, ...backgroundBatch];
-    
-    // Mark as completed for UX; background fill continues
-    search.status = 'completed';
+    // Update counts after initial batch
+    const initialEnrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
     search.extractedCount = extractedCount;
-    search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
-    search.completedAt = new Date();
+    search.enrichedCount = initialEnrichedCount;
     await search.save();
-
-    if (bgList.length > 0) {
-      console.log(`[PROCESS] 🔄 Background fill: remaining ${bgList.length} results...`);
-      setImmediate(async () => {
-        for (let j = 0; j < bgList.length; j++) {
-          await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
+    
+    // Check if we need background fill
+    const totalLeadsFound = expandedResults.length;
+    const needsBackgroundFill = totalLeadsFound >= 20;
+    
+    if (!needsBackgroundFill) {
+      // If total leads < 20, mark as completed immediately (no background fill needed)
+      search.status = 'completed';
+      search.completedAt = new Date();
+      await search.save();
+      console.log(`[PROCESS] ✅ Search complete (${totalLeadsFound} leads, no background fill needed)`);
+    } else {
+      // Wait for 20-30 enriched threshold before allowing next search
+      const THRESHOLD_MIN = 20;
+      const THRESHOLD_MAX = 30;
+      const THRESHOLD_TIMEOUT = 60000; // 60 seconds
+      
+      let enrichedCount = initialEnrichedCount;
+      const thresholdStartTime = Date.now();
+      
+      // Wait for threshold (with timeout)
+      while (enrichedCount < THRESHOLD_MIN && (Date.now() - thresholdStartTime) < THRESHOLD_TIMEOUT) {
+        // Re-fetch to get updated count
+        const updatedSearch = await Search.findById(search._id);
+        if (updatedSearch) {
+          enrichedCount = updatedSearch.enrichedCount || 0;
         }
-        const s = await Search.findById(search._id);
-        if (s) {
-          s.extractedCount = extractedCount;
-          s.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
-          s.completedAt = new Date();
-          await s.save();
+        
+        if (enrichedCount < THRESHOLD_MIN) {
+          // Wait a bit before checking again
+          await new Promise(resolve => setTimeout(resolve, 2000)); // Check every 2 seconds
+          console.log(`[PROCESS] ⏳ Waiting for threshold: ${enrichedCount}/${THRESHOLD_MIN} enriched...`);
         }
-        console.log(`[PROCESS] 🔄 Background fill complete.`);
-      });
+      }
+      
+      const finalEnrichedCount = enrichedCount;
+      if (finalEnrichedCount >= THRESHOLD_MIN) {
+        console.log(`[PROCESS] ✅ Threshold reached: ${finalEnrichedCount} enriched`);
+      } else {
+        console.log(`[PROCESS] ⏱️  Threshold timeout: ${finalEnrichedCount} enriched (proceeding anyway)`);
+      }
+      
+      // Mark as processing_backfill (threshold met or timeout)
+      search.status = 'processing_backfill';
+      search.enrichedCount = finalEnrichedCount;
+      search.completedAt = new Date(); // Mark when initial batch completed
+      await search.save();
+      
+      // Prepare background fill list, respecting resultCount limit
+      const leftoverFromInitial = initialBatch.slice(completed);
+      const maxTotal = search.resultCount;
+      const alreadyProcessed = extractedCount;
+      const remainingAllowed = Math.max(0, maxTotal - alreadyProcessed);
+      
+      // Cap background batch to respect resultCount
+      const cappedBackgroundBatch = backgroundBatch.slice(0, Math.max(0, remainingAllowed - leftoverFromInitial.length));
+      const bgList = [...leftoverFromInitial, ...cappedBackgroundBatch];
+      
+      if (bgList.length > 0) {
+        console.log(`[PROCESS] 🔄 Background fill: ${bgList.length} results (capped from ${backgroundBatch.length + leftoverFromInitial.length} to respect limit of ${maxTotal})...`);
+        
+        // Create pause/resume mechanism
+        const pauseResume = {
+          isPaused: false,
+          resume: null
+        };
+        
+        // Register with queue
+        searchQueue.backgroundFills.set(search._id.toString(), pauseResume);
+        
+        setImmediate(async () => {
+          for (let j = 0; j < bgList.length; j++) {
+            // Check if we've hit the resultCount limit
+            const currentCount = await Lead.countDocuments({ 
+              searchId: search._id, 
+              isDuplicate: false,
+              extractionStatus: 'extracted'
+            });
+            if (currentCount >= maxTotal) {
+              console.log(`[PROCESS] 🔄 Background fill stopped: reached limit of ${maxTotal} leads`);
+              break;
+            }
+            
+            // Check if paused
+            const bgFill = searchQueue.backgroundFills.get(search._id.toString());
+            if (bgFill && bgFill.isPaused) {
+              console.log(`[PROCESS] ⏸️  Background fill paused for search ${search._id}`);
+              // Wait for resume
+              await new Promise((resolve) => {
+                bgFill.resume = resolve;
+              });
+              console.log(`[PROCESS] ▶️  Background fill resumed for search ${search._id}`);
+            }
+            
+            await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
+          }
+          
+          // Clean up
+          searchQueue.backgroundFills.delete(search._id.toString());
+          
+          // Re-fetch actual counts from database
+          const s = await Search.findById(search._id);
+          if (s) {
+            const actualExtracted = await Lead.countDocuments({ 
+              searchId: search._id, 
+              isDuplicate: false,
+              extractionStatus: 'extracted'
+            });
+            const actualEnriched = await Lead.countDocuments({ 
+              searchId: search._id, 
+              isDuplicate: false,
+              enrichmentStatus: 'enriched'
+            });
+            s.extractedCount = actualExtracted;
+            s.enrichedCount = actualEnriched;
+            s.status = 'completed';
+            s.completedAt = new Date();
+            await s.save();
+            console.log(`[PROCESS] 🔄 Background fill complete. Final counts: ${actualExtracted} extracted, ${actualEnriched} enriched`);
+          }
+        });
+      } else {
+        // No background fill needed (already at limit or no remaining items)
+        search.status = 'completed';
+        search.completedAt = new Date();
+        await search.save();
+        console.log(`[PROCESS] ✅ Search complete (no background fill needed, already at limit)`);
+      }
     }
     
     const totalDuration = Date.now() - startTime;

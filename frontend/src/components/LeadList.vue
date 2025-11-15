@@ -57,13 +57,14 @@
               />
             </td>
             <td class="company-name">{{ lead.companyName }}</td>
-            <td>
+            <td class="website-cell">
               <a
                 v-if="lead.website"
                 :href="lead.website"
                 target="_blank"
                 @click.stop
                 class="website-link"
+                :title="lead.website"
               >
                 {{ formatUrl(lead.website) }}
               </a>
@@ -217,10 +218,34 @@ function handleExport(format) {
 
 .table-wrapper {
   overflow-x: auto;
+  max-width: 100%;
 }
 
 .table {
   width: 100%;
+  table-layout: auto;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  padding: var(--spacing-sm) var(--spacing-md);
+  text-align: left;
+  vertical-align: top;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  max-width: 200px;
+}
+
+.table th {
+  white-space: nowrap;
+  font-weight: var(--font-weight-semibold);
+  border-bottom: 2px solid var(--neutral-2);
+}
+
+.table td {
+  white-space: normal;
+  word-break: break-word;
 }
 
 .sortable {
@@ -247,11 +272,53 @@ function handleExport(format) {
 
 .company-name {
   font-weight: var(--font-weight-semibold);
+  max-width: 250px;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+}
+
+.table td:nth-child(2) {
+  max-width: 250px; /* Company column */
+}
+
+.table td:nth-child(3) {
+  max-width: 150px; /* Website column */
+}
+
+.table td:nth-child(4) {
+  max-width: 120px; /* Phone column */
+}
+
+.table td:nth-child(5) {
+  max-width: 180px; /* Email column */
+}
+
+.table td:nth-child(6) {
+  max-width: 200px; /* Location column */
+}
+
+.table td:nth-child(7) {
+  max-width: 100px; /* Score column */
+}
+
+.table td:nth-child(8) {
+  max-width: 80px; /* Actions column */
+  white-space: nowrap;
+}
+
+.website-cell {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .website-link {
   color: var(--accent);
   text-decoration: none;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .website-link:hover {
