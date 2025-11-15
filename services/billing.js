@@ -36,7 +36,8 @@ export async function getCompanyUsage(companyId) {
 }
 
 export async function mockAddCredits(companyId, packId, byUserId) {
-  const pack = CREDIT_PACKS.find(p => p.id === packId);
+  const packs = getCreditPacks();
+  const pack = packs.find(p => p.id === packId);
   if (!pack) throw new Error('Invalid pack');
   const company = await Company.findById(companyId);
   if (!company) throw new Error('Company not found');
