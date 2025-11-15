@@ -135,27 +135,8 @@ router.get('/:id', async (req, res) => {
 });
 
 /**
- * GET /api/search - List searches (most recent first)
- * Optional query params: limit, status
- */
-router.get('/', async (req, res) => {
-  try {
-    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    const status = req.query.status;
-    
-    const filter = {};
-    if (status) filter.status = status;
-    
-    const searches = await Search.find(filter).sort({ createdAt: -1 }).limit(limit);
-    res.json({ searches });
-  } catch (error) {
-    console.error('List searches error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-/**
- * GET /api/search - List all searches (filtered by company)
+ * GET /api/search - List searches (filtered by company sharing)
+ * Query params: limit, status
  */
 router.get('/', async (req, res) => {
   try {
@@ -178,31 +159,36 @@ router.get('/', async (req, res) => {
           shareSearches = user.companyId.settings?.shareSearches ?? false;
         }
       } catch (err) {
-        // Token invalid, return empty
-        return res.json([]);
+        // Token invalid; return empty
+        return res.json({ searches: [] });
       }
     }
     
-    // Build query based on sharing settings
-    let query = {};
+    // Build base query
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const status = req.query.status;
+    const query = {};
+    if (status) query.status = status;
+
     if (userCompanyId) {
       if (shareSearches) {
-        // Get all users in company
         const User = (await import('../models/User.js')).default;
         const companyUsers = await User.find({ companyId: userCompanyId }).select('_id');
         const userIds = companyUsers.map(u => u._id);
         query.userId = { $in: userIds };
       } else {
-        // Only own searches
         query.userId = userId;
       }
+    } else {
+      // No auth -> return empty for privacy
+      return res.json({ searches: [] });
     }
     
     const searches = await Search.find(query)
       .sort({ createdAt: -1 })
-      .limit(50);
+      .limit(limit);
     
-    res.json(searches);
+    res.json({ searches });
   } catch (error) {
     console.error('Searches list error:', error);
     res.status(500).json({ error: error.message });
