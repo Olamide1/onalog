@@ -7,6 +7,7 @@ import leadRoutes from './routes/leads.js';
 import exportRoutes from './routes/export.js';
 import authRoutes from './routes/auth.js';
 import companyRoutes from './routes/company.js';
+import billingRoutes from './routes/billing.js';
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.use('/api/company', companyRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/export', exportRoutes);
+app.use('/api/billing', billingRoutes);
 
 // Health check
 app.get('/api/health', (req, res) => {

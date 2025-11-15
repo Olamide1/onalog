@@ -8,6 +8,7 @@ import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanie
 import { enrichLead } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
 import jwt from 'jsonwebtoken';
+import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
 const router = express.Router();
 
@@ -65,6 +66,47 @@ router.post('/', async (req, res) => {
 });
 
 /**
+ * DELETE /api/search/:id - Delete a search (owner or company admin)
+ */
+router.delete('/:id', async (req, res) => {
+  try {
+    // Require auth
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+    const decoded = jwt.verify(token, secret);
+    const User = (await import('../models/User.js')).default;
+    const user = await User.findById(decoded.userId).populate('companyId');
+    if (!user) return res.status(401).json({ error: 'Unauthorized' });
+    
+    const search = await Search.findById(req.params.id);
+    if (!search) return res.status(404).json({ error: 'Search not found' });
+    
+    // Access: owner OR company admin in same company
+    let allowed = false;
+    if (String(search.userId) === String(user._id)) {
+      allowed = true;
+    } else if (user.role === 'admin') {
+      const SearchOwner = (await import('../models/User.js')).default;
+      const owner = await SearchOwner.findById(search.userId);
+      if (owner && String(owner.companyId) === String(user.companyId?._id || user.companyId)) {
+        allowed = true;
+      }
+    }
+    if (!allowed) return res.status(403).json({ error: 'Access denied' });
+    
+    // Delete leads for this search and the search itself
+    await Lead.deleteMany({ searchId: search._id });
+    await Search.deleteOne({ _id: search._id });
+    
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Delete search error:', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/**
  * GET /api/search/:id - Get search status and results
  */
 router.get('/:id', async (req, res) => {
@@ -114,12 +156,32 @@ router.get('/:id', async (req, res) => {
       }
     }
     
-    const leads = await Lead.find({ searchId: search._id, isDuplicate: false })
-      .sort({ 'enrichment.signalStrength': -1 })
-      .limit(1000);
+    // Determine preview limit based on billing state of the search owner's company
+    let previewLimit = null;
+    try {
+      if (billingEnabled()) {
+        const OwnerUser = (await import('../models/User.js')).default;
+        const owner = await OwnerUser.findById(search.userId).populate('companyId');
+        const ownerCompany = owner?.companyId;
+        if (ownerCompany && (ownerCompany.creditBalance || 0) <= 0) {
+          previewLimit = parseInt(process.env.PREVIEW_LIMIT || '10', 10);
+        }
+      }
+    } catch (e) {
+      // ignore preview evaluation errors
+    }
+    
+    const leadsQuery = Lead.find({ searchId: search._id, isDuplicate: false })
+      .sort({ 'enrichment.signalStrength': -1 });
+    if (previewLimit) leadsQuery.limit(previewLimit);
+    const leads = await leadsQuery;
     
     res.json({
-      search,
+      search: {
+        ...search.toObject(),
+        previewLimited: !!previewLimit,
+        previewLimit: previewLimit || null
+      },
       leads,
       stats: {
         total: leads.length,
@@ -294,6 +356,15 @@ async function processSearch(searchId) {
       location: search.location,
       resultCount: search.resultCount
     });
+    
+    // Resolve user and company for potential billing
+    let searchUser = null;
+    let searchCompanyId = null;
+    try {
+      const User = (await import('../models/User.js')).default;
+      searchUser = await User.findById(search.userId).populate('companyId');
+      searchCompanyId = searchUser?.companyId?._id || searchUser?.companyId || null;
+    } catch {}
     
     // Step 1: Google Search / Google Places
     search.status = 'searching';
@@ -562,41 +633,57 @@ async function processSearch(searchId) {
           leads.push(lead);
           extractedCount++;
           
-          // Step 3: Enrich lead
-          console.log(`[PROCESS] [${i + 1}/${total}] Enriching lead...`);
-          lead.enrichmentStatus = 'enriching';
-          await lead.save();
-          
-          try {
-            const enrichStartTime = Date.now();
-            const enrichment = await enrichLead({
-              companyName: lead.companyName,
-              website: lead.website,
-              aboutText: lead.aboutText,
-              categorySignals: lead.categorySignals,
-              emails: lead.emails,
-              phoneNumbers: lead.phoneNumbers,
-              socials: lead.socials,
-              decisionMakers: lead.decisionMakers || [] // Pass extracted decision makers
-            });
-            const enrichDuration = Date.now() - enrichStartTime;
+          // Step 3: Enrich lead (with billing gate)
+          let reserved = false;
+          if (billingEnabled() && searchCompanyId) {
+            const r = await reserveCredit(searchCompanyId, search.userId, search._id, lead._id);
+            reserved = r.ok;
+          } else {
+            reserved = true; // billing disabled = free
+          }
+          if (!reserved) {
+            console.log(`[PROCESS] [${i + 1}/${total}] No credits; skipping enrichment.`);
+            lead.enrichmentStatus = 'skipped';
+            await lead.save();
+          } else {
+            console.log(`[PROCESS] [${i + 1}/${total}] Enriching lead...`);
+            lead.enrichmentStatus = 'enriching';
+            await lead.save();
             
-            lead.enrichment = enrichment;
-            
-            // Update decision makers with enriched data (emails generated)
-            if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
-              lead.decisionMakers = enrichment.decisionMakers;
-            console.log(`[PROCESS] [${i + 1}/${total}] Enriched ${enrichment.decisionMakers.length} decision makers with emails`);
+            try {
+              const enrichStartTime = Date.now();
+              const enrichment = await enrichLead({
+                companyName: lead.companyName,
+                website: lead.website,
+                aboutText: lead.aboutText,
+                categorySignals: lead.categorySignals,
+                emails: lead.emails,
+                phoneNumbers: lead.phoneNumbers,
+                socials: lead.socials,
+                decisionMakers: lead.decisionMakers || []
+              });
+              const enrichDuration = Date.now() - enrichStartTime;
+              
+              lead.enrichment = enrichment;
+              if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
+                lead.decisionMakers = enrichment.decisionMakers;
+              }
+              const hasUsable = Array.isArray(enrichment.decisionMakers) && enrichment.decisionMakers.some(d => d.email);
+              if (!hasUsable && billingEnabled() && searchCompanyId) {
+                // refund if unusable
+                await refundCredit(searchCompanyId, search.userId, search._id, lead._id, 'refund_invalid');
+              }
+              lead.enrichmentStatus = 'enriched';
+              await lead.save();
+              console.log(`[PROCESS] [${i + 1}/${total}] ✅ Enrichment complete (${enrichDuration}ms)`);
+            } catch (enrichError) {
+              console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error:`, enrichError.message);
+              if (billingEnabled() && searchCompanyId) {
+                await refundCredit(searchCompanyId, search.userId, search._id, lead._id, 'refund_error');
+              }
+              lead.enrichmentStatus = 'failed';
+              await lead.save();
             }
-            
-            lead.enrichmentStatus = 'enriched';
-            await lead.save();
-            
-          console.log(`[PROCESS] [${i + 1}/${total}] ✅ Enrichment complete (${enrichDuration}ms)`);
-          } catch (enrichError) {
-          console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error:`, enrichError.message);
-            lead.enrichmentStatus = 'failed';
-            await lead.save();
           }
         } else {
         console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate detected, skipping`);
