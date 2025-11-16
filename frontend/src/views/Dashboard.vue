@@ -5,7 +5,7 @@
       <div class="container">
         <div class="header-content">
           <div class="header-left">
-            <h1>Onalog</h1>
+            <h1>coralgen</h1>
             <div v-if="dashboardStats?.company" class="company-info">
               <span class="company-name">{{ dashboardStats.company.name }}</span>
               <span v-if="dashboardStats.company.memberCount > 1" class="member-count">

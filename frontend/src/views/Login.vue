@@ -3,7 +3,7 @@
     <div class="login-container">
       <div class="login-form geometric-block">
         <h1>Sign In</h1>
-        <p class="subtitle">Welcome back to Onalog</p>
+        <p class="subtitle">Welcome back to coralgen</p>
         
         <!-- Error Message -->
         <div v-if="error" class="error-message geometric-block">

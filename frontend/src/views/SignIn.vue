@@ -3,7 +3,7 @@
     <div class="signin-container">
       <div class="signin-form geometric-block">
         <h1>Sign Up</h1>
-        <p class="subtitle">Create your Onalog account</p>
+        <p class="subtitle">Create your coralgen account</p>
         
         <!-- Error Message -->
         <div v-if="error" class="error-message geometric-block">

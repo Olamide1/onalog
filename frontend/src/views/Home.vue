@@ -3,7 +3,7 @@
     <!-- Search Section - Wide rectangular band -->
     <section class="search-section horizontal-band">
       <div class="container">
-        <h1 class="mb-lg">Onalog</h1>
+        <h1 class="mb-lg">coralgen</h1>
         <SearchForm ref="searchFormRef" @search="handleSearch" />
       </div>
     </section>
@@ -120,45 +120,20 @@ function startPolling(searchId) {
           status === 'searching' ||
           status === 'extracting' ||
           status === 'enriching' ||
-          status === 'processing' ||
           (status === 'completed' && have < requested)
         );
-      if (!shouldKeepPolling) stopPolling();
-    } catch (error) {
-      console.error('Polling error:', error);
-      stopPolling();
+      if (!shouldKeepPolling) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+      }
+    } catch (err) {
+      // ignore
     }
-  }, 2000); // Poll every 2 seconds
-}
-
-function stopPolling() {
-  if (pollInterval) {
-    clearInterval(pollInterval);
-    pollInterval = null;
-  }
-}
-
-async function openLeadDetail(lead) {
-  try {
-    const detail = await leadsStore.fetchLeadDetail(lead._id);
-    selectedLead.value = detail;
-  } catch (error) {
-    console.error('Error fetching lead detail:', error);
-  }
-}
-
-function closeLeadDetail() {
-  selectedLead.value = null;
-}
-
-function handleExport(format) {
-  const searchId = leadsStore.currentSearch?._id;
-  const url = `/api/export/${format}${searchId ? `?searchId=${searchId}` : ''}`;
-  window.open(url, '_blank');
+  }, 2000);
 }
 
 onUnmounted(() => {
-  stopPolling();
+  if (pollInterval) clearInterval(pollInterval);
 });
 </script>
 

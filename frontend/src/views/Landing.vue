@@ -4,7 +4,7 @@
     <section class="hero horizontal-band">
       <div class="container">
         <div class="hero-content">
-          <h1 class="hero-title">Onalog</h1>
+          <h1 class="hero-title">coralgen</h1>
           <p class="hero-subtitle">B2B Lead Discovery. Structured. Fast.</p>
           <p class="hero-description">
             Search. Extract. Enrich. Action.<br>
@@ -22,7 +22,7 @@
     <section class="value-prop">
       <div class="container">
         <div class="value-prop-content geometric-block">
-          <h2 class="section-title">Why Onalog?</h2>
+          <h2 class="section-title">Why coralgen?</h2>
           <p class="value-prop-lead">
             Hours of manual searching. Scattered contact details. Blank outreach pages.<br>
             We turn that workflow into 25 seconds. Structured. Complete. Ready.
@@ -79,12 +79,12 @@
           
           <div class="feature-block geometric-block">
             <h3>Enrich</h3>
-            <p>AI fills missing details. Company size. Industry. Decision makers. Contact patterns.</p>
+            <p>Use AI to discover decision makers, infer email patterns, and prioritize prospects.</p>
           </div>
           
           <div class="feature-block geometric-block">
             <h3>Action</h3>
-            <p>Ready-to-send outreach templates. WhatsApp. Email. Call scripts. Context-aware.</p>
+            <p>Ready-made outreach emails and WhatsApp messages. Export to CSV/XLSX. Integrations coming soon.</p>
           </div>
         </div>
       </div>
@@ -130,10 +130,16 @@
     </section>
 
     <!-- CTA Section -->
-    <section class="cta horizontal-band">
+    <section class="cta">
       <div class="container">
-        <h2>Start Discovering Leads</h2>
-        <router-link to="/signin" class="btn btn-accent">Get Started</router-link>
+        <div class="cta-content geometric-block">
+          <h2>Start generating leads in minutes</h2>
+          <p>Sign up and run your first search with coralgen now.</p>
+          <div class="cta-actions">
+            <router-link to="/signin" class="btn btn-accent">Get Started</router-link>
+            <router-link to="/login" class="btn">Sign In</router-link>
+          </div>
+        </div>
       </div>
     </section>
   </div>
