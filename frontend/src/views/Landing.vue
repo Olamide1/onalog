@@ -113,7 +113,7 @@
           
           <div class="comparison-block geometric-block comparison-onalog">
             <div class="comparison-header">
-              <h3>Onalog</h3>
+              <h3>coralgen</h3>
             </div>
             <ul class="comparison-list">
               <li><span class="comparison-marker onalog-marker">+</span> Low-cost, pay-as-you-scale</li>
