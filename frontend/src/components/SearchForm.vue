@@ -12,7 +12,7 @@
     </div>
 
     <!-- Filters - Flat geometric blocks -->
-    <div class="filters-grid grid grid-3">
+    <div class="filters-grid grid grid-4">
       <div class="filter-block">
         <label class="filter-label">Country</label>
         <select v-model="formData.country" class="input">
@@ -102,6 +102,39 @@
         />
       </div>
 
+      <div class="filter-block">
+        <label class="filter-label">Industry</label>
+        <select v-model="formData.industry" class="input">
+          <option value="">All Industries</option>
+          <option value="Technology">Technology</option>
+          <option value="Software">Software</option>
+          <option value="Healthcare">Healthcare</option>
+          <option value="Finance">Finance</option>
+          <option value="Banking">Banking</option>
+          <option value="Real Estate">Real Estate</option>
+          <option value="Retail">Retail</option>
+          <option value="Manufacturing">Manufacturing</option>
+          <option value="Education">Education</option>
+          <option value="Hospitality">Hospitality</option>
+          <option value="Food & Beverage">Food & Beverage</option>
+          <option value="Construction">Construction</option>
+          <option value="Transportation">Transportation</option>
+          <option value="Logistics">Logistics</option>
+          <option value="Energy">Energy</option>
+          <option value="Telecommunications">Telecommunications</option>
+          <option value="Media & Entertainment">Media & Entertainment</option>
+          <option value="Advertising & Marketing">Advertising & Marketing</option>
+          <option value="Consulting">Consulting</option>
+          <option value="Legal">Legal</option>
+          <option value="Professional Services">Professional Services</option>
+          <option value="Non-Profit">Non-Profit</option>
+          <option value="Government">Government</option>
+          <option value="Agriculture">Agriculture</option>
+          <option value="Mining">Mining</option>
+          <option value="Utilities">Utilities</option>
+          <option value="Other">Other</option>
+        </select>
+      </div>
       <div class="filter-block">
         <label class="filter-label">Result Count</label>
         <select v-model="formData.resultCount" class="input">
@@ -200,6 +233,7 @@ const formData = ref({
   query: '',
   country: '',
   location: '',
+  industry: '',
   resultCount: 50
 });
 
@@ -283,6 +317,7 @@ function loadTemplate(template) {
   formData.value.query = template.query || '';
   formData.value.country = template.country || '';
   formData.value.location = template.location || '';
+  formData.value.industry = template.industry || '';
   formData.value.resultCount = template.resultCount || 50;
   
   // Close templates section after loading
@@ -350,6 +385,18 @@ onMounted(() => {
 
 .filters-grid {
   margin-bottom: var(--spacing-lg);
+}
+
+@media (max-width: 1200px) {
+  .filters-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 768px) {
+  .filters-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .filter-block {

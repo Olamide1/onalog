@@ -3,11 +3,64 @@
     <!-- Header - Stella band style -->
     <div class="list-header horizontal-band">
       <div class="header-content">
-        <h2>Leads ({{ leads.length }})</h2>
+        <h2>Leads ({{ leads.length }}{{ totalPages > 1 ? ` - Page ${currentPage} of ${totalPages}` : '' }})</h2>
         <div class="header-actions">
           <button @click="handleExport('csv')" class="btn">Export CSV</button>
           <button @click="handleExport('excel')" class="btn">Export Excel</button>
         </div>
+      </div>
+    </div>
+
+    <!-- Pagination Controls (Top) -->
+    <div v-if="totalPages > 1" class="pagination-controls geometric-block">
+      <div class="pagination-info">
+        <span>Showing {{ startIndex + 1 }}-{{ endIndex }} of {{ leads.length }} leads</span>
+        <select v-model="pageSize" class="page-size-select" @change="currentPage = 1">
+          <option :value="10">10 per page</option>
+          <option :value="25">25 per page</option>
+          <option :value="50">50 per page</option>
+          <option :value="100">100 per page</option>
+        </select>
+      </div>
+      <div class="pagination-buttons">
+        <button 
+          @click="currentPage = 1" 
+          :disabled="currentPage === 1"
+          class="btn btn-sm"
+        >
+          First
+        </button>
+        <button 
+          @click="currentPage--" 
+          :disabled="currentPage === 1"
+          class="btn btn-sm"
+        >
+          Previous
+        </button>
+        <span class="page-numbers">
+          <button
+            v-for="page in visiblePages"
+            :key="page"
+            @click="currentPage = page"
+            :class="['btn', 'btn-sm', 'page-number', { active: currentPage === page }]"
+          >
+            {{ page }}
+          </button>
+        </span>
+        <button 
+          @click="currentPage++" 
+          :disabled="currentPage === totalPages"
+          class="btn btn-sm"
+        >
+          Next
+        </button>
+        <button 
+          @click="currentPage = totalPages" 
+          :disabled="currentPage === totalPages"
+          class="btn btn-sm"
+        >
+          Last
+        </button>
       </div>
     </div>
 
@@ -44,7 +97,7 @@
         </thead>
         <tbody>
           <tr
-            v-for="lead in sortedLeads"
+            v-for="lead in paginatedLeads"
             :key="lead._id"
             @click="selectLead(lead)"
             class="lead-row"
@@ -98,11 +151,64 @@
         </tbody>
       </table>
     </div>
+
+    <!-- Pagination Controls (Bottom) -->
+    <div v-if="totalPages > 1" class="pagination-controls geometric-block">
+      <div class="pagination-info">
+        <span>Showing {{ startIndex + 1 }}-{{ endIndex }} of {{ leads.length }} leads</span>
+        <select v-model="pageSize" class="page-size-select" @change="currentPage = 1">
+          <option :value="10">10 per page</option>
+          <option :value="25">25 per page</option>
+          <option :value="50">50 per page</option>
+          <option :value="100">100 per page</option>
+        </select>
+      </div>
+      <div class="pagination-buttons">
+        <button 
+          @click="currentPage = 1" 
+          :disabled="currentPage === 1"
+          class="btn btn-sm"
+        >
+          First
+        </button>
+        <button 
+          @click="currentPage--" 
+          :disabled="currentPage === 1"
+          class="btn btn-sm"
+        >
+          Previous
+        </button>
+        <span class="page-numbers">
+          <button
+            v-for="page in visiblePages"
+            :key="page"
+            @click="currentPage = page"
+            :class="['btn', 'btn-sm', 'page-number', { active: currentPage === page }]"
+          >
+            {{ page }}
+          </button>
+        </span>
+        <button 
+          @click="currentPage++" 
+          :disabled="currentPage === totalPages"
+          class="btn btn-sm"
+        >
+          Next
+        </button>
+        <button 
+          @click="currentPage = totalPages" 
+          :disabled="currentPage === totalPages"
+          class="btn btn-sm"
+        >
+          Last
+        </button>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, computed } from 'vue';
+import { ref, computed, watch } from 'vue';
 
 const props = defineProps({
   leads: {
@@ -116,9 +222,13 @@ const emit = defineEmits(['select-lead', 'export']);
 const selectedIds = ref([]);
 const sortBy = ref('signalStrength');
 const sortOrder = ref('desc');
+const currentPage = ref(1);
+const pageSize = ref(50);
+const previousLeadsRef = ref(null);
 
 const allSelected = computed(() => {
-  return props.leads.length > 0 && selectedIds.value.length === props.leads.length;
+  return paginatedLeads.value.length > 0 && 
+    selectedIds.value.filter(id => paginatedLeads.value.some(l => l._id === id)).length === paginatedLeads.value.length;
 });
 
 const sortedLeads = computed(() => {
@@ -145,6 +255,59 @@ const sortedLeads = computed(() => {
   return sorted;
 });
 
+const totalPages = computed(() => {
+  return Math.ceil(sortedLeads.value.length / pageSize.value);
+});
+
+const startIndex = computed(() => {
+  return (currentPage.value - 1) * pageSize.value;
+});
+
+const endIndex = computed(() => {
+  return Math.min(startIndex.value + pageSize.value, sortedLeads.value.length);
+});
+
+const paginatedLeads = computed(() => {
+  return sortedLeads.value.slice(startIndex.value, endIndex.value);
+});
+
+const visiblePages = computed(() => {
+  const pages = [];
+  const maxVisible = 7;
+  let start = Math.max(1, currentPage.value - Math.floor(maxVisible / 2));
+  let end = Math.min(totalPages.value, start + maxVisible - 1);
+  
+  if (end - start < maxVisible - 1) {
+    start = Math.max(1, end - maxVisible + 1);
+  }
+  
+  for (let i = start; i <= end; i++) {
+    pages.push(i);
+  }
+  
+  return pages;
+});
+
+// Reset to page 1 when leads change (watch array reference to detect new searches)
+// This fixes the bug where pagination didn't reset when new search had same length
+// We track the array reference to detect when a completely new search result set arrives
+watch(
+  () => props.leads,
+  (newLeads) => {
+    // Check if this is a new array reference (new search completed)
+    // When a new search completes, the store assigns a new array reference to leads.value
+    if (previousLeadsRef.value !== newLeads) {
+      // Reset to page 1 for new search results
+      currentPage.value = 1;
+      // Clear selections when switching to new results
+      selectedIds.value = [];
+      // Update reference for next comparison
+      previousLeadsRef.value = newLeads;
+    }
+  },
+  { immediate: true }
+);
+
 function isSelected(leadId) {
   return selectedIds.value.includes(leadId);
 }
@@ -160,9 +323,20 @@ function toggleSelection(leadId) {
 
 function toggleAll() {
   if (allSelected.value) {
-    selectedIds.value = [];
+    // Deselect all on current page
+    paginatedLeads.value.forEach(lead => {
+      const index = selectedIds.value.indexOf(lead._id);
+      if (index > -1) {
+        selectedIds.value.splice(index, 1);
+      }
+    });
   } else {
-    selectedIds.value = props.leads.map(l => l._id);
+    // Select all on current page
+    paginatedLeads.value.forEach(lead => {
+      if (!selectedIds.value.includes(lead._id)) {
+        selectedIds.value.push(lead._id);
+      }
+    });
   }
 }
 
@@ -366,6 +540,57 @@ function handleExport(format) {
   background: #fff3cd;
   color: #856404;
   border-color: #ffc107;
+}
+
+/* Pagination Styles */
+.pagination-controls {
+  padding: var(--spacing-md);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--spacing-md);
+  margin-bottom: var(--spacing-md);
+}
+
+.pagination-info {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.page-size-select {
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border: var(--border-medium) solid var(--neutral-2);
+  background: var(--neutral-0);
+  font-size: 0.875rem;
+}
+
+.pagination-buttons {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.page-numbers {
+  display: flex;
+  gap: var(--spacing-xs);
+}
+
+.page-number {
+  min-width: 36px;
+}
+
+.page-number.active {
+  background: var(--accent);
+  color: var(--neutral-0);
+  border-color: var(--accent);
+}
+
+.btn-sm:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 </style>
 

@@ -14,6 +14,7 @@ const searchSchema = new mongoose.Schema({
   },
   country: String,
   location: String,
+  industry: String,
   resultCount: {
     type: Number,
     default: 50,

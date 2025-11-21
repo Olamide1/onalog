@@ -303,6 +303,7 @@ async function handleSearch(searchData) {
       searchData.query,
       searchData.country,
       searchData.location,
+      searchData.industry,
       searchData.resultCount
     );
     

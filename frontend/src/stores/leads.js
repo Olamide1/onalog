@@ -24,7 +24,7 @@ export const useLeadsStore = defineStore('leads', () => {
     );
   });
   
-  async function createSearch(query, country, location, resultCount) {
+  async function createSearch(query, country, location, industry, resultCount) {
     loading.value = true;
     error.value = null;
     
@@ -33,6 +33,7 @@ export const useLeadsStore = defineStore('leads', () => {
         query,
         country,
         location,
+        industry,
         resultCount: parseInt(resultCount)
       });
       
