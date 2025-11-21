@@ -256,7 +256,7 @@ const searchQueue = {
  */
 router.post('/', async (req, res) => {
   try {
-    const { query, country, location, resultCount = 50 } = req.body;
+    const { query, country, location, industry, resultCount = 50 } = req.body;
     
     if (!query) {
       return res.status(400).json({ error: 'Search query is required' });
@@ -315,6 +315,7 @@ router.post('/', async (req, res) => {
       query,
       country,
       location,
+      industry,
       resultCount,
       userId,
       priority,
