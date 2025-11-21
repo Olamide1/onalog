@@ -223,7 +223,7 @@ const selectedIds = ref([]);
 const sortBy = ref('signalStrength');
 const sortOrder = ref('desc');
 const currentPage = ref(1);
-const pageSize = ref(50);
+const pageSize = ref(10);
 const previousLeadsRef = ref(null);
 
 const allSelected = computed(() => {
