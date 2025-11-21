@@ -1,8 +1,44 @@
 <template>
-  <div class="panel" :class="{ closed: !isOpen }">
+  <div class="panel" :class="{ closed: !isOpen }" tabindex="0">
+    <!-- Breadcrumb Navigation -->
+    <div class="panel-breadcrumb">
+      <button @click="close" class="breadcrumb-link">Dashboard</button>
+      <span class="breadcrumb-separator">›</span>
+      <button @click="close" class="breadcrumb-link">Search Results</button>
+      <span class="breadcrumb-separator">›</span>
+      <span class="breadcrumb-current">{{ lead.companyName }}</span>
+    </div>
+
     <div class="panel-header">
+      <div class="panel-header-left">
+        <button @click="goBack" class="btn-back">
+          ← Back to Results
+        </button>
       <h2>{{ lead.companyName }}</h2>
-      <button @click="close" class="close-btn">×</button>
+        <div v-if="searchQuery" class="search-context">From search: "{{ searchQuery }}"</div>
+      </div>
+      <div class="panel-header-right">
+        <div v-if="showNavigation" class="lead-navigation">
+          <button 
+            @click="navigateToLead('prev')" 
+            :disabled="!hasPrevious"
+            class="btn-nav"
+            title="Previous Lead (←)"
+          >
+            ←
+          </button>
+          <span class="nav-counter">{{ currentLeadIndex + 1 }} / {{ totalLeads }}</span>
+          <button 
+            @click="navigateToLead('next')" 
+            :disabled="!hasNext"
+            class="btn-nav"
+            title="Next Lead (→)"
+          >
+            →
+          </button>
+        </div>
+        <button @click="close" class="close-btn" title="Close (ESC)">×</button>
+      </div>
     </div>
 
     <div class="panel-content">
@@ -147,6 +183,7 @@
             :lead="lead"
             :search-query="searchQuery"
             @generate="generateOutreach"
+            @copied="$emit('copied', $event)"
           />
         </div>
       </section>
@@ -158,7 +195,7 @@
 </template>
 
 <script setup>
-import { ref, computed, watch } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import OutreachAssistant from './OutreachAssistant.vue';
 
 const props = defineProps({
@@ -169,10 +206,14 @@ const props = defineProps({
   searchQuery: {
     type: String,
     default: ''
+  },
+  allLeads: {
+    type: Array,
+    default: () => []
   }
 });
 
-const emit = defineEmits(['close']);
+const emit = defineEmits(['close', 'navigate-lead', 'copied']);
 
 const isOpen = ref(true);
 
@@ -180,21 +221,99 @@ const hasSocials = computed(() => {
   return props.lead.socials && Object.values(props.lead.socials).some(v => v);
 });
 
+const currentLeadIndex = computed(() => {
+  if (!props.allLeads || props.allLeads.length === 0) return -1;
+  return props.allLeads.findIndex(l => l._id === props.lead._id);
+});
+
+const totalLeads = computed(() => {
+  return props.allLeads?.length || 0;
+});
+
+const hasPrevious = computed(() => {
+  return currentLeadIndex.value > 0;
+});
+
+const hasNext = computed(() => {
+  return currentLeadIndex.value >= 0 && currentLeadIndex.value < totalLeads.value - 1;
+});
+
+const showNavigation = computed(() => {
+  return totalLeads.value > 1;
+});
+
 watch(() => props.lead, () => {
   isOpen.value = true;
+});
+
+// ESC key handler
+function handleKeydown(event) {
+  if (event.key === 'Escape' && isOpen.value) {
+    close();
+  }
+}
+
+// Keyboard navigation (arrow keys)
+function handleKeydownNav(event) {
+  if (!isOpen.value) return;
+  
+  if (event.key === 'ArrowLeft' && hasPrevious.value) {
+    event.preventDefault();
+    navigateToLead('prev');
+  } else if (event.key === 'ArrowRight' && hasNext.value) {
+    event.preventDefault();
+    navigateToLead('next');
+  }
+}
+
+onMounted(() => {
+  document.addEventListener('keydown', handleKeydown);
+  document.addEventListener('keydown', handleKeydownNav);
+});
+
+onUnmounted(() => {
+  document.removeEventListener('keydown', handleKeydown);
+  document.removeEventListener('keydown', handleKeydownNav);
 });
 
 function close() {
   isOpen.value = false;
   setTimeout(() => {
     emit('close');
+    // Scroll to top of results when closing
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   }, 300);
+}
+
+function goBack() {
+  close();
+}
+
+function navigateToLead(direction) {
+  if (!showNavigation.value) return;
+  
+  let newIndex;
+  if (direction === 'prev' && hasPrevious.value) {
+    newIndex = currentLeadIndex.value - 1;
+  } else if (direction === 'next' && hasNext.value) {
+    newIndex = currentLeadIndex.value + 1;
+  } else {
+    return;
+  }
+  
+  const newLead = props.allLeads[newIndex];
+  if (newLead) {
+    emit('navigate-lead', newLead);
+  }
 }
 
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text).then(() => {
-    // Could add toast notification here
-    console.log('Copied:', text);
+    // Emit copy event for toast notification
+    emit('copied', { type: 'success', message: 'Copied to clipboard' });
+  }).catch(err => {
+    console.error('Failed to copy:', err);
+    emit('copied', { type: 'error', message: 'Failed to copy' });
   });
 }
 
@@ -208,13 +327,126 @@ async function generateOutreach() {
   padding: var(--spacing-xl);
 }
 
+.panel-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  margin-bottom: var(--spacing-md);
+  font-size: 0.875rem;
+  padding-bottom: var(--spacing-sm);
+  border-bottom: var(--border-thin) solid var(--neutral-2);
+}
+
+.breadcrumb-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.875rem;
+}
+
+.breadcrumb-link:hover {
+  text-decoration: underline;
+}
+
+.breadcrumb-separator {
+  color: var(--neutral-3);
+  font-weight: var(--font-weight-bold);
+}
+
+.breadcrumb-current {
+  color: var(--neutral-2);
+  font-weight: var(--font-weight-semibold);
+}
+
 .panel-header {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   margin-bottom: var(--spacing-xl);
   padding-bottom: var(--spacing-md);
   border-bottom: var(--border-thick) solid var(--neutral-2);
+  gap: var(--spacing-md);
+}
+
+.panel-header-left {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+}
+
+.panel-header-right {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-md);
+}
+
+.btn-back {
+  align-self: flex-start;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border: var(--border-medium) solid var(--neutral-2);
+  background: white;
+  color: var(--neutral-2);
+  cursor: pointer;
+  font-size: 0.875rem;
+  font-weight: var(--font-weight-semibold);
+  transition: all 0.2s linear;
+  margin-bottom: var(--spacing-xs);
+}
+
+.btn-back:hover {
+  background: var(--neutral-1);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.search-context {
+  font-size: 0.875rem;
+  color: var(--neutral-3);
+  font-style: italic;
+}
+
+.lead-navigation {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  padding: var(--spacing-xs);
+  border: var(--border-thin) solid var(--neutral-2);
+}
+
+.btn-nav {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1.25rem;
+  color: var(--neutral-2);
+  padding: var(--spacing-xs);
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s linear;
+}
+
+.btn-nav:hover:not(:disabled) {
+  background: var(--neutral-1);
+  color: var(--accent);
+}
+
+.btn-nav:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.nav-counter {
+  font-size: 0.875rem;
+  color: var(--neutral-3);
+  min-width: 50px;
+  text-align: center;
 }
 
 .close-btn {

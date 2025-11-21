@@ -217,7 +217,7 @@ const props = defineProps({
   }
 });
 
-const emit = defineEmits(['select-lead', 'export']);
+const emit = defineEmits(['select-lead', 'export', 'toast']);
 
 const selectedIds = ref([]);
 const sortBy = ref('signalStrength');
@@ -364,6 +364,12 @@ function formatUrl(url) {
 
 function handleExport(format) {
   emit('export', format);
+  // Emit toast notification (parent will handle)
+  emit('toast', {
+    type: 'success',
+    message: `${format.toUpperCase()} export started. Check your downloads.`,
+    duration: 4000
+  });
 }
 </script>
 

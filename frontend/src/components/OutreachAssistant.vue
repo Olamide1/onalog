@@ -70,7 +70,7 @@ const props = defineProps({
   }
 });
 
-const emit = defineEmits(['generate']);
+const emit = defineEmits(['generate', 'copied']);
 
 const outreach = ref(null);
 const generating = ref(false);
@@ -106,6 +106,11 @@ async function generate() {
 function copyToClipboard(text) {
   navigator.clipboard.writeText(text).then(() => {
     console.log('Copied:', text);
+    // Emit toast notification (parent will handle)
+    emit('copied', { type: 'success', message: 'Copied to clipboard' });
+  }).catch(err => {
+    console.error('Failed to copy:', err);
+    emit('copied', { type: 'error', message: 'Failed to copy' });
   });
 }
 </script>

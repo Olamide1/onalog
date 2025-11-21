@@ -3,6 +3,24 @@
     <!-- Header - Stella band style -->
     <header class="dashboard-header horizontal-band">
       <div class="container">
+        <!-- Breadcrumb Navigation -->
+        <div class="breadcrumb-nav">
+          <button @click="goToDashboard" class="breadcrumb-link">Dashboard</button>
+          <template v-if="leadsStore.currentSearch && !selectedLead">
+            <span class="breadcrumb-separator">›</span>
+            <button 
+              @click="scrollToResults"
+              class="breadcrumb-link"
+            >
+              Search: "{{ leadsStore.currentSearch.query }}"
+            </button>
+          </template>
+          <template v-if="selectedLead">
+            <span class="breadcrumb-separator">›</span>
+            <span class="breadcrumb-current">{{ selectedLead.companyName }}</span>
+          </template>
+        </div>
+        
         <div class="header-content">
           <div class="header-left">
             <h1>coralgen</h1>
@@ -100,9 +118,18 @@
             <div class="progress-fill" :style="{ width: progressPercent + '%' }"></div>
           </div>
         </div>
-        <button @click="clearSearch" class="btn" style="margin-top: var(--spacing-md);">
-          Start New Search
+        <div class="search-actions">
+          <button 
+            v-if="leadsStore.filteredLeads.length > 0" 
+            @click="scrollToResults" 
+            class="btn btn-outline"
+          >
+            View Results ({{ leadsStore.filteredLeads.length }})
+          </button>
+          <button @click="clearSearch" class="btn">
+            {{ leadsStore.filteredLeads.length > 0 ? '← Back to Dashboard' : 'Start New Search' }}
         </button>
+        </div>
       </div>
 
       <!-- Loading State - When processing but no leads yet -->
@@ -147,22 +174,113 @@
         :is-processing="leadsStore.currentSearch?.status === 'processing'"
         @select-lead="openLeadDetail"
         @export="handleExport"
+        @toast="showToast"
       />
 
       <!-- Empty State - No Search -->
       <div v-if="!leadsStore.loading && leadsStore.filteredLeads.length === 0 && !leadsStore.currentSearch && !loadingStats" class="empty-state geometric-block">
+        <div class="empty-icon-large">
+          <div class="icon-search"></div>
+        </div>
         <h2>Start a search to discover leads</h2>
-        <p>Enter a business query above to begin</p>
+        <p class="empty-description">Enter a business query above to begin discovering and enriching B2B leads</p>
+        
+        <!-- Example Searches -->
+        <div class="example-searches">
+          <p class="examples-label">Try these example searches:</p>
+          <div class="example-chips">
+            <button 
+              @click="loadExampleSearch('Coffee shops in Nairobi')" 
+              class="example-chip"
+            >
+              Coffee shops in Nairobi
+            </button>
+            <button 
+              @click="loadExampleSearch('SaaS companies in South Africa')" 
+              class="example-chip"
+            >
+              SaaS companies in South Africa
+            </button>
+            <button 
+              @click="loadExampleSearch('Real estate agents in Lagos')" 
+              class="example-chip"
+            >
+              Real estate agents in Lagos
+            </button>
+            <button 
+              @click="loadExampleSearch('Marketing agencies')" 
+              class="example-chip"
+            >
+              Marketing agencies
+            </button>
+            <button 
+              @click="loadExampleSearch('Hospitals in Kenya')" 
+              class="example-chip"
+            >
+              Hospitals in Kenya
+            </button>
+          </div>
+        </div>
+        
+        <div class="empty-actions">
+          <button @click="scrollToTemplates" class="btn btn-outline" v-if="searchFormRef">
+            View Saved Templates
+          </button>
+        </div>
       </div>
 
       <!-- Empty State - Search Completed with 0 Results -->
       <div v-if="leadsStore.currentSearch && leadsStore.currentSearch.status === 'completed' && leadsStore.filteredLeads.length === 0 && !leadsStore.loading" class="empty-state geometric-block">
+        <div class="empty-icon-large">
+          <div class="icon-search"></div>
+        </div>
         <h2>No Results Found</h2>
-        <p>Your search for "{{ leadsStore.currentSearch.query }}" returned 0 results.</p>
-        <p class="empty-hint">Try adjusting your search query or filters and search again.</p>
-        <button @click="clearSearch" class="btn btn-accent" style="margin-top: var(--spacing-md);">
+        <p class="empty-description">Your search for <strong>"{{ leadsStore.currentSearch.query }}"</strong> returned 0 results.</p>
+        
+        <!-- Troubleshooting Suggestions -->
+        <div class="troubleshooting-box">
+          <h3>Try these suggestions:</h3>
+          <ul class="suggestions-list">
+            <li>Make your query <strong>broader</strong> - try "restaurants" instead of "fine dining Italian restaurants"</li>
+            <li v-if="leadsStore.currentSearch.location">Remove the <strong>location filter</strong> to search globally</li>
+            <li v-if="leadsStore.currentSearch.industry">Try a different <strong>industry</strong> or remove the industry filter</li>
+            <li v-if="leadsStore.currentSearch.country">Check if the <strong>country filter</strong> matches your query</li>
+            <li>Use simpler, more common business terms</li>
+          </ul>
+        </div>
+        
+        <!-- Alternative Suggestions -->
+        <div class="alternative-searches">
+          <p class="suggestions-label">Try these alternative searches:</p>
+          <div class="example-chips">
+            <button 
+              @click="loadExampleSearch(leadsStore.currentSearch.query.split(' ')[0])" 
+              class="example-chip"
+            >
+              {{ leadsStore.currentSearch.query.split(' ')[0] }} businesses
+            </button>
+            <button 
+              @click="loadAlternativeSearch(leadsStore.currentSearch.location, leadsStore.currentSearch.country)" 
+              class="example-chip"
+              v-if="leadsStore.currentSearch.location || leadsStore.currentSearch.country"
+            >
+              Companies in {{ getDisplayLocation(leadsStore.currentSearch.location, leadsStore.currentSearch.country) }}
+            </button>
+          </div>
+        </div>
+        
+        <div class="empty-state-actions">
+          <button 
+            v-if="leadsStore.currentSearch" 
+            @click="modifySearch" 
+            class="btn btn-accent"
+          >
+            Modify Search
+          </button>
+          <button @click="clearSearch" class="btn">
           Start New Search
         </button>
+        </div>
       </div>
     </div>
 
@@ -171,10 +289,30 @@
       v-if="selectedLead"
       :lead="selectedLead"
       :search-query="leadsStore.currentSearch?.query"
+      :all-leads="leadsStore.filteredLeads"
       @close="closeLeadDetail"
+      @navigate-lead="navigateToLead"
+      @copied="showToast"
     />
   
   <BuyCreditsModal v-if="showBuyModal" @close="showBuyModal = false" @updated="refreshCredits" />
+  
+  <!-- Toast Notifications -->
+  <div v-if="toastNotifications.length > 0" class="toast-notifications">
+    <div
+      v-for="toast in toastNotifications"
+      :key="toast.id"
+      class="toast"
+      :class="toast.type"
+    >
+      <span class="toast-icon">
+        <span v-if="toast.type === 'success'">✓</span>
+        <span v-else-if="toast.type === 'error'">✗</span>
+        <span v-else>ℹ</span>
+      </span>
+      <span class="toast-message">{{ toast.message }}</span>
+    </div>
+  </div>
   
   <!-- Completion Notifications -->
   <div v-if="completedNotifications.length > 0" class="completion-notifications">
@@ -230,6 +368,7 @@ import RecentSearches from '../components/RecentSearches.vue';
 import CreditPill from '../components/CreditPill.vue';
 import BuyCreditsModal from '../components/BuyCreditsModal.vue';
 import api from '../services/api';
+import { getCountryName, allCountries } from '../utils/countries';
 
 const router = useRouter();
 const leadsStore = useLeadsStore();
@@ -248,6 +387,8 @@ let recentSearchesInterval = null;
 const showBuyModal = ref(false);
 const creditBalance = ref(null);
 const completedNotifications = ref([]);
+const toastNotifications = ref([]);
+let toastIdCounter = 0;
 
 // Check auth on mount
 onMounted(async () => {
@@ -483,8 +624,11 @@ async function openLeadDetail(lead) {
   try {
     const detail = await leadsStore.fetchLeadDetail(lead._id);
     selectedLead.value = detail;
+    // Scroll to top to show the detail panel
+    window.scrollTo({ top: 0, behavior: 'smooth' });
   } catch (error) {
     console.error('Error fetching lead detail:', error);
+    showToast({ type: 'error', message: 'Failed to load lead details' });
   }
 }
 
@@ -492,10 +636,25 @@ function closeLeadDetail() {
   selectedLead.value = null;
 }
 
+async function navigateToLead(lead) {
+  try {
+    const detail = await leadsStore.fetchLeadDetail(lead._id);
+    selectedLead.value = detail;
+  } catch (error) {
+    console.error('Error navigating to lead:', error);
+    showToast({ type: 'error', message: 'Failed to load lead' });
+  }
+}
+
 function handleExport(format) {
   const searchId = leadsStore.currentSearch?._id;
   const url = `/api/export/${format}${searchId ? `?searchId=${searchId}` : ''}`;
   window.open(url, '_blank');
+  showToast({ 
+    type: 'success', 
+    message: `${format.toUpperCase()} export started. Check your downloads.`,
+    duration: 4000
+  });
 }
 
 async function loadDashboardStats() {
@@ -590,16 +749,234 @@ async function selectFromAll(search) {
 }
 
 function clearSearch() {
+  selectedLead.value = null; // Close any open lead detail
   leadsStore.currentSearch = null;
   leadsStore.leads = [];
   stopPolling();
   // Refresh stats
   loadDashboardStats();
+  // Scroll to top
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function scrollToResults() {
+  // Close lead detail if open
+  if (selectedLead.value) {
+    selectedLead.value = null;
+  }
+  
+  const resultsElement = document.querySelector('.lead-list');
+  if (resultsElement) {
+    setTimeout(() => {
+      resultsElement.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  } else {
+    // Fallback: scroll to top
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+}
+
+function goToDashboard() {
+  // Close lead detail if open
+  if (selectedLead.value) {
+    selectedLead.value = null;
+  }
+  // Clear search
+  clearSearch();
+  // Scroll to top
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function loadExampleSearch(exampleQuery) {
+  if (!searchFormRef.value) return;
+  
+  // Parse example query (basic parsing)
+  const parts = exampleQuery.toLowerCase().split(/\s+(?:in|at)\s+/);
+  const query = parts[0];
+  const location = parts[1] || '';
+  
+  // Try to detect country from location (handles both names and codes)
+  let country = '';
+  const locationLower = location.toLowerCase().trim();
+  
+  // First check if it's a 2-letter country code
+  if (locationLower.length === 2) {
+    const countryObj = allCountries.find(c => c.code.toLowerCase() === locationLower);
+    if (countryObj) {
+      country = countryObj.code;
+    }
+  }
+  
+  // If not a code, try to detect by country/city names
+  if (!country) {
+    if (locationLower.includes('nairobi') || locationLower.includes('kenya')) country = 'ke';
+    else if (locationLower.includes('lagos') || locationLower.includes('nigeria')) country = 'ng';
+    else if (locationLower.includes('johannesburg') || locationLower.includes('cape town') || locationLower.includes('south africa')) country = 'za';
+    else if (locationLower.includes('accra') || locationLower.includes('ghana')) country = 'gh';
+    // Check against all country names
+    else {
+      const countryObj = allCountries.find(c => 
+        c.name.toLowerCase() === locationLower || 
+        locationLower.includes(c.name.toLowerCase())
+      );
+      if (countryObj) {
+        country = countryObj.code;
+      }
+    }
+  }
+  
+  // If we found a country, use the location field only if it's a city, not the country name
+  let locationField = location;
+  if (country && locationField) {
+    const countryObj = allCountries.find(c => c.code === country);
+    // If location matches country name, clear it (country is already set)
+    if (countryObj && locationField.toLowerCase() === countryObj.name.toLowerCase()) {
+      locationField = '';
+    }
+    // If location is the country code, clear it
+    else if (locationField.toLowerCase() === country.toLowerCase()) {
+      locationField = '';
+    }
+  }
+  
+  searchFormRef.value.setSearchParams({
+    query: query,
+    country: country,
+    location: locationField,
+    industry: '',
+    resultCount: 50
+  });
+  
+  // Scroll to form and trigger search
+  setTimeout(() => {
+    const searchForm = document.querySelector('.search-form');
+    if (searchForm) {
+      searchForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      // Auto-submit after a short delay
+      setTimeout(() => {
+        if (searchFormRef.value) {
+          searchFormRef.value.submitSearch();
+        }
+      }, 300);
+    }
+  }, 100);
+}
+
+function loadAlternativeSearch(location, countryCode) {
+  // Build the search query properly, converting country code to name if needed
+  let searchLocation = location;
+  if (!searchLocation && countryCode) {
+    // Convert country code to name for the query string
+    searchLocation = getCountryName(countryCode);
+  }
+  
+  const query = searchLocation ? `companies in ${searchLocation}` : 'companies';
+  loadExampleSearch(query);
+}
+
+function getDisplayLocation(location, countryCode) {
+  // Return location if it exists, otherwise convert country code to name
+  if (location) {
+    return location;
+  }
+  if (countryCode) {
+    return getCountryName(countryCode);
+  }
+  return '';
+}
+
+async function toggleTemplates() {
+  if (searchFormRef.value) {
+    await searchFormRef.value.toggleTemplates();
+  }
+}
+
+async function scrollToTemplates() {
+  if (searchFormRef.value) {
+    try {
+      // First open the templates section if it's not open, and wait for it to complete
+      const isTemplatesOpen = searchFormRef.value.showTemplates;
+      if (!isTemplatesOpen) {
+        // Await the async toggleTemplates to ensure templates are loaded
+        await searchFormRef.value.toggleTemplates();
+      }
+      
+      // Wait a bit for DOM to update, then scroll
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      const templatesSection = document.querySelector('.templates-section');
+      if (templatesSection) {
+        templatesSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        // Add a subtle highlight effect
+        templatesSection.style.transition = 'box-shadow 0.3s ease';
+        templatesSection.style.boxShadow = '0 0 0 4px rgba(0, 123, 255, 0.2)';
+        setTimeout(() => {
+          templatesSection.style.boxShadow = '';
+        }, 2000);
+      }
+    } catch (e) {
+      // Fallback: try to open templates (with await to ensure it completes)
+      try {
+        await searchFormRef.value.toggleTemplates();
+        // Wait a bit for DOM to update
+        await new Promise(resolve => setTimeout(resolve, 100));
+      } catch (err) {
+        console.error('Error opening templates:', err);
+      }
+      // Still try to scroll after a delay
+      setTimeout(() => {
+        const templatesSection = document.querySelector('.templates-section');
+        if (templatesSection) {
+          templatesSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }
+      }, 500);
+    }
+  }
+}
+
+function modifySearch() {
+  if (leadsStore.currentSearch) {
+    // Pre-fill search form with current search parameters
+    if (searchFormRef.value) {
+      searchFormRef.value.setSearchParams({
+        query: leadsStore.currentSearch.query,
+        country: leadsStore.currentSearch.country || '',
+        location: leadsStore.currentSearch.location || '',
+        industry: leadsStore.currentSearch.industry || '',
+        resultCount: leadsStore.currentSearch.resultCount || 50
+      });
+    }
+    clearSearch();
+    // Scroll to search form
+    setTimeout(() => {
+      const searchForm = document.querySelector('.search-form');
+      if (searchForm) {
+        searchForm.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  }
 }
 
 function handleLogout() {
   authStore.clearUser();
   router.push('/');
+}
+
+function showToast(notification) {
+  // Use a counter combined with timestamp to ensure unique IDs even for rapid calls
+  toastIdCounter += 1;
+  const toast = {
+    id: `toast-${Date.now()}-${toastIdCounter}`,
+    type: notification.type || 'info',
+    message: notification.message || 'Action completed',
+    duration: notification.duration || 3000
+  };
+  
+  toastNotifications.value.push(toast);
+  
+  setTimeout(() => {
+    toastNotifications.value = toastNotifications.value.filter(t => t.id !== toast.id);
+  }, toast.duration);
 }
 </script>
 
@@ -704,6 +1081,271 @@ function handleLogout() {
     transform: translateX(0);
     opacity: 1;
   }
+}
+
+/* Toast Notifications */
+.toast-notifications {
+  position: fixed;
+  bottom: var(--spacing-lg);
+  right: var(--spacing-lg);
+  z-index: 10001;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  max-width: 350px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: var(--spacing-md) var(--spacing-lg);
+  background: white;
+  border: var(--border-medium) solid var(--neutral-2);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  animation: slideUp 0.3s ease-out;
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  pointer-events: auto;
+}
+
+.toast.success {
+  border-color: #4caf50;
+  background: #e8f5e9;
+}
+
+.toast.error {
+  border-color: #f44336;
+  background: #ffebee;
+}
+
+.toast.info {
+  border-color: #2196f3;
+  background: #e3f2fd;
+}
+
+.toast-icon {
+  font-size: 1.25rem;
+  font-weight: bold;
+  flex-shrink: 0;
+}
+
+.toast.success .toast-icon {
+  color: #2e7d32;
+}
+
+.toast.error .toast-icon {
+  color: #c62828;
+}
+
+.toast.info .toast-icon {
+  color: #1565c0;
+}
+
+.toast-message {
+  font-size: 0.875rem;
+  flex: 1;
+}
+
+@keyframes slideUp {
+  from {
+    transform: translateY(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+/* Breadcrumb Navigation */
+.breadcrumb-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  margin-bottom: var(--spacing-md);
+  padding: var(--spacing-sm) 0;
+  font-size: 0.875rem;
+  border-bottom: var(--border-thin) solid var(--neutral-2);
+}
+
+.breadcrumb-link {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  text-decoration: none;
+  padding: var(--spacing-xs) var(--spacing-sm);
+  font-size: 0.875rem;
+  transition: all 0.2s linear;
+}
+
+.breadcrumb-link:hover {
+  text-decoration: underline;
+  color: var(--accent);
+  background: var(--neutral-1);
+  border-radius: 4px;
+}
+
+.breadcrumb-separator {
+  color: var(--neutral-3);
+  font-weight: var(--font-weight-bold);
+  user-select: none;
+}
+
+.breadcrumb-current {
+  color: var(--neutral-2);
+  font-weight: var(--font-weight-semibold);
+  padding: var(--spacing-xs) var(--spacing-sm);
+}
+
+/* Enhanced Empty States */
+.empty-state {
+  text-align: center;
+  padding: var(--spacing-xxl);
+  margin-top: var(--spacing-xl);
+}
+
+.empty-icon-large {
+  width: 80px;
+  height: 80px;
+  margin: 0 auto var(--spacing-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: var(--border-thick) solid var(--neutral-2);
+  background: var(--neutral-1);
+  position: relative;
+}
+
+.icon-search {
+  width: 40px;
+  height: 40px;
+  border: var(--border-medium) solid var(--neutral-2);
+  border-radius: 50%;
+  position: relative;
+}
+
+.icon-search::before {
+  content: '';
+  position: absolute;
+  bottom: -8px;
+  right: -8px;
+  width: 16px;
+  height: var(--border-medium);
+  background: var(--neutral-2);
+  transform: rotate(45deg);
+  transform-origin: right center;
+}
+
+.empty-state h2 {
+  margin-bottom: var(--spacing-md);
+  color: var(--neutral-2);
+}
+
+.empty-description {
+  color: var(--neutral-3);
+  font-size: 1rem;
+  margin-bottom: var(--spacing-xl);
+  max-width: 600px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Example Searches */
+.example-searches,
+.alternative-searches {
+  margin: var(--spacing-xl) 0;
+  text-align: center;
+}
+
+.examples-label,
+.suggestions-label {
+  font-size: 0.875rem;
+  color: var(--neutral-3);
+  margin-bottom: var(--spacing-md);
+  font-weight: var(--font-weight-semibold);
+}
+
+.example-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-sm);
+  justify-content: center;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+.example-chip {
+  padding: var(--spacing-sm) var(--spacing-md);
+  border: var(--border-medium) solid var(--neutral-2);
+  background: white;
+  color: var(--neutral-2);
+  cursor: pointer;
+  font-size: 0.875rem;
+  transition: all 0.2s linear;
+  border-radius: 4px;
+}
+
+.example-chip:hover {
+  background: var(--accent);
+  color: white;
+  border-color: var(--accent);
+  transform: translateY(-2px);
+  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+}
+
+/* Troubleshooting Box */
+.troubleshooting-box {
+  background: var(--neutral-1);
+  border: var(--border-medium) solid var(--neutral-2);
+  padding: var(--spacing-lg);
+  margin: var(--spacing-xl) auto;
+  max-width: 700px;
+  text-align: left;
+  border-radius: 4px;
+}
+
+.troubleshooting-box h3 {
+  margin-bottom: var(--spacing-md);
+  color: var(--neutral-2);
+  font-size: 1rem;
+}
+
+.suggestions-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.suggestions-list li {
+  padding: var(--spacing-sm) 0;
+  padding-left: var(--spacing-lg);
+  position: relative;
+  color: var(--neutral-3);
+  line-height: 1.6;
+}
+
+.suggestions-list li::before {
+  content: "→";
+  position: absolute;
+  left: 0;
+  color: var(--accent);
+  font-weight: bold;
+}
+
+.suggestions-list li strong {
+  color: var(--neutral-2);
+}
+
+/* Empty State Actions */
+.empty-actions,
+.empty-state-actions,
+.search-actions {
+  display: flex;
+  gap: var(--spacing-md);
+  justify-content: center;
+  margin-top: var(--spacing-xl);
+  flex-wrap: wrap;
 }
 
 .header-content {

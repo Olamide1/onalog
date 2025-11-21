@@ -2,20 +2,29 @@
   <form @submit.prevent="handleSubmit" class="search-form geometric-block">
     <!-- Search Input - Wide rectangular band -->
     <div class="search-input-wrapper">
+      <label class="search-label">
+        Search Query
+        <span class="field-help" title="Enter the type of business or industry you want to find. Examples: 'coffee shops', 'SaaS companies', 'marketing agencies'">ℹ️</span>
+      </label>
       <input
         v-model="formData.query"
         type="text"
-        placeholder="Search for businesses..."
+        placeholder="e.g., coffee shops, SaaS companies, marketing agencies"
         class="input search-input"
         required
+        title="Enter the type of business or industry you want to find"
       />
+      <p class="helper-text">Be specific: "Coffee shops in Nairobi" works better than just "coffee"</p>
     </div>
 
     <!-- Filters - Flat geometric blocks -->
     <div class="filters-grid grid grid-4">
       <div class="filter-block">
-        <label class="filter-label">Country</label>
-        <select v-model="formData.country" class="input">
+        <label class="filter-label">
+          Country
+          <span class="field-help" title="Filter results to a specific country. Leave empty to search globally.">ℹ️</span>
+        </label>
+        <select v-model="formData.country" class="input" title="Filter results to a specific country">
           <option value="">All Countries</option>
           <optgroup label="Africa">
             <option value="ng">Nigeria</option>
@@ -90,21 +99,30 @@
             <option value="pe">Peru</option>
           </optgroup>
         </select>
+        <p class="helper-text">Leave empty to search all countries</p>
       </div>
 
       <div class="filter-block">
-        <label class="filter-label">Location</label>
+        <label class="filter-label">
+          Location
+          <span class="field-help" title="Enter a specific city or region to narrow down results within the selected country.">ℹ️</span>
+        </label>
         <input
           v-model="formData.location"
           type="text"
           class="input"
           placeholder="e.g., Lagos, Nairobi, Accra"
+          title="Enter a specific city or region"
         />
+        <p class="helper-text">Optional: narrow results to a specific city or region</p>
       </div>
 
       <div class="filter-block">
-        <label class="filter-label">Industry</label>
-        <select v-model="formData.industry" class="input">
+        <label class="filter-label">
+          Industry
+          <span class="field-help" title="Filter businesses by industry category for more targeted results.">ℹ️</span>
+        </label>
+        <select v-model="formData.industry" class="input" title="Filter businesses by industry category">
           <option value="">All Industries</option>
           <option value="Technology">Technology</option>
           <option value="Software">Software</option>
@@ -136,12 +154,16 @@
         </select>
       </div>
       <div class="filter-block">
-        <label class="filter-label">Result Count</label>
-        <select v-model="formData.resultCount" class="input">
+        <label class="filter-label">
+          Result Count
+          <span class="field-help" title="Choose how many results to retrieve. More results take longer to process and cost more credits.">ℹ️</span>
+        </label>
+        <select v-model="formData.resultCount" class="input" title="Number of results to retrieve">
           <option :value="50">50</option>
           <option :value="100">100</option>
           <option :value="200">200</option>
         </select>
+        <p class="helper-text">More results = longer processing time and higher credit cost</p>
       </div>
     </div>
 
@@ -254,6 +276,10 @@ async function handleSubmit() {
   loading.value = false;
 }
 
+async function submitSearch() {
+  await handleSubmit();
+}
+
 async function saveAsTemplate() {
   if (!currentSearchId.value) {
     alert('Please start a search first');
@@ -345,8 +371,20 @@ function setSearchId(searchId) {
   currentSearchId.value = searchId;
 }
 
+function setSearchParams(params) {
+  if (params.query !== undefined) formData.value.query = params.query;
+  if (params.country !== undefined) formData.value.country = params.country;
+  if (params.location !== undefined) formData.value.location = params.location;
+  if (params.industry !== undefined) formData.value.industry = params.industry;
+  if (params.resultCount !== undefined) formData.value.resultCount = params.resultCount;
+}
+
 defineExpose({
-  setSearchId
+  setSearchId,
+  setSearchParams,
+  toggleTemplates,
+  submitSearch,
+  get showTemplates() { return showTemplates.value; }
 });
 
 // Watch for template changes and refresh when section is opened
@@ -405,11 +443,41 @@ onMounted(() => {
   gap: var(--spacing-sm);
 }
 
+.search-label,
 .filter-label {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
   font-weight: var(--font-weight-semibold);
   font-size: 0.875rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
+  margin-bottom: var(--spacing-xs);
+}
+
+.search-label {
+  margin-bottom: var(--spacing-sm);
+}
+
+.field-help {
+  cursor: help;
+  font-size: 0.75rem;
+  opacity: 0.6;
+  transition: opacity 0.2s linear;
+  font-style: normal;
+}
+
+.field-help:hover {
+  opacity: 1;
+}
+
+.helper-text {
+  font-size: 0.75rem;
+  color: var(--neutral-3);
+  margin-top: var(--spacing-xs);
+  margin-bottom: 0;
+  font-style: italic;
+  line-height: 1.4;
 }
 
 .search-actions {
