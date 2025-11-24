@@ -43,6 +43,11 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// a hi response in base route
+app.get('/', (req, res) => {
+  res.json({ message: 'hi', timestamp: new Date().toISOString() });
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Error:', err);
