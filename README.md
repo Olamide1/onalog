@@ -174,6 +174,10 @@ npm run build
 - MongoDB Atlas free tier compatible
 - Low-bandwidth safe design
 - Mobile responsive
+- output logs on heroku
+    ```cmd
+    heroku logs --app=caoral-gen-be -n 500 >> heroku.log
+    ```
 
 ## License
 
