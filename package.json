@@ -12,7 +12,7 @@
     "start:backend": "cd backend && npm start",
     "kill-port": "lsof -ti:3000 | xargs kill -9 2>/dev/null || echo 'Port 3000 is free'",
     "dev:clean": "npm run kill-port && npm run dev",
-    "heroku-prebuild": "cd backend"
+    "heroku-prebuild": "npm --prefix backend install"
   },
   "engines": {
     "node": "18.x",
