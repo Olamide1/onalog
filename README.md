@@ -177,13 +177,12 @@ npm run build
 - output logs on heroku
     ```cmd
     heroku logs --app=caoral-gen-be -n 500 >> heroku.log
-
-    // steps to make heroku run the /backend folder
-    heroku buildpacks:add -a caoral-gen-be https://github.com/lstoll/heroku-buildpack-monorepo
+    ```
+- steps to make heroku run the /backend folder
+    ```cmd
+    heroku buildpacks:add -a caoral-gen-be https://github.com/lstoll/heroku-buildpack-monorepo -i 1
 
     heroku config:set -a caoral-gen-be APP_BASE=backend
-
-
     ```
 
 ## License
