@@ -11,7 +11,12 @@
     "build:frontend": "cd frontend && npm install && npm run build",
     "start:backend": "cd backend && npm start",
     "kill-port": "lsof -ti:3000 | xargs kill -9 2>/dev/null || echo 'Port 3000 is free'",
-    "dev:clean": "npm run kill-port && npm run dev"
+    "dev:clean": "npm run kill-port && npm run dev",
+    "heroku-postbuild": "cd backend && npm install"
+  },
+  "engines": {
+    "node": "18.x",
+    "npm": "9.x"
   },
   "keywords": ["lead-generation", "b2b", "scraping"],
   "author": "",
