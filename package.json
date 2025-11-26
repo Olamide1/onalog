@@ -5,17 +5,13 @@
   "main": "index.js",
   "scripts": {
     "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "dev:backend": "cd backend && npm run dev",
+    "dev:backend": "cd backend && yarn dev",
     "dev:frontend": "cd frontend && npm run dev",
-    "install:all": "npm install && cd backend && npm install && cd ../frontend && npm install",
+    "install:all": "npm install && cd backend && yarn install && cd ../frontend && npm install",
     "build:frontend": "cd frontend && npm install && npm run build",
-    "start:backend": "cd backend && npm start",
+    "start:backend": "cd backend && yarn start",
     "kill-port": "lsof -ti:3000 | xargs kill -9 2>/dev/null || echo 'Port 3000 is free'",
     "dev:clean": "npm run kill-port && npm run dev"
-  },
-  "engines": {
-    "node": "18.x",
-    "npm": "9.x"
   },
   "keywords": ["lead-generation", "b2b", "scraping"],
   "author": "",
