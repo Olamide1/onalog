@@ -184,6 +184,10 @@ npm run build
 
     heroku config:set -a caoral-gen-be APP_BASE=backend
     ```
+- deploy heroku. (Push your changes to the heroku branch)
+    ```cmd
+    git subtree push --prefix backend chuks heroku
+    ```
 
 ## License
 
