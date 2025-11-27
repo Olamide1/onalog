@@ -17,7 +17,7 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: [process.env.CORS_ORIGIN || 'http://localhost:5173', 'https://coralgen.netlify.app'],
+  origin: [process.env.CORS_ORIGIN || 'http://localhost:5173', 'https://coralgen.netlify.app', 'https://coralgen.netlify.app/'],
   credentials: true,
   maxAge: 86400,
   allowedHeaders: ['Content-Type', 'Authorization'],
