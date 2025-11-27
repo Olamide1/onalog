@@ -25,6 +25,13 @@ api.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+    
+    // Add admin username header for admin endpoints (username-only auth)
+    const adminUsername = sessionStorage.getItem('admin_username');
+    if (adminUsername && config.url?.includes('/admin/')) {
+      config.headers['X-Admin-Username'] = adminUsername;
+    }
+    
     return config;
   },
   error => {

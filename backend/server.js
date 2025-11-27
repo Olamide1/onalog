@@ -8,6 +8,7 @@ import exportRoutes from './routes/export.js';
 import authRoutes from './routes/auth.js';
 import companyRoutes from './routes/company.js';
 import billingRoutes from './routes/billing.js';
+import adminRoutes from './routes/admin.js';
 
 dotenv.config();
 
@@ -32,6 +33,7 @@ app.use('/api/search', searchRoutes);
 app.use('/api/leads', leadRoutes);
 app.use('/api/export', exportRoutes);
 app.use('/api/billing', billingRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Health check - responds even if DB not connected (for deployment health checks)
 app.get('/api/health', (req, res) => {
