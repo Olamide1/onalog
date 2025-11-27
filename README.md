@@ -176,7 +176,7 @@ npm run build
 - Mobile responsive
 - output logs on heroku
     ```cmd
-    heroku logs --app=caoral-gen-be -n 500 >> heroku.log
+    heroku logs --app=coral-gen-backend -n 500 >> heroku.log
     ```
 - steps to make heroku run the /backend folder
     ```cmd
