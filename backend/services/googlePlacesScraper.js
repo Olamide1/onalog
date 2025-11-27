@@ -38,6 +38,7 @@ export async function scrapeGooglePlaces(query, country = null, location = null,
       
       browser = await puppeteer.launch({
         headless: 'new',
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -45,7 +46,9 @@ export async function scrapeGooglePlaces(query, country = null, location = null,
           '--disable-blink-features=AutomationControlled',
           '--window-size=1920,1080',
           '--disable-gpu',
-          '--disable-software-rasterizer'
+          '--disable-software-rasterizer',
+          '--single-process',
+          '--no-zygote'
         ],
         timeout: 90000,
         protocolTimeout: 180000,
