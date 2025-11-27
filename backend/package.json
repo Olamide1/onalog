@@ -10,6 +10,7 @@
   "engines": {
     "yarn": "1.x"
   },
+  "license": "ISC",
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "cheerio": "^1.0.0-rc.12",
