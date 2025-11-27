@@ -57,7 +57,7 @@ app.use((err, req, res, next) => {
   });
 });
 
-// MongoDB connection with timeout and retry logic
+// MongoDB connection with timeout and retry logic (non-blocking)
 const connectDB = async () => {
   const maxRetries = 5;
   const retryDelay = 5000; // 5 seconds
@@ -91,20 +91,37 @@ const connectDB = async () => {
   return false;
 };
 
-// Start server only after MongoDB connection attempt
-const startServer = async () => {
-  // Attempt to connect to MongoDB (but don't block server startup)
-  await connectDB();
+// Start server immediately (non-blocking MongoDB connection)
+const startServer = () => {
+  let server;
   
-  // Start server with error handling
-  const server = app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    if (mongoose.connection.readyState !== 1) {
-      console.warn('⚠️  Server started but MongoDB connection pending - some features may not work');
+  try {
+    // Start server immediately for fast health checks
+    server = app.listen(PORT, () => {
+      console.log(`🚀 Server running on port ${PORT}`);
+      console.log('⏳ Connecting to MongoDB in background...');
+    });
+  } catch (err) {
+    // Catch synchronous errors from app.listen() (e.g., invalid port)
+    console.error('❌ Failed to start HTTP server:', err.message);
+    throw err; // Re-throw to be caught by outer handler
+  }
+  
+  // Connect to MongoDB in background (non-blocking)
+  // Note: MongoDB connection failures don't cause process exit - server continues running
+  connectDB().then(connected => {
+    if (connected) {
+      console.log('✅ MongoDB connection established');
+    } else {
+      console.warn('⚠️  MongoDB connection failed - server running but database features may not work');
     }
+  }).catch(err => {
+    // MongoDB connection errors are logged but don't exit the process
+    console.error('❌ MongoDB connection error:', err.message);
+    console.warn('⚠️  Server continues running without database connection');
   });
   
-  // Handle port already in use error
+  // Handle port already in use error (asynchronous)
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
       console.error(`❌ Port ${PORT} is already in use.`);
@@ -113,7 +130,8 @@ const startServer = async () => {
       console.log(`   2. Use a different port: PORT=3001 npm run dev`);
       process.exit(1);
     } else {
-      throw err;
+      console.error('❌ Server error:', err.message);
+      process.exit(1);
     }
   });
   
@@ -156,8 +174,11 @@ const startServer = async () => {
   return server;
 };
 
-// Start the application
-startServer().catch(err => {
-  console.error('❌ Failed to start server:', err);
+// Start the application immediately
+// Catches synchronous errors from startServer() (e.g., invalid port, app.listen() throws)
+try {
+  startServer();
+} catch (err) {
+  console.error('❌ Failed to start server:', err.message);
   process.exit(1);
-});
+}
