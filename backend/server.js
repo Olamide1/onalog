@@ -43,8 +43,8 @@ app.use(cors({
   },
   credentials: true,
   maxAge: 86400,
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  exposedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-username'],
+  exposedHeaders: ['Content-Type', 'Authorization', 'x-admin-username'],
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
