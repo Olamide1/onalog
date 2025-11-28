@@ -17,7 +17,30 @@ const PORT = process.env.PORT || 3000;
 
 // Middleware
 app.use(cors({
-  origin: [process.env.CORS_ORIGIN || 'http://localhost:5173', 'https://coralgen.netlify.app', 'https://coralgen.netlify.app/'],
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or Postman)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://localhost:5174',
+      'https://coralgen.netlify.app',
+      process.env.CORS_ORIGIN
+    ].filter(Boolean); // Remove undefined values
+    
+    // Remove trailing slashes for comparison
+    const normalizedOrigin = origin.replace(/\/$/, '');
+    const isAllowed = allowedOrigins.some(allowed => 
+      normalizedOrigin === allowed.replace(/\/$/, '')
+    );
+    
+    if (isAllowed) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
   maxAge: 86400,
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -48,6 +71,14 @@ app.get('/api/health', (req, res) => {
 // a hi response in base route
 app.get('/', (req, res) => {
   res.json({ message: 'hi', timestamp: new Date().toISOString() });
+});
+
+// 404 handler - must be after all other routes
+app.use('*', (req, res) => {
+  res.status(404).json({
+    error: 'Route not found',
+    message: `Cannot ${req.method} ${req.originalUrl}`,
+  });
 });
 
 // Error handling middleware

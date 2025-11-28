@@ -13,6 +13,7 @@ const getBaseURL = () => {
 
 const api = axios.create({
   baseURL: getBaseURL(),
+  withCredentials: true, // Important for CORS with credentials
   headers: {
     'Content-Type': 'application/json'
   }
