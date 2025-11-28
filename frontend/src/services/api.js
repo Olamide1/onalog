@@ -29,8 +29,8 @@ api.interceptors.request.use(
     
     // Add admin username header for admin endpoints (username-only auth)
     const adminUsername = sessionStorage.getItem('admin_username');
-    if (adminUsername && config.url?.includes('/admin/')) {
-      config.headers['X-Admin-Username'] = adminUsername;
+    if (adminUsername && config.url?.includes('/admin')) {
+      config.headers['x-admin-username'] = adminUsername;
     }
     
     return config;

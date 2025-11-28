@@ -3,7 +3,7 @@ const ALLOWED_ADMIN_USERS = ['chuks', 'olamide', 'ola'];
 
 /**
  * Admin username-based authentication middleware
- * Accepts username in X-Admin-Username header and verifies it matches allowed list
+ * Accepts username in x-admin-username header and verifies it matches allowed list
  * This is for username-only admin access (no JWT required)
  */
 export const requireAdminUsername = async (req, res, next) => {
