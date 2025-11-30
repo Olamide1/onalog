@@ -8,6 +8,7 @@ import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanie
 import { enrichLead } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
 import { normalizeUrl } from '../utils/urlNormalizer.js';
+import { isSocialMediaUrl } from '../utils/socialMediaDetector.js';
 import jwt from 'jsonwebtoken';
 import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
@@ -269,7 +270,7 @@ router.post('/', async (req, res) => {
     if (!industry || !location) {
       try {
         const { parseQuery } = await import('../utils/queryParser.js');
-        const parsed = parseQuery(query, country, location, industry);
+        const parsed = await parseQuery(query, country, location, industry);
         
         // Use parsed values if explicit values weren't provided
         if (parsed.industry && !industry) {
@@ -1066,13 +1067,32 @@ async function processSearch(searchId) {
           // If it's a person page, keep the validated finalCompanyName (from domain derivation)
           // This ensures we never use person names as company names
         }
-        // Use extracted website if it's better (canonical URL, etc.)
-        if (extracted.website && extracted.website !== result.link) {
-          lead.website = extracted.website;
+        // Fix: Filter out social media URLs - never use them as main website
+        // Try extracted website first, then original link, but reject social media URLs
+        let websiteUrl = null;
+        
+        if (extracted.website && !isSocialMediaUrl(extracted.website)) {
+          websiteUrl = extracted.website;
           console.log(`[PROCESS] [${i + 1}/${total}] Using extracted website: ${extracted.website}`);
+        } else if (result.link && !isSocialMediaUrl(result.link)) {
+          websiteUrl = result.link;
         } else {
-          lead.website = result.link;
+          // Both are social media URLs - try to resolve real website from social media page
+          const socialUrl = extracted.website || result.link;
+          if (socialUrl && isSocialMediaUrl(socialUrl)) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping social media URL as website: ${socialUrl}`);
+            // Skip this lead - we can't use social media URLs as main website
+            // The lead will be created but without a valid website URL
+            // This will result in a lower quality score, which is correct
+          }
         }
+        
+        if (!websiteUrl) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  No valid website URL (both were social media), skipping lead`);
+          return; // Skip this result - no valid website
+        }
+        
+        lead.website = websiteUrl;
         
         // Guard: first‑party vs directory classifier (check both original link and extracted website)
         // Uses dynamic pattern-based detection, not hardcoded domain lists
