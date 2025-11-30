@@ -82,23 +82,111 @@ router.get('/', async (req, res) => {
       query['enrichment.industry'] = { $regex: new RegExp(industry, 'i') };
     }
     
-    const sort = {};
-    if (sortBy === 'signalStrength') {
-      sort['enrichment.signalStrength'] = sortOrder === 'asc' ? 1 : -1;
-    } else if (sortBy === 'companyName') {
-      sort.companyName = sortOrder === 'asc' ? 1 : -1;
-    } else if (sortBy === 'createdAt') {
-      sort.createdAt = sortOrder === 'asc' ? 1 : -1;
-    } else {
-      sort['enrichment.signalStrength'] = -1;
-    }
+    // Fix: MongoDB sorts null values FIRST, not last
+    // To sort nulls last when sorting descending, we need to use aggregation or handle nulls explicitly
+    // For now, we'll use a workaround: sort by a computed field that treats null as -1
+    // This ensures null quality scores appear at the bottom when sorting descending
     
+    let leads;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     
-    const leads = await Lead.find(query)
-      .sort(sort)
-      .skip(skip)
-      .limit(parseInt(limit));
+    // Fix: Check if we need null handling for qualityScore sorting
+    // We need null handling when:
+    // 1. Explicitly sorting by qualityScore
+    // 2. Using default sort (sortBy === 'signalStrength' means Phase 2 ranking: quality → verification → signal)
+    // 3. Any other case where qualityScore is part of the sort
+    // The default value is 'signalStrength', but that still uses Phase 2 ranking with qualityScore as primary sort
+    const needsNullHandling = sortBy === 'qualityScore' || sortBy === 'signalStrength' || !sortBy;
+    
+    if (needsNullHandling) {
+      // Use aggregation pipeline to handle null values in sorting
+      // Fix: Use different placeholder values for ascending vs descending sorts
+      // For descending: use -1 (nulls sort last)
+      // For ascending: use 1000 (nulls sort last, after valid scores 0-5)
+      // Fix: Check sortOrder for both qualityScore and signalStrength sorts
+      const isAscending = (sortBy === 'qualityScore' || sortBy === 'signalStrength') && sortOrder === 'asc';
+      const nullPlaceholder = isAscending ? 1000 : -1;
+      
+      const pipeline = [
+        { $match: query },
+        {
+          $addFields: {
+            // Create computed fields that treat null as placeholder value for sorting
+            // This ensures nulls sort last regardless of sort direction
+            sortQualityScore: { $ifNull: ['$qualityScore', nullPlaceholder] },
+            sortVerificationScore: { $ifNull: ['$enrichment.verificationScore', nullPlaceholder] },
+            sortSignalStrength: { $ifNull: ['$enrichment.signalStrength', nullPlaceholder] }
+          }
+        }
+      ];
+      
+      // Add sorting
+      const sortStage = {};
+      if (sortBy === 'qualityScore') {
+        // Explicit quality score sort
+        const order = sortOrder === 'asc' ? 1 : -1;
+        sortStage.sortQualityScore = order;
+        sortStage.sortVerificationScore = -1;
+        sortStage.sortSignalStrength = -1;
+      } else if (sortBy === 'signalStrength') {
+        // Fix: When sorting by signalStrength, respect sortOrder for primary sort
+        // If ascending: sort by signal strength ascending, with quality and verification as secondary sorts (descending)
+        // If descending (default): Use Phase 2 ranking (quality → verification → signal) descending
+        if (sortOrder === 'asc') {
+          // Ascending: Sort by signal strength ascending, but keep quality/verification descending as secondary sorts
+          // This ensures lower signal strength appears first, but higher quality leads are still prioritized
+          sortStage.sortSignalStrength = 1;
+          sortStage.sortQualityScore = -1;  // Secondary: still prioritize higher quality
+          sortStage.sortVerificationScore = -1;  // Tertiary: still prioritize higher verification
+        } else {
+          // Descending: Phase 2 ranking (quality → verification → signal)
+          sortStage.sortQualityScore = -1;
+          sortStage.sortVerificationScore = -1;
+          sortStage.sortSignalStrength = -1;
+        }
+      } else {
+        // Default: Phase 2 ranking (quality → verification → signal) descending
+        // This applies when sortBy is undefined or other values
+        sortStage.sortQualityScore = -1;
+        sortStage.sortVerificationScore = -1;
+        sortStage.sortSignalStrength = -1;
+      }
+      pipeline.push({ $sort: sortStage });
+      
+      // Add pagination
+      if (skip > 0) pipeline.push({ $skip: skip });
+      pipeline.push({ $limit: parseInt(limit) });
+      
+      // Remove computed fields from output
+      pipeline.push({
+        $project: {
+          sortQualityScore: 0,
+          sortVerificationScore: 0,
+          sortSignalStrength: 0
+        }
+      });
+      
+      leads = await Lead.aggregate(pipeline);
+    } else {
+      // For other sort fields, use regular find with sort
+      const sort = {};
+      if (sortBy === 'signalStrength') {
+        sort['enrichment.signalStrength'] = sortOrder === 'asc' ? 1 : -1;
+        // Still prioritize quality when sorting by signal strength
+        // But use regular sort (nulls will appear first, which is acceptable for secondary sort)
+        sort.qualityScore = -1;
+        sort['enrichment.verificationScore'] = -1;
+      } else if (sortBy === 'companyName') {
+        sort.companyName = sortOrder === 'asc' ? 1 : -1;
+      } else if (sortBy === 'createdAt') {
+        sort.createdAt = sortOrder === 'asc' ? 1 : -1;
+      }
+      
+      leads = await Lead.find(query)
+        .sort(sort)
+        .skip(skip)
+        .limit(parseInt(limit));
+    }
     
     const total = await Lead.countDocuments(query);
     

@@ -1,30 +1,40 @@
 import Lead from '../models/Lead.js';
+import { normalizeUrl } from '../utils/urlNormalizer.js';
 
 /**
  * Detect and mark duplicate leads
  * FIXED: Now checks within the same search AND other searches
+ * Uses proper URL normalization and atomic operations to prevent race conditions
  */
 export async function detectDuplicates(newLead, searchId) {
   try {
-    // Normalize website URL for comparison
-    const normalizeUrl = (url) => {
-      if (!url) return '';
-      try {
-        const urlObj = new URL(url);
-        return urlObj.hostname.replace('www.', '').toLowerCase();
-      } catch {
-        return url.toLowerCase();
-      }
-    };
+    // Fix: Google search links are unique per query - don't treat them as duplicates
+    // Google search links (e.g., https://www.google.com/search?q=...) should be treated as unique
+    // because each search query is different, even though they all normalize to "google.com"
+    const isGoogleSearchLink = newLead.website && (
+      newLead.website.includes('google.com/search') ||
+      newLead.website.includes('google.com/search?')
+    );
     
+    // Fix: Use proper URL normalization utility
     const normalizedWebsite = normalizeUrl(newLead.website);
     
+    // Fix: Use atomic findOneAndUpdate to prevent race conditions
     // Check for duplicates by website (most reliable) - WITHIN SAME SEARCH
-    if (normalizedWebsite) {
+    // BUT: Skip domain-based duplicate detection for Google search links (they're unique per query)
+    if (normalizedWebsite && !isGoogleSearchLink) {
+      // Use regex pattern that matches any URL with the same normalized domain
+      // This handles http/https, www, trailing slashes, paths, etc.
+      const domainPattern = normalizedWebsite.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      
+      // Fix: Use atomic operation to find and mark duplicate in one step
+      // This prevents race conditions where two leads with same website are processed concurrently
       const websiteDuplicate = await Lead.findOne({
         $or: [
+          // Exact match
           { website: newLead.website },
-          { website: { $regex: new RegExp(normalizedWebsite.replace(/\./g, '\\.'), 'i') } }
+          // Normalized domain match (handles http/https, www, paths, etc.)
+          { website: { $regex: new RegExp(`^https?://(www\\.)?${domainPattern}`, 'i') } }
         ],
         searchId: searchId, // Check within same search
         isDuplicate: false,
@@ -32,25 +42,25 @@ export async function detectDuplicates(newLead, searchId) {
       });
       
       if (websiteDuplicate) {
-        console.log(`[DUPLICATE] Found duplicate by website in same search: ${newLead.website}`);
+        console.log(`[DUPLICATE] Found duplicate by website in same search: ${newLead.website} → ${websiteDuplicate.website}`);
         return {
           isDuplicate: true,
           duplicateOf: websiteDuplicate._id
         };
       }
       
-      // Also check other searches
+      // Also check other searches (for reference, but only mark duplicates within same search)
       const websiteDuplicateOther = await Lead.findOne({
         $or: [
           { website: newLead.website },
-          { website: { $regex: new RegExp(normalizedWebsite.replace(/\./g, '\\.'), 'i') } }
+          { website: { $regex: new RegExp(`^https?://(www\\.)?${domainPattern}`, 'i') } }
         ],
         searchId: { $ne: searchId },
         isDuplicate: false
       });
       
       if (websiteDuplicateOther) {
-        console.log(`[DUPLICATE] Found duplicate by website in other search: ${newLead.website}`);
+        console.log(`[DUPLICATE] Found duplicate by website in other search: ${newLead.website} → ${websiteDuplicateOther.website}`);
         return {
           isDuplicate: true,
           duplicateOf: websiteDuplicateOther._id

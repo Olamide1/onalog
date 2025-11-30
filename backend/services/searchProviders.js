@@ -1159,46 +1159,117 @@ export async function searchOpenStreetMap(query, country = null, location = null
         const businessRelatedClasses = ['amenity', 'shop', 'office', 'craft', 'education', 'leisure', 'tourism'];
         const isBusinessClass = businessRelatedClasses.includes(placeClass);
         
+        // Fix: Detect and reject street-only names (not actual businesses) - DYNAMIC approach
+        // Use OSM's own classification system instead of hardcoded business keywords
+        // OSM already tells us if something is a business through placeClass and placeType
+        const businessName = place.name || displayName?.split(',')[0] || '';
+        const businessNameLower = businessName.toLowerCase().trim();
+        
+        // Common street suffixes that indicate this might be just a road name
+        const streetSuffixes = ['road', 'street', 'avenue', 'boulevard', 'drive', 'lane', 'way', 'close', 'court', 'place', 'terrace', 'grove', 'gardens', 'park', 'square', 'circle', 'highway', 'motorway'];
+        
+        // Check if businessName ends with a street suffix (e.g., "Ibrahim Taiwo Road")
+        const endsWithStreetSuffix = streetSuffixes.some(suffix => businessNameLower.endsWith(' ' + suffix) || businessNameLower === suffix);
+        
+        // Dynamic business detection using OSM's classification:
+        // 1. If OSM classifies it as a business (amenity, shop, office, etc.) → it's a business
+        // 2. If it has a website → likely a business
+        // 3. If it has a placeType (OSM's business type) → it's a business
+        // Note: We don't include matchesSearchIntent here because that's checked later in the filter
+        const isLikelyBusiness = isBusinessClass || !!website || !!placeType;
+        
+        // If it ends with a street suffix AND OSM doesn't classify it as a business AND no website
+        // → it's likely just a street name, not a business (reject early)
+        if (endsWithStreetSuffix && !isLikelyBusiness) {
+          console.log(`[OSM] Skipping street name (not a business): ${businessName} (class: ${placeClass}, type: ${placeType})`);
+          return false; // Filter it out early
+        }
+        
+        // Fix: Dynamic approach - determine if query is specific (not generic) to require strict matching
+        // Generic terms that indicate a broad search (be permissive)
+        const genericTerms = ['companies', 'businesses', 'firms', 'organizations', 'enterprises', 'business', 'company', 'firm'];
+        const queryLower = (query || '').toLowerCase().trim();
+        const queryWords = queryLower.split(/\s+/).filter(w => w.length > 2);
+        
+        // Check if query is generic (only contains generic terms + location/country words)
+        const hasGenericTerm = genericTerms.some(term => queryWords.includes(term));
+        const hasSpecificTerms = queryWords.some(word => {
+          // Exclude generic terms, location words, and common stop words
+          const stopWords = ['in', 'at', 'near', 'around', 'within', 'from', 'the', 'a', 'an', 'and', 'or', 'of', 'for', 'to'];
+          return !stopWords.includes(word) && !genericTerms.includes(word) && word.length > 3;
+        });
+        
+        // Query is specific if it has meaningful terms beyond generic words
+        const isSpecificQuery = hasSpecificTerms || (allSearchTerms && allSearchTerms.length > 0);
+        
+        // Check if result has query keywords in name/type (used for multiple validation checks)
+        const hasQueryKeywords = queryWords.some(word => 
+          displayNameLower.includes(word) || 
+          placeType?.toLowerCase().includes(word)
+        );
+        
         // Dynamic relevance filtering: require search intent match for better accuracy
         // This prevents irrelevant businesses (e.g., telecom companies in school searches)
         // Works for ANY business type, not hardcoded to specific categories
-        if (!matchesSearchIntent) {
-          // If it doesn't match search intent, be more selective
+        // Fix: Only apply strict filtering for SPECIFIC queries, not generic ones
+        // Generic queries like "companies" or "businesses" should be permissive and accept any business class
+        if (isSpecificQuery && !matchesSearchIntent) {
+          // If query is specific AND it doesn't match search intent, be more selective
           // Only accept if it's in a relevant business class AND has keywords from search query
-          const queryWords = (query || '').toLowerCase().split(/\s+/).filter(w => w.length > 3);
-          const hasQueryKeywords = queryWords.some(word => 
-            displayNameLower.includes(word) || 
-            placeType?.toLowerCase().includes(word)
-          );
-          
-          // If no query keywords match, reject even if it's a business class
-          // This prevents telecom (office class) from appearing in school searches
+          // This prevents telecom (office class) from appearing in "hospitals" searches
+          // BUT: Generic queries bypass this check and are handled below (more permissive)
           if (!hasQueryKeywords && !website) {
             return false;
           }
         }
         
-        // For non-education queries: accept if matches search intent OR is in a business class
-        if (matchesSearchIntent || isBusinessClass) {
+        // Accept if matches search intent (always)
+        if (matchesSearchIntent) {
           return true;
         }
         
-        // If no website and doesn't match search intent, be stricter when no country/location is provided
+        // If query is generic (e.g., "companies", "businesses"), accept if it's in a business class (permissive)
+        // This allows generic queries to return various business types
+        // If query is specific, we already handled it above (requires intent match)
+        if (!isSpecificQuery && isBusinessClass) {
+          return true;
+        }
+        
+        // Fix: If no website and doesn't match search intent, be stricter when no country/location is provided
         // This avoids geographic places named after businesses (e.g., "Bank" village)
-        if ((!country && !location) && !website && !matchesSearchIntent) {
+        // BUT: If query keywords were found, allow it (already validated as relevant above)
+        if ((!country && !location) && !website && !matchesSearchIntent && !hasQueryKeywords) {
           return false;
         }
         
         // If it has a website, include it only if it matches search intent (to avoid irrelevant businesses)
+        // Fix: For specific queries (e.g., "grocery stores"), require search intent match even with website
+        // This prevents tech companies (STEEZETECH) from appearing in grocery store searches
         if (website && website.length > 0) {
-          // Require at least some relevance to search query
-          return matchesSearchIntent || displayName.length >= 3;
+          // For specific queries, require search intent match (strict)
+          // For generic queries, be more permissive (allow if has website and reasonable name)
+          if (isSpecificQuery) {
+            // Specific query: require search intent match to prevent irrelevant businesses
+            return matchesSearchIntent || hasQueryKeywords;
+          } else {
+            // Generic query: be permissive (has website and reasonable name)
+            return matchesSearchIntent || displayName.length >= 3;
+          }
         }
         
         // If location/country match and has a name, be permissive (let extractor/enricher validate)
         // This catches businesses that might not match exact synonyms but are in the right location
-        if ((location || country) && displayName.length >= 3 && matchesSearchIntent) {
-          return true;
+        // Fix: For specific queries, still require some relevance (keywords or search intent)
+        // For generic queries, be fully permissive
+        if ((location || country) && displayName.length >= 3) {
+          if (isSpecificQuery) {
+            // For specific queries, require at least query keywords or search intent match
+            // This prevents completely irrelevant businesses (e.g., domain sellers, computer repair) from passing through
+            return matchesSearchIntent || hasQueryKeywords;
+          } else {
+            // For generic queries, be fully permissive
+            return true;
+          }
         }
         
         return false;
@@ -1248,6 +1319,7 @@ export async function searchOpenStreetMap(query, country = null, location = null
           address: address || null
         };
       })
+      .filter(item => item !== null) // Filter out null items (rejected street names)
       .filter(item => {
         // Filter out directory sites
         if (isDirectorySite(item.link)) {

@@ -20,7 +20,7 @@ function generateToken(userId) {
  */
 router.post('/signup', async (req, res) => {
   try {
-    const { name, email, password, companyName, joinCompanyId } = req.body;
+    const { name, email, password, companyName, joinCompanyId, userRole, companyType } = req.body;
     
     // Validation
     if (!name || !email || !password || !companyName) {
@@ -86,7 +86,8 @@ router.post('/signup', async (req, res) => {
       name,
       email,
       password,
-      role
+      role,
+      userRole: userRole || null // Optional: founder_ceo, sales_manager, marketing_manager, operations, other
     });
     
     // If creating new company, we need user._id first
@@ -99,6 +100,7 @@ router.post('/signup', async (req, res) => {
         name: companyName.trim(),
         normalizedName,
         adminId: user._id,
+        companyType: companyType || null, // Optional: agency, saas, ecommerce, service_provider, manufacturing, other
         settings: {
           shareSearches: true,
           shareLeads: true,
@@ -143,8 +145,10 @@ router.post('/signup', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        userRole: user.userRole || null,
         companyId: company._id,
-        companyName: company.name
+        companyName: company.name,
+        companyType: company.companyType || null
       }
     });
     
@@ -196,8 +200,10 @@ router.post('/login', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        userRole: user.userRole || null,
         companyId: user.companyId,
-        companyName: company?.name
+        companyName: company?.name,
+        companyType: company?.companyType || null
       }
     });
     
@@ -220,7 +226,7 @@ router.get('/me', async (req, res) => {
     
     const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
     const decoded = jwt.verify(token, secret);
-    const user = await User.findById(decoded.userId).populate('companyId', 'name');
+    const user = await User.findById(decoded.userId).populate('companyId', 'name companyType');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -232,8 +238,10 @@ router.get('/me', async (req, res) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        userRole: user.userRole || null,
         companyId: user.companyId?._id,
         companyName: user.companyId?.name,
+        companyType: user.companyId?.companyType || null,
         defaultCountry: user.defaultCountry,
         defaultResultCount: user.defaultResultCount
       }

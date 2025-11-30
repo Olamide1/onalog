@@ -33,6 +33,13 @@ const userSchema = new mongoose.Schema({
     required: true
   },
   
+  // User role/position (optional, for personalization)
+  userRole: {
+    type: String,
+    enum: ['founder_ceo', 'sales_manager', 'marketing_manager', 'operations', 'other'],
+    default: null
+  },
+  
   // Preferences
   defaultCountry: String,
   defaultResultCount: {

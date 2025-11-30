@@ -85,6 +85,7 @@
             <th>Website</th>
             <th>Phone</th>
             <th>Email</th>
+            <th>Decision Maker</th>
             <th>Location</th>
             <th @click="sort('signalStrength')" class="sortable">
               Score
@@ -127,7 +128,15 @@
               {{ lead.phoneNumbers?.[0]?.formatted || lead.phoneNumbers?.[0]?.phone || '—' }}
             </td>
             <td>
-              {{ lead.emails?.[0]?.email || '—' }}
+              {{ getPrimaryEmail(lead) || '—' }}
+            </td>
+            <td class="decision-maker-cell">
+              <div v-if="getPrimaryDecisionMaker(lead)" class="decision-maker-info">
+                <div class="dm-name">{{ getPrimaryDecisionMaker(lead).name }}</div>
+                <div v-if="getPrimaryDecisionMaker(lead).title" class="dm-title">{{ getPrimaryDecisionMaker(lead).title }}</div>
+                <div v-if="getPrimaryDecisionMaker(lead).email" class="dm-email">{{ getPrimaryDecisionMaker(lead).email }}</div>
+              </div>
+              <span v-else class="text-muted">—</span>
             </td>
             <td>{{ lead.address || '—' }}</td>
             <td>
@@ -135,13 +144,21 @@
                 <div v-if="lead.enrichmentStatus === 'skipped'" class="status-badge skipped">
                   Skipped
                 </div>
-                <div v-else class="score-bar">
-                  <div
-                    class="score-bar-fill"
-                    :style="{ width: (lead.enrichment?.signalStrength || 0) + '%' }"
-                  ></div>
+                <div v-else class="score-container">
+                  <div class="score-bar">
+                    <div
+                      class="score-bar-fill"
+                      :style="{ width: (lead.enrichment?.signalStrength || 0) + '%' }"
+                    ></div>
+                  </div>
+                  <span class="score-value">{{ lead.enrichment?.signalStrength || 0 }}</span>
+                  <span v-if="lead.qualityScore !== null && lead.qualityScore !== undefined" 
+                        class="quality-badge" 
+                        :class="getQualityClass(lead.qualityScore)"
+                        :title="getQualityTooltip(lead.qualityScore)">
+                    Q{{ lead.qualityScore }}
+                  </span>
                 </div>
-                <span v-if="lead.enrichmentStatus !== 'skipped'" class="score-value">{{ lead.enrichment?.signalStrength || 0 }}</span>
               </div>
             </td>
             <td @click.stop>
@@ -371,6 +388,50 @@ function handleExport(format) {
     duration: 4000
   });
 }
+
+function getQualityClass(score) {
+  if (score >= 5) return 'quality-high';
+  if (score >= 3) return 'quality-medium';
+  if (score >= 1) return 'quality-low';
+  return 'quality-very-low';
+}
+
+function getQualityTooltip(score) {
+  const explanations = {
+    5: 'Q5 - Excellent: Complete contact info (email + phone), verified website, decision makers found, high data completeness',
+    4: 'Q4 - Very Good: Most contact info available, verified website, good data completeness',
+    3: 'Q3 - Good: Basic contact info available, website verified, moderate data completeness',
+    2: 'Q2 - Fair: Limited contact info, website may be unverified, low data completeness',
+    1: 'Q1 - Poor: Minimal contact info, website may be missing or unverified, very low data completeness',
+    0: 'Q0 - Very Poor: Missing critical information, unverified data'
+  };
+  return explanations[score] || `Quality: ${score}/5`;
+}
+
+// Get primary email - prioritize decision maker email, fallback to company email
+function getPrimaryEmail(lead) {
+  // First, try to get email from decision makers (most valuable)
+  const primaryDM = getPrimaryDecisionMaker(lead);
+  if (primaryDM?.email) {
+    return primaryDM.email;
+  }
+  // Fallback to company email
+  return lead.emails?.[0]?.email || null;
+}
+
+// Get primary decision maker (first one with email, or first one overall)
+function getPrimaryDecisionMaker(lead) {
+  if (!lead.decisionMakers || lead.decisionMakers.length === 0) {
+    return null;
+  }
+  // Prefer decision maker with email
+  const withEmail = lead.decisionMakers.find(dm => dm.email);
+  if (withEmail) {
+    return withEmail;
+  }
+  // Fallback to first decision maker
+  return lead.decisionMakers[0];
+}
 </script>
 
 <style scoped>
@@ -474,14 +535,18 @@ function handleExport(format) {
 }
 
 .table td:nth-child(6) {
-  max-width: 200px; /* Location column */
+  max-width: 200px; /* Decision Maker column */
 }
 
 .table td:nth-child(7) {
-  max-width: 100px; /* Score column */
+  max-width: 200px; /* Location column */
 }
 
 .table td:nth-child(8) {
+  max-width: 100px; /* Score column */
+}
+
+.table td:nth-child(9) {
   max-width: 80px; /* Actions column */
   white-space: nowrap;
 }
@@ -511,9 +576,17 @@ function handleExport(format) {
   gap: var(--spacing-sm);
 }
 
+.score-container {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
 .score-bar {
   flex: 1;
   max-width: 100px;
+  min-width: 60px;
 }
 
 .score-value {
@@ -532,6 +605,34 @@ function handleExport(format) {
   color: #999;
 }
 
+.decision-maker-cell {
+  max-width: 200px;
+}
+
+.decision-maker-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.dm-name {
+  font-weight: var(--font-weight-semibold);
+  font-size: 0.9rem;
+  color: var(--text-primary);
+}
+
+.dm-title {
+  font-size: 0.8rem;
+  color: #666;
+  font-style: italic;
+}
+
+.dm-email {
+  font-size: 0.85rem;
+  color: var(--accent);
+  word-break: break-all;
+}
+
 .status-badge {
   display: inline-block;
   padding: var(--spacing-xs) var(--spacing-sm);
@@ -546,6 +647,40 @@ function handleExport(format) {
   background: #fff3cd;
   color: #856404;
   border-color: #ffc107;
+}
+
+.quality-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  font-size: 0.7rem;
+  font-weight: var(--font-weight-bold);
+  border: var(--border-thin) solid;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.quality-badge.quality-high {
+  background: #d4edda;
+  color: #155724;
+  border-color: #28a745;
+}
+
+.quality-badge.quality-medium {
+  background: #fff3cd;
+  color: #856404;
+  border-color: #ffc107;
+}
+
+.quality-badge.quality-low {
+  background: #f8d7da;
+  color: #721c24;
+  border-color: #dc3545;
+}
+
+.quality-badge.quality-very-low {
+  background: #e2e3e5;
+  color: #383d41;
+  border-color: #6c757d;
 }
 
 /* Pagination Styles */

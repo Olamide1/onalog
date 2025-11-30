@@ -78,6 +78,45 @@
                 <span>{{ lead.enrichment?.signalStrength || 0 }}</span>
               </div>
             </div>
+            <div class="info-item" v-if="lead.qualityScore !== null && lead.qualityScore !== undefined">
+              <label>
+                Quality Score
+                <span class="help-icon" :title="getQualityTooltip(lead.qualityScore)">ℹ️</span>
+              </label>
+              <div class="score-display">
+                <div class="score-bar">
+                  <div
+                    class="score-bar-fill"
+                    :class="getQualityClass(lead.qualityScore)"
+                    :style="{ width: (lead.qualityScore / 5 * 100) + '%' }"
+                  ></div>
+                </div>
+                <span>{{ lead.qualityScore }}/5</span>
+                <span class="quality-label" :class="getQualityClass(lead.qualityScore)">
+                  {{ getQualityLabel(lead.qualityScore) }}
+                </span>
+              </div>
+              <p class="score-explanation">{{ getQualityTooltip(lead.qualityScore) }}</p>
+            </div>
+            <div class="info-item" v-if="lead.enrichment?.verificationScore !== null && lead.enrichment?.verificationScore !== undefined">
+              <label>Verification Score</label>
+              <div class="score-display">
+                <div class="score-bar">
+                  <div
+                    class="score-bar-fill"
+                    :class="getVerificationClass(lead.enrichment.verificationScore)"
+                    :style="{ width: (lead.enrichment.verificationScore / 5 * 100) + '%' }"
+                  ></div>
+                </div>
+                <span>{{ lead.enrichment.verificationScore }}/5</span>
+                <span class="verification-label" :class="getVerificationClass(lead.enrichment.verificationScore)">
+                  {{ getVerificationLabel(lead.enrichment.verificationScore) }}
+                </span>
+              </div>
+              <div v-if="lead.enrichment?.verificationSources && lead.enrichment.verificationSources.length > 0" class="verification-sources">
+                <small>Sources: {{ lead.enrichment.verificationSources.join(', ') }}</small>
+              </div>
+            </div>
           </div>
           <div v-if="lead.enrichment?.businessSummary" class="summary">
             <p>{{ lead.enrichment.businessSummary }}</p>
@@ -319,6 +358,46 @@ function copyToClipboard(text) {
 
 async function generateOutreach() {
   // Handled by OutreachAssistant component
+}
+
+function getQualityClass(score) {
+  if (score >= 5) return 'quality-high';
+  if (score >= 3) return 'quality-medium';
+  if (score >= 1) return 'quality-low';
+  return 'quality-very-low';
+}
+
+function getQualityLabel(score) {
+  if (score >= 5) return 'High';
+  if (score >= 3) return 'Medium';
+  if (score >= 1) return 'Low';
+  return 'Very Low';
+}
+
+function getQualityTooltip(score) {
+  const explanations = {
+    5: 'Q5 - Excellent: Complete contact info (email + phone), verified website, decision makers found, high data completeness',
+    4: 'Q4 - Very Good: Most contact info available, verified website, good data completeness',
+    3: 'Q3 - Good: Basic contact info available, website verified, moderate data completeness',
+    2: 'Q2 - Fair: Limited contact info, website may be unverified, low data completeness',
+    1: 'Q1 - Poor: Minimal contact info, website may be missing or unverified, very low data completeness',
+    0: 'Q0 - Very Poor: Missing critical information, unverified data'
+  };
+  return explanations[score] || `Quality: ${score}/5`;
+}
+
+function getVerificationClass(score) {
+  if (score >= 5) return 'verification-high';
+  if (score >= 3) return 'verification-medium';
+  if (score >= 1) return 'verification-low';
+  return 'verification-very-low';
+}
+
+function getVerificationLabel(score) {
+  if (score >= 5) return 'Highly Verified';
+  if (score >= 3) return 'Verified';
+  if (score >= 1) return 'Partially Verified';
+  return 'Unverified';
 }
 </script>
 
@@ -621,6 +700,102 @@ async function generateOutreach() {
 .enrichment-notice p {
   margin: 0;
   line-height: 1.6;
+}
+
+.quality-label,
+.verification-label {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: var(--font-weight-semibold);
+  border: var(--border-thin) solid;
+  margin-left: var(--spacing-xs);
+}
+
+.quality-label.quality-high,
+.verification-label.verification-high {
+  background: #d4edda;
+  color: #155724;
+  border-color: #28a745;
+}
+
+.quality-label.quality-medium,
+.verification-label.verification-medium {
+  background: #fff3cd;
+  color: #856404;
+  border-color: #ffc107;
+}
+
+.quality-label.quality-low,
+.verification-label.verification-low {
+  background: #f8d7da;
+  color: #721c24;
+  border-color: #dc3545;
+}
+
+.quality-label.quality-very-low,
+.verification-label.verification-very-low {
+  background: #e2e3e5;
+  color: #383d41;
+  border-color: #6c757d;
+}
+
+.score-bar-fill.quality-high {
+  background: #28a745;
+}
+
+.score-bar-fill.quality-medium {
+  background: #ffc107;
+}
+
+.score-bar-fill.quality-low {
+  background: #dc3545;
+}
+
+.score-bar-fill.quality-very-low {
+  background: #6c757d;
+}
+
+.score-bar-fill.verification-high {
+  background: #28a745;
+}
+
+.score-bar-fill.verification-medium {
+  background: #ffc107;
+}
+
+.score-bar-fill.verification-low {
+  background: #dc3545;
+}
+
+.score-bar-fill.verification-very-low {
+  background: #6c757d;
+}
+
+.verification-sources {
+  margin-top: var(--spacing-xs);
+  color: #666;
+  font-size: 0.75rem;
+}
+
+.help-icon {
+  display: inline-block;
+  margin-left: var(--spacing-xs);
+  cursor: help;
+  font-size: 0.9rem;
+  opacity: 0.7;
+}
+
+.help-icon:hover {
+  opacity: 1;
+}
+
+.score-explanation {
+  margin-top: var(--spacing-xs);
+  font-size: 0.75rem;
+  color: #666;
+  font-style: italic;
+  line-height: 1.4;
 }
 </style>
 

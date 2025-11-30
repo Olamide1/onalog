@@ -71,22 +71,38 @@ export const useLeadsStore = defineStore('leads', () => {
       const search = response.data.search;
       const searchLeads = response.data.leads;
       
-      // If this is the current search, update it and leads
-      if (currentSearch.value && (currentSearch.value._id === searchId || currentSearch.value.searchId === searchId)) {
-        currentSearch.value = search;
-        leads.value = searchLeads;
+      // Normalize searchId for comparison (handle both string and ObjectId)
+      const normalizedSearchId = String(searchId);
+      const currentSearchId = currentSearch.value ? String(currentSearch.value._id || currentSearch.value.searchId || '') : '';
+      
+      // Fix: If this is the current search, update it and leads (improved ID matching)
+      if (currentSearch.value && (currentSearchId === normalizedSearchId || String(currentSearch.value.searchId) === normalizedSearchId)) {
+        currentSearch.value = { ...search };
+        // Force reactivity by creating new array reference
+        leads.value = [...(searchLeads || [])];
       } 
       // If this is a background search, update it
       else if (updateBackground) {
-        const bgIndex = backgroundSearches.value.findIndex(s => s._id === searchId || s.searchId === searchId);
+        const bgIndex = backgroundSearches.value.findIndex(s => {
+          const sId = String(s._id || s.searchId || '');
+          return sId === normalizedSearchId;
+        });
         if (bgIndex >= 0) {
-          backgroundSearches.value[bgIndex] = search;
+          backgroundSearches.value[bgIndex] = { ...search };
         } else {
           // If not found in background, might be a new background search
           // Only add if it's processing
           if (search.status === 'processing' || search.status === 'queued' || search.status === 'searching' || search.status === 'extracting' || search.status === 'enriching') {
-            backgroundSearches.value.push(search);
+            backgroundSearches.value.push({ ...search });
           }
+        }
+      }
+      // Fix: If no current search but this matches the searchId, set it as current
+      else if (!currentSearch.value && search._id) {
+        const searchIdStr = String(search._id);
+        if (searchIdStr === normalizedSearchId) {
+          currentSearch.value = { ...search };
+          leads.value = [...(searchLeads || [])];
         }
       }
       

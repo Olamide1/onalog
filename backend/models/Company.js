@@ -20,6 +20,13 @@ const companySchema = new mongoose.Schema({
     required: true
   },
   
+  // Company type/industry (optional, for better search targeting)
+  companyType: {
+    type: String,
+    enum: ['agency', 'saas', 'ecommerce', 'service_provider', 'manufacturing', 'other'],
+    default: null
+  },
+  
   // Sharing settings (controlled by admin)
   settings: {
     shareSearches: {

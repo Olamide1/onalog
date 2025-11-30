@@ -34,27 +34,72 @@ export async function extractContactInfo(url, defaultCountry = null) {
     const resolveQuery = rawQ || 'business';
     const resolved = await resolveWebsiteFromQuery(resolveQuery);
     if (resolved) {
-      console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
-      // Recurse by extracting from the resolved site
+      // Fix: Additional validation - reject example.com/localhost after resolution
+      const invalidDomains = ['example.com', 'localhost', '127.0.0.1', '0.0.0.0', 'test.com', 'placeholder.com', 'domain.com', 'website.com', 'site.com'];
       try {
-        return await extractContactInfo(resolved, defaultCountry);
-      } catch (e) {
-        console.log(`[EXTRACT] ⚠️  Resolution extract failed, falling back to minimal data: ${e.message}`);
+        const resolvedUrl = new URL(resolved);
+        const hostname = resolvedUrl.hostname.toLowerCase();
+        
+        if (invalidDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain))) {
+          console.log(`[EXTRACT] ⚠️  Rejected invalid/placeholder domain after resolution: ${resolved}`);
+          // Fall through to minimal data return
+        } else {
+          console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
+          // Recurse by extracting from the resolved site
+          try {
+            return await extractContactInfo(resolved, defaultCountry);
+          } catch (e) {
+            console.log(`[EXTRACT] ⚠️  Resolution extract failed, falling back to minimal data: ${e.message}`);
+          }
+        }
+      } catch (urlError) {
+        console.log(`[EXTRACT] ⚠️  Invalid resolved URL format: ${resolved}`);
+        // Fall through to minimal data return
       }
     } else {
-      console.log(`[EXTRACT] ⚠️  Could not resolve website, returning minimal data`);
+      console.log(`[EXTRACT] ⚠️  Could not resolve website, returning fallback data`);
     }
-    // Fallback minimal data
-    const businessName = rawQ.split(',')[0].trim() || 'Unknown Business';
+    // Fix: Improved fallback - extract better business name and location from query
+    // Extract business name (first part before comma or location preposition)
+    let businessName = rawQ.split(',')[0].trim() || 
+                       rawQ.split(/\s+(?:in|at|near|around)\s+/i)[0].trim() || 
+                       'Unknown Business';
+    
+    // Fix: Clean up generic terms to get a better company name
+    // Generic terms that indicate a business type (not a specific company name)
+    const genericTerms = ['grocery', 'store', 'shop', 'supermarket', 'market', 'convenience', 'provision', 'food', 'restaurant', 'cafe', 'bar', 'hotel', 'hospital', 'clinic', 'school', 'university', 'bank', 'office', 'company', 'business', 'firm', 'enterprise'];
+    
+    // Try to extract a more specific name by removing generic terms
+    let cleanedName = businessName;
+    for (const term of genericTerms) {
+      // Remove generic terms (case-insensitive, whole word only)
+      cleanedName = cleanedName.replace(new RegExp(`\\b${term}\\b`, 'gi'), '').trim();
+      // Clean up multiple spaces
+      cleanedName = cleanedName.replace(/\s+/g, ' ').trim();
+    }
+    
+    // If cleaned name is too short or empty, use original (but capitalize properly)
+    const finalName = cleanedName.length >= 3 ? cleanedName : businessName;
+    
+    // Capitalize first letter of each word for better presentation
+    const capitalizedName = finalName.split(' ').map(word => 
+      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    ).join(' ');
+    
+    // Extract location from query if available (for better address)
+    const locationMatch = rawQ.match(/\s+(?:in|at|near|around)\s+([^,]+)/i);
+    const extractedLocation = locationMatch ? locationMatch[1].trim() : null;
+    
+    // Fix: Return better fallback data instead of completely empty
     return {
       emails: [],
       phoneNumbers: [],
       socials: {},
-      address: null,
+      address: extractedLocation || null, // Include extracted location as address
       aboutText: '',
       categorySignals: [],
-      companyName: businessName,
-      website: null,
+      companyName: capitalizedName,
+      website: url, // Keep original Google search link (better than null)
       decisionMakers: []
     };
   }
@@ -128,13 +173,59 @@ export async function extractContactInfo(url, defaultCountry = null) {
           // Keep default
         }
         // Attempt to resolve first‑party quickly using the derived name
+        // Fix: Don't resolve for very short names (like "Ng" from ng.africabz.com)
+        // These are often country codes or abbreviations that will resolve incorrectly
         let resolved = null;
         try {
-          if (companyName && companyName !== 'Unknown Company') {
-            resolved = await resolveWebsiteFromQuery(`${companyName} official site`);
+          // Only attempt resolution if company name is meaningful (at least 3 characters, not just abbreviations)
+          if (companyName && 
+              companyName !== 'Unknown Company' && 
+              companyName.length >= 3 &&
+              !/^[A-Z]{1,2}$/.test(companyName)) { // Reject single/double letter abbreviations
+            const resolveQuery = `${companyName} official site`;
+            resolved = await resolveWebsiteFromQuery(resolveQuery);
+            
+            // Fix: Validate that resolved website makes sense for the original URL context
+            // Reject if resolved domain doesn't match the business context (e.g., nationalguard.mil for a grocery store)
+            if (resolved) {
+              try {
+                const resolvedHost = new URL(resolved).hostname.toLowerCase();
+                const originalHost = new URL(url).hostname.toLowerCase();
+                
+                // If resolved domain is completely unrelated (e.g., .mil, .gov for a business search),
+                // or if it's a known incorrect resolution pattern, reject it
+                const invalidPatterns = [
+                  /\.mil$/,  // Military domains
+                  /\.gov$/,  // Government domains
+                  /nationalguard/i,  // National Guard specifically
+                  /army\.mil/i,
+                  /navy\.mil/i
+                ];
+                
+                // Check if resolved domain matches invalid patterns
+                const isInvalid = invalidPatterns.some(pattern => pattern.test(resolvedHost));
+                
+                // Also check if resolved domain shares any meaningful part with original
+                // (e.g., "ng.africabz.com" should not resolve to "nationalguard.mil")
+                const originalParts = originalHost.split('.').filter(p => p.length > 2); // Meaningful parts
+                const resolvedParts = resolvedHost.split('.').filter(p => p.length > 2);
+                const hasCommonPart = originalParts.some(op => 
+                  resolvedParts.some(rp => rp.includes(op) || op.includes(rp))
+                );
+                
+                if (isInvalid || (!hasCommonPart && originalParts.length > 0)) {
+                  console.log(`[EXTRACT] ⚠️  Rejected invalid website resolution: ${resolved} (doesn't match context: ${url})`);
+                  resolved = null;
+                }
+              } catch (validationError) {
+                // If validation fails, err on the side of caution and reject
+                console.log(`[EXTRACT] ⚠️  Could not validate resolved website, rejecting: ${resolved}`);
+                resolved = null;
+              }
+            }
           }
         } catch (_) {}
-        // Return minimal data - prefer resolved site if found
+        // Return minimal data - prefer resolved site if found, but only if it's valid
         return {
           emails: [],
           phoneNumbers: [],
@@ -444,19 +535,75 @@ async function resolveWebsiteFromQuery(query) {
     try {
       if (process.env.OPENAI_API_KEY) {
         const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-        const prompt = `Given this business string, output {"domain": "https://example.com"} for the likely official site.\nBusiness: ${query}\nRules: must be first-party domain; do not return review/aggregator/social sites.`;
+        // Fix: Don't use example.com in prompt - use a placeholder format instead
+        const prompt = `Given this business string, infer the likely official website domain.
+
+Business: ${query}
+
+Rules:
+- Output ONLY a JSON object with this exact format: {"domain": "https://actual-domain.com"}
+- Must be a first-party business domain (not review sites, aggregators, or social media)
+- If you cannot determine a real domain, return {"domain": null}
+- Do NOT return example.com, localhost, or placeholder domains
+- Do NOT return the literal string "example.com" - only return actual business domains
+
+Output the JSON object only:`;
         const resp = await openai.chat.completions.create({
           model: 'gpt-4o-mini',
           temperature: 0.2,
           response_format: { type: 'json_object' },
           messages: [
-            { role: 'system', content: 'Infer official domains. Output JSON only.' },
+            { role: 'system', content: 'You infer official business domains from business names. Output JSON only. Never return example.com, localhost, or placeholder domains. Return null if uncertain.' },
             { role: 'user', content: prompt }
           ]
         });
         const json = JSON.parse(resp.choices?.[0]?.message?.content || '{}');
         const url = json.domain;
+        
+        // Fix: Validate resolved URL - reject example.com, localhost, and invalid domains
         if (url && /^https?:\/\//i.test(url) && !isDirectoryDomain(url)) {
+          // Reject placeholder/invalid domains
+          const invalidDomains = ['example.com', 'localhost', '127.0.0.1', '0.0.0.0', 'test.com', 'placeholder.com', 'domain.com', 'website.com', 'site.com'];
+          const urlObj = new URL(url);
+          const hostname = urlObj.hostname.toLowerCase();
+          
+          if (invalidDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain))) {
+            console.log(`[EXTRACT] ⚠️  Rejected invalid/placeholder domain: ${url}`);
+            return null;
+          }
+          
+          // Fix: Reject government/military domains for business queries
+          // These are often incorrect resolutions (e.g., "Ng" → "nationalguard.mil")
+          const invalidTlds = ['.mil', '.gov'];
+          const isGovernmentDomain = invalidTlds.some(tld => hostname.endsWith(tld));
+          if (isGovernmentDomain) {
+            console.log(`[EXTRACT] ⚠️  Rejected government/military domain for business query: ${url}`);
+            return null;
+          }
+          
+          // Fix: Validate that resolved domain has some relationship to the query
+          // Extract meaningful words from query (ignore "official site", location words, etc.)
+          const queryWords = query.toLowerCase()
+            .replace(/\s+official\s+site/gi, '')
+            .replace(/\b(in|at|near|around|within|from|the|a|an|and|or|of|for|to)\b/gi, '')
+            .split(/\s+/)
+            .filter(w => w.length > 2);
+          
+          // Extract meaningful parts from hostname
+          const hostnameParts = hostname.split('.').filter(p => p.length > 2);
+          
+          // Check if any query word appears in hostname (fuzzy match)
+          const hasMatch = queryWords.some(qw => 
+            hostnameParts.some(hp => hp.includes(qw) || qw.includes(hp))
+          );
+          
+          // If query has meaningful words but none match hostname, be suspicious
+          // But allow if query is very short (might be abbreviation)
+          if (queryWords.length > 0 && !hasMatch && queryWords.some(qw => qw.length > 3)) {
+            console.log(`[EXTRACT] ⚠️  Rejected resolved domain (no match with query): ${url} for query "${query}"`);
+            return null;
+          }
+          
           return url;
         }
       }
@@ -1037,12 +1184,38 @@ function extractDecisionMakers($, baseUrl) {
   for (const selector of teamSelectors) {
     $(selector).each((i, elem) => {
       const $el = $(elem);
-      const name = $el.find('h1, h2, h3, h4, h5, .name, [class*="name"], strong, b').first().text().trim();
-      const title = $el.find('.title, .role, .position, [class*="title"], [class*="role"], [class*="position"], p, span').first().text().trim();
+      // Try multiple name selectors - be more aggressive
+      const name = $el.find('h1, h2, h3, h4, h5, h6, .name, [class*="name"], [data-name], strong, b, .person-name, .member-name').first().text().trim() ||
+                   $el.find('img').attr('alt') || // Sometimes names are in image alt text
+                   $el.text().split('\n')[0].trim(); // First line of text
+      // Try multiple title selectors
+      const title = $el.find('.title, .role, .position, [class*="title"], [class*="role"], [class*="position"], [data-title], [data-role], .job-title, .designation').first().text().trim() ||
+                    $el.find('p, span, div').filter((i, el) => {
+                      const txt = $(el).text().toLowerCase();
+                      return /(ceo|cto|cfo|director|manager|president|founder|head|lead|vp|chief|executive)/.test(txt);
+                    }).first().text().trim();
       
-      if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/)) {
-        // More lenient - accept if name looks valid (has capital letter, not just numbers)
-        if (name.match(/^[A-Z]/)) {
+      if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/) && !name.toLowerCase().includes('click here')) {
+        // Fix: More restrictive validation - require actual name patterns (two capitalized words)
+        // Reject common navigation/UI text like "Skip to main content", "Product details", etc.
+        const commonNonNamePatterns = [
+          /^(skip|click|read|view|see|learn|more|about|home|menu|navigation|product|service|contact|login|sign|register|search|filter|sort|close|open|next|previous|back|forward|submit|cancel|save|delete|edit|add|remove|select|choose|browse|shop|buy|cart|checkout|account|profile|settings|help|support|faq|terms|privacy|policy|cookie|legal|copyright|all rights reserved)/i,
+          /^(the|a|an|and|or|but|in|on|at|to|for|of|with|by|from|as|is|was|are|were|be|been|being|have|has|had|do|does|did|will|would|should|could|may|might|must|can|cannot|shall|ought)/i,
+          /^(details|information|description|summary|overview|features|benefits|pricing|plans|packages|options|solutions|products|services|resources|blog|news|events|careers|jobs|team|company|about|contact|support|help|faq|terms|privacy|policy)/i
+        ];
+        
+        // Check if it matches common non-name patterns
+        const isNonNamePattern = commonNonNamePatterns.some(pattern => pattern.test(name));
+        if (isNonNamePattern) {
+          return; // Skip this match
+        }
+        
+        // Require actual name pattern: two or more capitalized words (e.g., "John Smith", "Mary Jane")
+        // Or single word with title prefix (e.g., "Dr. Smith", "Mr. Johnson")
+        // Pattern: (optional title prefix) + at least one capitalized word + (optional second capitalized word)
+        const namePattern = /^(?:Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.|Professor|Rev\.|Reverend)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$|^[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/;
+        
+        if (namePattern.test(name)) {
           const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
           if (!seen.has(key)) {
             seen.add(key);
@@ -1058,36 +1231,100 @@ function extractDecisionMakers($, baseUrl) {
     });
   }
   
-  // Pattern 2: Look for "Name, Title" patterns in text - ENHANCED
+  // Pattern 2: Look for "Name, Title" patterns in text - ENHANCED & MORE AGGRESSIVE
   const text = $('body').text();
+  // Define patterns with their group structure: [pattern, nameGroupIndex, titleGroupIndex]
   const nameTitlePatterns = [
-    // "John Smith, CEO" or "John Smith - CEO"
-    /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*([A-Z][A-Za-z\s&]+(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General))/gi,
-    // "CEO: John Smith"
-    /(CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/gi,
-    // "John Smith - Managing Director"
-    /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[-–—]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive))/gi
+    // Pattern 1: "John Smith, CEO" or "John Smith - CEO" - (name, title)
+    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*([A-Z][A-Za-z\s&]+(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor|Administrator|Officer|Specialist))/gi, nameIdx: 1, titleIdx: 2 },
+    // Pattern 2: "CEO: John Smith" or "CEO John Smith" - (title, name)
+    { pattern: /(CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/gi, nameIdx: 2, titleIdx: 1 },
+    // Pattern 3: "John Smith - Managing Director" or "John Smith, Managing Director" - (name, title)
+    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[-–—,]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer))/gi, nameIdx: 1, titleIdx: 2 },
+    // Pattern 4: "Dr. John Smith" or "Mr. John Smith" followed by title - (name, title)
+    { pattern: /(?:Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*([A-Z][A-Za-z\s&]+(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive))/gi, nameIdx: 1, titleIdx: 2 },
+    // Pattern 5: "John Smith, john.smith@company.com" - extract name and email, infer title from context
+    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-–—]\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/gi, nameIdx: 1, titleIdx: null, hasEmail: true }
   ];
   
-  nameTitlePatterns.forEach(pattern => {
+  nameTitlePatterns.forEach(({ pattern, nameIdx, titleIdx, hasEmail }) => {
+    // Fix: Reset lastIndex before using global regex to ensure clean state
+    // This prevents issues if the loop exits early, leaving lastIndex at a non-zero value
+    pattern.lastIndex = 0;
+    
     let match;
     while ((match = pattern.exec(text)) !== null && decisionMakers.length < 15) {
-      const name = match[2] || match[1];
-      const title = match[1] || match[2];
+      const name = match[nameIdx]?.trim();
+      let title = titleIdx ? match[titleIdx]?.trim() : null;
+      const email = hasEmail ? match[2]?.trim() : null;
       
-      if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/)) {
-        const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          decisionMakers.push({
-            name: name.trim(),
-            title: title.trim(),
-            source: 'website',
-            confidence: 0.75
-          });
+      // Fix: Validate name exists before attempting title inference
+      // If name extraction failed (undefined), skip this match entirely
+      // Fix: Use if-else instead of continue (continue doesn't work in forEach callbacks)
+      if (!name || name.length < 2) {
+        // Skip this match if name is invalid - the while loop will continue to next iteration
+        // We can't use continue in forEach, but wrapping in else ensures we skip processing
+      } else {
+        // For email pattern, try to infer title from surrounding context
+        if (hasEmail && !title) {
+          // Look for title before or after the match in nearby text
+          const matchStart = match.index;
+          const contextStart = Math.max(0, matchStart - 150);
+          const contextEnd = Math.min(text.length, matchStart + match[0].length + 150);
+          const context = text.substring(contextStart, contextEnd);
+          
+          // Try to find a title near the name (look for common patterns)
+          // Fix: Only create dynamic regex patterns if name is valid (already validated above)
+          const titlePatterns = [
+            /(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor|Administrator|Officer|Medical Director|Chief Medical Officer|Dr\.|Professor|Prof\.)/i,
+            // Look for "Name, Title" or "Title: Name" patterns in context
+            // name is guaranteed to be valid at this point (checked above)
+            new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[,\\-–—]\\s*([A-Z][A-Za-z\\s&]+(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer|Medical|Chief))`, 'i'),
+            new RegExp(`([A-Z][A-Za-z\\s&]+(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer|Medical|Chief))[:\\.]\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i')
+          ];
+          
+          for (const titlePattern of titlePatterns) {
+            const titleMatch = context.match(titlePattern);
+            if (titleMatch) {
+              title = titleMatch[1] || titleMatch[0];
+              break;
+            }
+          }
+          
+          if (!title) {
+            title = 'Contact'; // Default if no title found
+          }
+        }
+        
+        // Validate name and title before adding (name already validated above, but double-check)
+        if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/) && title && title.length > 0) {
+          const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            // Validate email if present (should not contain placeholder text)
+            let validEmail = email || null;
+            if (validEmail) {
+              const placeholderTerms = ['firstname', 'lastname', 'firstinitial', 'lastinitial'];
+              if (placeholderTerms.some(term => validEmail.toLowerCase().includes(term))) {
+                validEmail = null; // Reject placeholder emails
+              }
+            }
+            
+            decisionMakers.push({
+              name: name,
+              title: title,
+              email: validEmail, // Include email if found and valid
+              source: 'website',
+              confidence: validEmail ? 0.9 : 0.75 // Higher confidence if email found
+            });
+          }
         }
       }
     }
+    
+    // Fix: Reset lastIndex after loop to ensure clean state for potential future use
+    // This is especially important if the loop exited early due to decisionMakers.length < 15
+    pattern.lastIndex = 0;
   });
   
   // Pattern 3: Look in structured data (JSON-LD) - ENHANCED
@@ -1096,9 +1333,11 @@ function extractDecisionMakers($, baseUrl) {
       const json = JSON.parse($(elem).html());
       
       // Organization founder
-      if (json['@type'] === 'Organization' && json.founder) {
+      // Fix: Enforce 15-item limit during extraction to prevent unnecessary processing
+      if (json['@type'] === 'Organization' && json.founder && decisionMakers.length < 15) {
         const founders = Array.isArray(json.founder) ? json.founder : [json.founder];
-        founders.forEach(founder => {
+        for (const founder of founders) {
+          if (decisionMakers.length >= 15) break; // Early exit when limit reached
           if (founder.name || founder['@id']) {
             const name = founder.name || (founder['@id'] ? founder['@id'].split('/').pop() : null);
             if (name) {
@@ -1114,11 +1353,12 @@ function extractDecisionMakers($, baseUrl) {
               }
             }
           }
-        });
+        }
       }
       
       // Person schema
-      if (json['@type'] === 'Person' && json.name) {
+      // Fix: Enforce 15-item limit during extraction to prevent unnecessary processing
+      if (json['@type'] === 'Person' && json.name && decisionMakers.length < 15) {
         const key = json.name.toLowerCase();
         if (!seen.has(key)) {
           seen.add(key);

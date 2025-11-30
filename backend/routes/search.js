@@ -7,6 +7,7 @@ import { isDirectorySite } from '../services/searchProviders.js';
 import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives } from '../services/extractor.js';
 import { enrichLead } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
+import { normalizeUrl } from '../utils/urlNormalizer.js';
 import jwt from 'jsonwebtoken';
 import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
@@ -256,10 +257,36 @@ const searchQueue = {
  */
 router.post('/', async (req, res) => {
   try {
-    const { query, country, location, industry, resultCount = 50 } = req.body;
+    let { query, country, location, industry, resultCount = 50 } = req.body;
     
     if (!query) {
       return res.status(400).json({ error: 'Search query is required' });
+    }
+    
+    // Fix: Parse natural language query to extract industry and location if not explicitly provided
+    // Only skip parsing if BOTH industry AND location are already provided
+    // Country doesn't prevent extracting industry/location from query text
+    if (!industry || !location) {
+      try {
+        const { parseQuery } = await import('../utils/queryParser.js');
+        const parsed = parseQuery(query, country, location, industry);
+        
+        // Use parsed values if explicit values weren't provided
+        if (parsed.industry && !industry) {
+          industry = parsed.industry;
+        }
+        if (parsed.location && !location) {
+          location = parsed.location;
+        }
+        // Fix: DO NOT replace original query with cleaned version
+        // The original query should be used for searching, cleaned query is only for internal use
+        // Keep the original query intact for better search results
+        
+        console.log(`[SEARCH] Parsed query: "${req.body.query}" → industry: ${industry || 'none'}, location: ${location || 'none'}`);
+      } catch (parseError) {
+        console.error('[SEARCH] Query parsing error:', parseError.message);
+        // Continue with original query if parsing fails
+      }
     }
     
     // Get user ID from token if available (optional for now)
@@ -457,10 +484,37 @@ router.get('/:id', async (req, res) => {
       // ignore preview evaluation errors
     }
     
-    const leadsQuery = Lead.find({ searchId: search._id, isDuplicate: false })
-      .sort({ 'enrichment.signalStrength': -1 });
-    if (previewLimit) leadsQuery.limit(previewLimit);
-    const leads = await leadsQuery;
+    // Phase 2: Sort by quality score (Q5→Q1), then verification score, then signal strength
+    // This ensures best results appear first
+    // Fix: MongoDB sorts null values FIRST, not last. Use aggregation to handle nulls properly
+    const pipeline = [
+      { $match: { searchId: search._id, isDuplicate: false } },
+      {
+        $addFields: {
+          // Create computed fields that treat null as -1 for sorting
+          // This ensures nulls sort last when using descending order
+          sortQualityScore: { $ifNull: ['$qualityScore', -1] },
+          sortVerificationScore: { $ifNull: ['$enrichment.verificationScore', -1] },
+          sortSignalStrength: { $ifNull: ['$enrichment.signalStrength', -1] }
+        }
+      },
+      {
+        $sort: {
+          sortQualityScore: -1,  // Q5 first, then Q4, Q3, etc. (nulls sort last)
+          sortVerificationScore: -1,  // Higher verification first
+          sortSignalStrength: -1  // Higher signal strength first
+        }
+      },
+      {
+        $project: {
+          sortQualityScore: 0,
+          sortVerificationScore: 0,
+          sortSignalStrength: 0
+        }
+      }
+    ];
+    if (previewLimit) pipeline.push({ $limit: previewLimit });
+    const leads = await Lead.aggregate(pipeline);
     
     res.json({
       search: {
@@ -771,25 +825,20 @@ async function processSearch(searchId) {
     const leads = [];
     let extractedCount = 0;
     let errorCount = 0;
+    
+    // Fix: Website-based lock to prevent concurrent processing of same website
+    // Map<normalizedWebsite, Promise> - tracks ongoing processing per website
+    const websiteLocks = new Map();
 
     async function processOne(result, i, total) {
       const itemStartTime = Date.now();
+      let lockResolver = null; // Fix: Declare lockResolver in function scope
+      const normalizedWebsite = normalizeUrl(result.link); // Fix: Declare early for error handling
       
       console.log(`[PROCESS] [${i + 1}/${total}] Processing: ${result.title}`);
       console.log(`[PROCESS] [${i + 1}/${total}] URL: ${result.link}`);
       
       try {
-        // Create lead record
-        const lead = new Lead({
-          searchId: search._id,
-          rawTitle: result.title,
-          rawSnippet: result.snippet,
-          rawLink: result.link,
-          companyName: result.title.split(' - ')[0] || result.title,
-          website: result.link,
-          extractionStatus: 'extracting'
-        });
-        
         // Extract contact info (pass search country for phone formatting)
         const extractStartTime = Date.now();
         const extracted = await extractContactInfo(result.link, search.country);
@@ -797,8 +846,226 @@ async function processSearch(searchId) {
         
         console.log(`[PROCESS] [${i + 1}/${total}] Extraction took ${extractDuration}ms`);
         
-        // Merge extracted data
-        lead.companyName = extracted.companyName || lead.companyName;
+        // Fix: Use extracted company name as primary source, fallback to cleaned search title
+        // This prevents person pages (e.g., "Darren Levy - CEO") from being treated as company names
+        const extractedCompanyName = extracted.companyName;
+        const fallbackCompanyName = result.title.split(' - ')[0] || result.title;
+        const isPersonPage = result.title.includes(' - ');
+        
+        // Fix: If extraction returned minimal data (e.g., from failed Google search link resolution),
+        // prefer the search result title over "Unknown Business" or similar generic names
+        // Also prefer search result title if extracted name looks like it came from domain (e.g., "Tiktok" from tiktok.com)
+        let finalCompanyName = extractedCompanyName;
+        
+        // Check if extracted name looks like it came from a domain (single word, no spaces, matches domain pattern)
+        const extractedLooksLikeDomain = extractedCompanyName && 
+          !extractedCompanyName.includes(' ') && 
+          extractedCompanyName.length < 20 &&
+          /^[a-zA-Z0-9]+$/.test(extractedCompanyName.replace(/[^a-zA-Z0-9]/g, ''));
+        
+        // Try to match extracted name to domain from URL
+        let extractedMatchesDomain = false;
+        if (extractedCompanyName && result.link) {
+          try {
+            const urlObj = new URL(result.link);
+            const domain = urlObj.hostname.replace('www.', '').split('.')[0].toLowerCase();
+            const extractedLower = extractedCompanyName.toLowerCase().replace(/[^a-z0-9]/g, '');
+            extractedMatchesDomain = extractedLower === domain || extractedLower.startsWith(domain) || domain.startsWith(extractedLower);
+          } catch (e) {
+            // URL parsing failed, ignore
+          }
+        }
+        
+        if ((!extractedCompanyName || 
+             extractedCompanyName.toLowerCase() === 'unknown business' || 
+             extractedCompanyName.toLowerCase() === 'unknown company' ||
+             (extractedLooksLikeDomain && extractedMatchesDomain)) && 
+            !isPersonPage && 
+            fallbackCompanyName && 
+            fallbackCompanyName.trim().length > 2 &&
+            fallbackCompanyName !== extractedCompanyName) {
+          // Use search result title as company name if extraction gave us a generic name or domain-based name
+          console.log(`[PROCESS] [${i + 1}/${total}] Using search result title "${fallbackCompanyName}" instead of extracted "${extractedCompanyName}"`);
+          finalCompanyName = fallbackCompanyName;
+        } else if (extractedCompanyName && extractedCompanyName.trim().length > 0) {
+          finalCompanyName = extractedCompanyName;
+        }
+        
+        // If no extracted name and it's a person page, try to derive from URL domain
+        if (!finalCompanyName && isPersonPage) {
+          try {
+            const urlObj = new URL(result.link);
+            const domain = urlObj.hostname.replace('www.', '');
+            const domainName = domain.split('.')[0];
+            if (domainName && domainName.length > 2) {
+              // Capitalize first letter
+              finalCompanyName = domainName.charAt(0).toUpperCase() + domainName.slice(1);
+              console.log(`[PROCESS] [${i + 1}/${total}] Derived company name from domain for person page: ${finalCompanyName}`);
+            }
+          } catch (urlError) {
+            // URL parsing failed, will skip below
+          }
+        }
+        
+        // If still no company name and it's a person page, skip this lead
+        // We don't want to create leads with person names as company names
+        if (!finalCompanyName && isPersonPage) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping person page (no company name found): ${result.title}`);
+          return; // Skip this result (no lock created yet)
+        }
+        
+        // Use fallback only if not a person page
+        // Fix: Add explicit check to prevent person names from being used as company names
+        if (!finalCompanyName && !isPersonPage) {
+          finalCompanyName = fallbackCompanyName;
+        }
+        
+        // Fix: Validate company name before creating lead
+        // Fix: Check if this is a Google search link (fallback data)
+        const isGoogleSearchLink = result.link && (
+          result.link.includes('google.com/search') ||
+          result.link.includes('google.com/search?')
+        );
+        
+        // Fix: Relax validation for Google search links (they have limited data)
+        // Allow generic names like "Grocery store" if they're at least 2 chars
+        if (isGoogleSearchLink) {
+          // Relaxed validation for Google search links
+          if (!finalCompanyName || finalCompanyName.trim().length < 2) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid company name "${finalCompanyName}" from Google search link ${result.link}`);
+            return; // Skip this result (no lock created yet)
+          }
+        } else {
+          // Strict validation for regular websites
+          if (!finalCompanyName || 
+              finalCompanyName.trim().length < 2 || 
+              finalCompanyName.trim().length > 200 ||
+              /^[\d\s\-_\.]+$/.test(finalCompanyName.trim()) || // Only numbers/special chars
+              finalCompanyName.trim().toLowerCase() === 'unknown' ||
+              finalCompanyName.trim().toLowerCase() === 'n/a' ||
+              finalCompanyName.trim().toLowerCase() === 'null') {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid company name "${finalCompanyName}" from ${result.link}`);
+            return; // Skip this result (no lock created yet)
+          }
+        }
+        
+        // Fix: Reject irrelevant business types (domain sellers, computer repair, military contractors, etc.)
+        // These should not appear in phone store or other specific business searches
+        const companyNameLower = finalCompanyName.toLowerCase();
+        const titleLower = (result.title || '').toLowerCase();
+        const snippetLower = (result.snippet || '').toLowerCase();
+        const combinedText = `${companyNameLower} ${titleLower} ${snippetLower}`;
+        
+        // Domain sellers/marketplaces
+        const domainSellerPatterns = [
+          /domain.*sale/i,
+          /domain.*marketplace/i,
+          /domain.*for sale/i,
+          /buy.*domain/i,
+          /premium.*domain/i,
+          /corporate.*domain/i,
+          /paccenter/i,
+          /domain.*auction/i
+        ];
+        
+        // Computer repair/services (not phone stores)
+        const computerRepairPatterns = [
+          /computer.*repair/i,
+          /pc.*repair/i,
+          /laptop.*repair/i,
+          /naples.*pc/i,
+          /goodypc/i,
+          /computer.*service/i,
+          /tech.*repair/i
+        ];
+        
+        // Military/defense contractors (not phone stores)
+        const militaryPatterns = [
+          /wagner.*group/i,
+          /military.*contractor/i,
+          /defense.*contractor/i,
+          /national.*guard/i,
+          /\.mil/i,
+          /army.*contractor/i
+        ];
+        
+        // Check if this is an irrelevant business type
+        const isDomainSeller = domainSellerPatterns.some(pattern => pattern.test(combinedText));
+        const isComputerRepair = computerRepairPatterns.some(pattern => pattern.test(combinedText));
+        const isMilitary = militaryPatterns.some(pattern => pattern.test(combinedText));
+        
+        // Only reject if we have a specific query (not generic "companies" search)
+        // For specific queries like "phone stores", reject these irrelevant types
+        const hasSpecificQuery = search.industry && search.industry.trim().length > 0;
+        
+        if (hasSpecificQuery && (isDomainSeller || isComputerRepair || isMilitary)) {
+          const reason = isDomainSeller ? 'domain seller' : (isComputerRepair ? 'computer repair service' : 'military contractor');
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Irrelevant business type (${reason}): "${finalCompanyName}" from ${result.link}`);
+          return; // Skip this result (no lock created yet)
+        }
+        
+        // Fix: Google search links are unique per query - don't lock them or treat as duplicates
+        // Google search links (e.g., https://www.google.com/search?q=...) should be processed independently
+        // because each search query is different, even though they all normalize to "google.com"
+        // (isGoogleSearchLink already declared above)
+        
+        // Fix: Check for concurrent processing of same website (but skip for Google search links)
+        if (normalizedWebsite && !isGoogleSearchLink && websiteLocks.has(normalizedWebsite)) {
+          // Another lead with same website is being processed - wait for it
+          console.log(`[PROCESS] [${i + 1}/${total}] ⏳ Waiting for concurrent processing of ${normalizedWebsite}...`);
+          try {
+            await websiteLocks.get(normalizedWebsite);
+          } catch (err) {
+            // Previous processing failed, continue anyway
+          }
+          // After waiting, check if duplicate was already created
+          const existingDuplicate = await Lead.findOne({
+            $or: [
+              { website: result.link },
+              { website: { $regex: new RegExp(`^https?://(www\\.)?${normalizedWebsite.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i') } }
+            ],
+            searchId: search._id,
+            isDuplicate: false
+          });
+          if (existingDuplicate) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate already created while waiting: ${normalizedWebsite}`);
+            return; // Skip - duplicate already exists
+          }
+        }
+        
+        // Create lock for this website (but skip for Google search links - they're unique per query)
+        const lockPromise = new Promise((resolve) => {
+          lockResolver = resolve;
+        });
+        if (normalizedWebsite && !isGoogleSearchLink) {
+          websiteLocks.set(normalizedWebsite, lockPromise);
+        }
+        
+        // Create lead record
+        const lead = new Lead({
+            searchId: search._id,
+            rawTitle: result.title,
+            rawSnippet: result.snippet,
+            rawLink: result.link,
+            companyName: finalCompanyName.trim(),
+            website: result.link,
+            extractionStatus: 'extracting'
+          });
+        
+        // Merge extracted data (extracted company name takes priority if available)
+        // Fix: Never use extractedCompanyName on person pages, as it may be a person's name
+        // Person pages should only use validated company names (from domain derivation or skip entirely)
+        // This prevents person names from being incorrectly used as company names
+        if (extractedCompanyName && extractedCompanyName.trim().length > 0) {
+          // Only use extractedCompanyName if it's NOT a person page
+          // On person pages, we've already validated finalCompanyName (from domain or skipped the lead)
+          // Using extractedCompanyName on person pages risks using a person's name as company name
+          if (!isPersonPage) {
+            lead.companyName = extractedCompanyName;
+          }
+          // If it's a person page, keep the validated finalCompanyName (from domain derivation)
+          // This ensures we never use person names as company names
+        }
         // Use extracted website if it's better (canonical URL, etc.)
         if (extracted.website && extracted.website !== result.link) {
           lead.website = extracted.website;
@@ -902,22 +1169,33 @@ async function processSearch(searchId) {
         
         // Executive discovery (business execs) if we still have few/no names
         try {
+          // Phase 2: More aggressive decision maker discovery - try even if we have some
           const siteForDiscovery = lead.website || extracted.website || result.link;
-          if ((!lead.decisionMakers || lead.decisionMakers.length < 3) && siteForDiscovery) {
+          // Try discovery if we have fewer than 5 decision makers (increased from 3)
+          // This ensures we get the best possible decision maker data
+          if ((!lead.decisionMakers || lead.decisionMakers.length < 5) && siteForDiscovery) {
             console.log(`[PROCESS] [${i + 1}/${total}] Discovering executives on ${siteForDiscovery}...`);
-            const execs = await discoverExecutives(siteForDiscovery);
-            if (execs && execs.length > 0) {
-              const existing = new Set((lead.decisionMakers || []).map(dm => (dm.name || '').toLowerCase()));
-              const merged = [...(lead.decisionMakers || [])];
-              for (const e of execs) {
-                const key = (e.name || '').toLowerCase();
-                if (!existing.has(key)) {
-                  merged.push({ name: e.name, title: e.title, email: null, source: e.source, confidence: e.confidence || 0.6 });
-                  existing.add(key);
+            try {
+              const execs = await discoverExecutives(siteForDiscovery);
+              if (execs && execs.length > 0) {
+                const existing = new Set((lead.decisionMakers || []).map(dm => (dm.name || '').toLowerCase()));
+                const originalCount = (lead.decisionMakers || []).length;
+                const merged = [...(lead.decisionMakers || [])];
+                for (const e of execs) {
+                  const key = (e.name || '').toLowerCase();
+                  if (!existing.has(key) && e.name && e.name.length > 2) {
+                    merged.push({ name: e.name, title: e.title || 'Executive', email: null, source: e.source || 'discovery', confidence: e.confidence || 0.7 });
+                    existing.add(key);
+                  }
+                  if (merged.length >= 12) break;
                 }
-                if (merged.length >= 12) break;
+                if (merged.length > originalCount) {
+                  lead.decisionMakers = merged;
+                  console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found ${merged.length} total decision makers (added ${merged.length - originalCount} from discovery)`);
+                }
               }
-              lead.decisionMakers = merged;
+            } catch (discErr) {
+              console.log(`[PROCESS] [${i + 1}/${total}] Exec discovery error: ${discErr.message}`);
             }
           }
         } catch (discErr) {
@@ -926,17 +1204,106 @@ async function processSearch(searchId) {
         
         lead.extractionStatus = 'extracted';
         
+        // Calculate quality score
+        try {
+          const { calculateQualityScore } = await import('../utils/qualityScoring.js');
+          lead.qualityScore = calculateQualityScore(lead);
+          console.log(`[PROCESS] [${i + 1}/${total}] Quality score: ${lead.qualityScore}/5`);
+        } catch (qualityErr) {
+          console.log(`[PROCESS] [${i + 1}/${total}] Quality scoring error: ${qualityErr.message}`);
+          // Continue without quality score (backward compatible)
+        }
+        
         // Check for duplicates
         const duplicateCheck = await detectDuplicates(lead, search._id);
         // Only treat as duplicate if it's a duplicate within THIS search.
         // Cross-search duplicates are allowed so users can run fresh queries and still see results.
         const dupOf = duplicateCheck.duplicateOf;
-        const isSameSearchDup = duplicateCheck.isDuplicate &&
-          dupOf && String(dupOf) === String(search._id);
-        lead.isDuplicate = isSameSearchDup;
-        lead.duplicateOf = dupOf || null;
         
-        await lead.save();
+        // Fix: Check if duplicate is from the same search by verifying the duplicate lead's searchId
+        let isSameSearchDup = false;
+        let actualDuplicateId = null; // Track the actual duplicate ID to use
+        if (duplicateCheck.isDuplicate && dupOf) {
+          // Fetch the duplicate lead to check its searchId
+          const duplicateLead = await Lead.findById(dupOf).select('searchId');
+          
+          if (duplicateLead) {
+            // Duplicate lead exists - verify it's from the same search
+            if (String(duplicateLead.searchId) === String(search._id)) {
+              isSameSearchDup = true;
+              actualDuplicateId = dupOf; // Use the original duplicate ID
+            }
+          } else {
+            // Fix: Duplicate lead was deleted - do a fallback check in the current search
+            // This handles the case where the duplicate lead was deleted between detection and verification
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate lead ${dupOf} not found, performing fallback duplicate check`);
+            
+            // Fix: Use proper URL normalization utility
+            const normalizedWebsite = normalizeUrl(lead.website);
+            let fallbackDuplicate = null;
+            
+            // Check by website (most reliable) - use proper URL normalization
+            if (normalizedWebsite) {
+              const domainPattern = normalizedWebsite.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+              fallbackDuplicate = await Lead.findOne({
+                $or: [
+                  { website: lead.website },
+                  { website: { $regex: new RegExp(`^https?://(www\\.)?${domainPattern}`, 'i') } }
+                ],
+                searchId: search._id,
+                isDuplicate: false,
+                _id: { $ne: lead._id }
+              });
+            }
+            
+            // If no website match, check by company name
+            if (!fallbackDuplicate && lead.companyName && lead.companyName.length > 3) {
+              fallbackDuplicate = await Lead.findOne({
+                companyName: { $regex: new RegExp(lead.companyName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') },
+                searchId: search._id,
+                isDuplicate: false,
+                _id: { $ne: lead._id }
+              });
+            }
+            
+            if (fallbackDuplicate) {
+              // Found a duplicate in the current search - mark as duplicate
+              // Fix: Use the fallback duplicate's ID, not the deleted original
+              isSameSearchDup = true;
+              actualDuplicateId = fallbackDuplicate._id; // Use the fallback duplicate ID
+              console.log(`[PROCESS] [${i + 1}/${total}] ✅ Fallback duplicate check found match: ${fallbackDuplicate._id}`);
+            } else {
+              // No duplicate found in current search - likely was from another search or was deleted
+              console.log(`[PROCESS] [${i + 1}/${total}] ℹ️  No duplicate found in current search (original duplicate lead was deleted or from another search)`);
+            }
+          }
+        }
+        
+        lead.isDuplicate = isSameSearchDup;
+        lead.duplicateOf = isSameSearchDup ? actualDuplicateId : null;
+        
+        // Fix: Use atomic findOneAndUpdate to prevent race conditions
+        // Try to save, but if duplicate was created concurrently, mark as duplicate
+        try {
+          await lead.save();
+        } catch (saveError) {
+          // If save fails due to duplicate key or concurrent modification, check again
+          if (saveError.code === 11000 || saveError.message.includes('duplicate')) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Concurrent duplicate detected during save, re-checking...`);
+            const concurrentCheck = await detectDuplicates(lead, search._id);
+            if (concurrentCheck.isDuplicate) {
+              const concurrentDup = await Lead.findById(concurrentCheck.duplicateOf).select('searchId');
+              if (concurrentDup && String(concurrentDup.searchId) === String(search._id)) {
+                lead.isDuplicate = true;
+                lead.duplicateOf = concurrentCheck.duplicateOf;
+                await lead.save();
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Marked as duplicate after concurrent save conflict`);
+              }
+            }
+          } else {
+            throw saveError; // Re-throw if it's a different error
+          }
+        }
         
         if (!lead.isDuplicate) {
           leads.push(lead);
@@ -977,6 +1344,19 @@ async function processSearch(searchId) {
               if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
                 lead.decisionMakers = enrichment.decisionMakers;
               }
+              
+              // Calculate verification score
+              try {
+                const { calculateVerificationScore } = await import('../utils/verificationScoring.js');
+                const verification = calculateVerificationScore(lead);
+                lead.enrichment.verificationScore = verification.score;
+                lead.enrichment.verificationSources = verification.sources;
+                console.log(`[PROCESS] [${i + 1}/${total}] Verification score: ${verification.score}/5 (sources: ${verification.sources.join(', ')})`);
+              } catch (verifyErr) {
+                console.log(`[PROCESS] [${i + 1}/${total}] Verification scoring error: ${verifyErr.message}`);
+                // Continue without verification score (backward compatible)
+              }
+              
               const hasUsable = Array.isArray(enrichment.decisionMakers) && enrichment.decisionMakers.some(d => d.email);
               if (!hasUsable && billingEnabled() && searchCompanyId) {
                 // refund if unusable
@@ -995,7 +1375,14 @@ async function processSearch(searchId) {
             }
           }
         } else {
-        console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate detected, skipping`);
+          const duplicateReason = actualDuplicateId ? `duplicate of lead ${actualDuplicateId}` : 'duplicate (same search)';
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Duplicate detected (${duplicateReason}), skipping: ${lead.companyName || result.title}`);
+        }
+        
+        // Fix: Release lock in all code paths (after processing is complete)
+        if (normalizedWebsite && lockResolver) {
+          lockResolver();
+          websiteLocks.delete(normalizedWebsite);
         }
         
         const itemDuration = Date.now() - itemStartTime;
@@ -1013,6 +1400,15 @@ async function processSearch(searchId) {
         errorCount++;
       console.error(`[PROCESS] [${i + 1}/${total}] ❌ Error processing ${result.link}:`, error.message);
       console.error(`[PROCESS] [${i + 1}/${total}] Error stack:`, error.stack);
+      
+      // Fix: Release lock even on error to prevent deadlocks
+      if (normalizedWebsite && lockResolver) {
+        lockResolver();
+        websiteLocks.delete(normalizedWebsite);
+      } else if (normalizedWebsite && websiteLocks.has(normalizedWebsite)) {
+        // Lock exists but resolver not set (early error) - just remove it
+        websiteLocks.delete(normalizedWebsite);
+      }
       }
     }
 
@@ -1107,30 +1503,76 @@ async function processSearch(searchId) {
         searchQueue.backgroundFills.set(search._id.toString(), pauseResume);
         
         setImmediate(async () => {
+          let bgErrorCount = 0;
           for (let j = 0; j < bgList.length; j++) {
-            // Check if we've hit the resultCount limit
-            const currentCount = await Lead.countDocuments({ 
-              searchId: search._id, 
-              isDuplicate: false,
-              extractionStatus: 'extracted'
-            });
-            if (currentCount >= maxTotal) {
-              console.log(`[PROCESS] 🔄 Background fill stopped: reached limit of ${maxTotal} leads`);
-              break;
-            }
-            
-            // Check if paused
-            const bgFill = searchQueue.backgroundFills.get(search._id.toString());
-            if (bgFill && bgFill.isPaused) {
-              console.log(`[PROCESS] ⏸️  Background fill paused for search ${search._id}`);
-              // Wait for resume
-              await new Promise((resolve) => {
-                bgFill.resume = resolve;
+            try {
+              // Check if we've hit the resultCount limit
+              const currentCount = await Lead.countDocuments({ 
+                searchId: search._id, 
+                isDuplicate: false,
+                extractionStatus: 'extracted'
               });
-              console.log(`[PROCESS] ▶️  Background fill resumed for search ${search._id}`);
+              if (currentCount >= maxTotal) {
+                console.log(`[PROCESS] 🔄 Background fill stopped: reached limit of ${maxTotal} leads`);
+                break;
+              }
+              
+              // Check if paused (with timeout to prevent infinite wait)
+              const bgFill = searchQueue.backgroundFills.get(search._id.toString());
+              if (bgFill && bgFill.isPaused) {
+                console.log(`[PROCESS] ⏸️  Background fill paused for search ${search._id}`);
+                // Wait for resume with timeout (max 5 minutes)
+                const resumeTimeout = setTimeout(() => {
+                  console.log(`[PROCESS] ⚠️  Background fill resume timeout, continuing anyway`);
+                  if (bgFill) {
+                    bgFill.isPaused = false;
+                    if (bgFill.resume) bgFill.resume();
+                  }
+                }, 300000); // 5 minutes
+                
+                await new Promise((resolve) => {
+                  if (bgFill) {
+                    bgFill.resume = () => {
+                      clearTimeout(resumeTimeout);
+                      resolve();
+                    };
+                  } else {
+                    clearTimeout(resumeTimeout);
+                    resolve();
+                  }
+                });
+                console.log(`[PROCESS] ▶️  Background fill resumed for search ${search._id}`);
+              }
+              
+              // Fix: Wrap processOne in try-catch to prevent silent failures
+              await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
+              
+              // Fix: Update progress periodically (every 5 items or on last item)
+              if ((j + 1) % 5 === 0 || j === bgList.length - 1) {
+                const s = await Search.findById(search._id);
+                if (s) {
+                  const currentExtracted = await Lead.countDocuments({ 
+                    searchId: search._id, 
+                    isDuplicate: false,
+                    extractionStatus: 'extracted'
+                  });
+                  const currentEnriched = await Lead.countDocuments({ 
+                    searchId: search._id, 
+                    isDuplicate: false,
+                    enrichmentStatus: 'enriched'
+                  });
+                  s.extractedCount = currentExtracted;
+                  s.enrichedCount = currentEnriched;
+                  await s.save();
+                  console.log(`[PROCESS] 🔄 Background fill progress: ${currentExtracted} extracted, ${currentEnriched} enriched (${j + 1}/${bgList.length} processed)`);
+                }
+              }
+            } catch (error) {
+              bgErrorCount++;
+              console.error(`[PROCESS] [BG ${j + 1}/${bgList.length}] ❌ Error processing ${bgList[j]?.link || 'unknown'}:`, error.message);
+              console.error(`[PROCESS] [BG ${j + 1}/${bgList.length}] Error stack:`, error.stack);
+              // Continue processing next item instead of stopping
             }
-            
-            await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
           }
           
           // Clean up
@@ -1154,7 +1596,7 @@ async function processSearch(searchId) {
             s.status = 'completed';
             s.completedAt = new Date();
             await s.save();
-            console.log(`[PROCESS] 🔄 Background fill complete. Final counts: ${actualExtracted} extracted, ${actualEnriched} enriched`);
+            console.log(`[PROCESS] 🔄 Background fill complete. Final counts: ${actualExtracted} extracted, ${actualEnriched} enriched${bgErrorCount > 0 ? ` (${bgErrorCount} errors)` : ''}`);
           }
         });
       } else {
@@ -1203,5 +1645,3 @@ async function processSearch(searchId) {
 }
 
 export default router;
-
-

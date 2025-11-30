@@ -39,6 +39,74 @@ export async function enrichLead(leadData) {
     
     const enrichment = JSON.parse(response.choices[0].message.content);
     
+    // Validate and clean email pattern - reject patterns with literal placeholder text
+    if (enrichment.emailPattern) {
+      const placeholderTerms = ['firstname', 'lastname', 'firstinitial', 'lastinitial'];
+      
+      // Fix: Check if pattern contains literal placeholder text (not in {placeholder} format)
+      // Also check for mixed formats (both placeholder and literal)
+      // A pattern like "firstname_{firstname}@example.com" should be rejected because
+      // it has a literal "firstname" at the start, even though it also has {firstname}
+      // Also reject patterns like "{firstname}.lastname" (mixed format)
+      const hasLiteralPlaceholder = placeholderTerms.some(term => {
+        const patternLower = enrichment.emailPattern.toLowerCase();
+        
+        // Check if term appears in the pattern
+        if (!patternLower.includes(term)) {
+          return false;
+        }
+        
+        // Find all occurrences of the term in the pattern
+        const termRegex = new RegExp(term, 'gi');
+        let match;
+        let foundLiteral = false;
+        
+        // Reset regex lastIndex to ensure we check from the start
+        termRegex.lastIndex = 0;
+        
+        while ((match = termRegex.exec(enrichment.emailPattern)) !== null) {
+          const matchIndex = match.index;
+          const beforeChar = matchIndex > 0 ? enrichment.emailPattern[matchIndex - 1] : '';
+          const afterChar = matchIndex + term.length < enrichment.emailPattern.length 
+            ? enrichment.emailPattern[matchIndex + term.length] 
+            : '';
+          
+          // Check if this occurrence is NOT wrapped in curly braces
+          // It's literal if:
+          // - It's at the start (no char before) OR the char before is not '{'
+          // - AND it's at the end (no char after) OR the char after is not '}'
+          const isAtStart = matchIndex === 0;
+          const isAtEnd = matchIndex + term.length === enrichment.emailPattern.length;
+          const notWrappedInBraces = (isAtStart || beforeChar !== '{') && (isAtEnd || afterChar !== '}');
+          
+          if (notWrappedInBraces) {
+            foundLiteral = true;
+            break;
+          }
+        }
+        
+        return foundLiteral;
+      });
+      
+      // Fix: Also check for mixed formats (e.g., "{firstname}.lastname" or "firstname.{lastname}")
+      // These should be rejected because they mix placeholder format with literal text
+      const hasMixedFormat = placeholderTerms.some(term => {
+        const pattern = enrichment.emailPattern;
+        // Check if pattern has both {term} and literal term
+        const hasPlaceholderFormat = pattern.includes(`{${term}}`);
+        const hasLiteralTerm = new RegExp(`[^{]${term}[^}]`, 'i').test(pattern) || 
+                              pattern.startsWith(term) || 
+                              pattern.endsWith(term);
+        
+        return hasPlaceholderFormat && hasLiteralTerm;
+      });
+      
+      if (hasLiteralPlaceholder || hasMixedFormat) {
+        console.log(`[ENRICH] ⚠️  Rejected email pattern with ${hasLiteralPlaceholder ? 'literal' : 'mixed format'} placeholder text: ${enrichment.emailPattern}`);
+        enrichment.emailPattern = null; // Reject invalid pattern
+      }
+    }
+    
     // Enrich with LinkedIn contacts
     let linkedinContacts = null;
     try {
@@ -114,17 +182,43 @@ function generateEmailFromName(name, emailPattern, website) {
     // Extract domain from website
     const domain = new URL(website).hostname.replace('www.', '');
     
-    // Parse name into parts
-    const nameParts = name.trim().split(/\s+/).filter(p => p.length > 0);
-    if (nameParts.length === 0) return null;
+    // Fix: Remove title prefixes before extracting name parts
+    // Common titles: Dr., Mr., Mrs., Ms., Prof., Professor, etc.
+    const titlePrefixes = ['dr', 'mr', 'mrs', 'ms', 'miss', 'prof', 'professor', 'sir', 'madam', 'lord', 'lady', 'rev', 'reverend', 'fr', 'father', 'sr', 'sister', 'brother'];
+    let cleanedName = name.trim();
     
-    const firstName = nameParts[0].toLowerCase();
-    const lastName = nameParts[nameParts.length - 1].toLowerCase();
+    // Remove title prefix if present (case-insensitive)
+    for (const title of titlePrefixes) {
+      const titleRegex = new RegExp(`^${title}\\.?\\s+`, 'i');
+      if (titleRegex.test(cleanedName)) {
+        cleanedName = cleanedName.replace(titleRegex, '').trim();
+        break; // Only remove the first matching title
+      }
+    }
+    
+    // Parse name into parts - require at least first and last name
+    const nameParts = cleanedName.split(/\s+/).filter(p => p.length > 0);
+    if (nameParts.length < 2) {
+      // Need at least first and last name to generate a proper email
+      // Single names are not reliable for email generation
+      return null;
+    }
+    
+    const firstName = nameParts[0].toLowerCase().replace(/[^a-z]/g, ''); // Remove non-letters
+    const lastName = nameParts[nameParts.length - 1].toLowerCase().replace(/[^a-z]/g, '');
+    
+    // Validate we have actual names (not placeholders or single letters)
+    if (!firstName || firstName.length < 2 || !lastName || lastName.length < 2) {
+      return null;
+    }
+    
     const firstInitial = firstName[0];
     const lastInitial = lastName[0];
     
-    // Common email patterns
+    // Common email patterns - handle both placeholder format and literal text
+    // IMPORTANT: Replace composite patterns BEFORE individual terms to avoid partial replacements
     let email = emailPattern
+      // Placeholder format replacements
       .replace(/{firstname}/gi, firstName)
       .replace(/{lastname}/gi, lastName)
       .replace(/{firstinitial}/gi, firstInitial)
@@ -134,11 +228,45 @@ function generateEmailFromName(name, emailPattern, website) {
       .replace(/{firstname-lastname}/gi, `${firstName}-${lastName}`)
       .replace(/{firstinitiallastname}/gi, `${firstInitial}${lastName}`)
       .replace(/{firstnamelastinitial}/gi, `${firstName}${lastInitial}`)
+      // Literal text replacements (common LLM mistakes)
+      // Fix: Replace composite patterns FIRST, before individual terms
+      // Otherwise, "firstname.lastname" becomes "john.lastname" then "john.smith",
+      // and the composite pattern replacement never matches
+      .replace(/firstname\.lastname/gi, `${firstName}.${lastName}`)
+      .replace(/firstname_lastname/gi, `${firstName}_${lastName}`)
+      .replace(/firstname-lastname/gi, `${firstName}-${lastName}`)
+      // Replace composite patterns with initials (e.g., "firstinitial.lastname")
+      .replace(/firstinitial\.lastname/gi, `${firstInitial}.${lastName}`)
+      .replace(/firstinitial_lastname/gi, `${firstInitial}_${lastName}`)
+      .replace(/firstinitial-lastname/gi, `${firstInitial}-${lastName}`)
+      .replace(/firstname\.lastinitial/gi, `${firstName}.${lastInitial}`)
+      .replace(/firstname_lastinitial/gi, `${firstName}_${lastInitial}`)
+      .replace(/firstname-lastinitial/gi, `${firstName}-${lastInitial}`)
+      .replace(/firstinitiallastname/gi, `${firstInitial}${lastName}`)
+      .replace(/firstnamelastinitial/gi, `${firstName}${lastInitial}`)
+      // Now replace individual terms (these won't interfere with composites anymore)
+      .replace(/firstname/gi, firstName)
+      .replace(/lastname/gi, lastName)
+      .replace(/firstinitial/gi, firstInitial)
+      .replace(/lastinitial/gi, lastInitial)
       .toLowerCase();
+    
+    // Validate email doesn't contain placeholder text
+    const placeholderTerms = ['firstname', 'lastname', 'firstinitial', 'lastinitial', 'firstname.lastname', 'firstname_lastname', 'firstname-lastname'];
+    if (placeholderTerms.some(term => email.includes(term))) {
+      // Still has placeholder text - don't return it
+      return null;
+    }
     
     // If pattern doesn't have domain, add it
     if (!email.includes('@')) {
       email = `${email}@${domain}`;
+    }
+    
+    // Final validation: ensure email looks valid
+    const emailRegex = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
+    if (!emailRegex.test(email)) {
+      return null;
     }
     
     return email;
@@ -176,10 +304,16 @@ Provide a JSON response with:
   "companySize": "micro|small|medium|large",
   "revenueBracket": "0-50k|50k-200k|200k-1m|1m+|unknown",
   "industry": "primary industry category",
-  "emailPattern": "guessed email pattern if missing (e.g., firstname.lastname@company.com)",
+  "emailPattern": "guessed email pattern if missing. Use placeholder format with curly braces: {firstname}.{lastname}@domain.com or {firstinitial}{lastname}@domain.com. NEVER use literal text like 'firstname.lastname' - always use {firstname} and {lastname} placeholders. If uncertain, return null.",
   "contactRelevance": 0-100 score for how relevant this lead is for B2B outreach,
   "signalStrength": 0-100 score for data quality and completeness
-}`;
+}
+
+IMPORTANT for emailPattern:
+- Use {firstname}, {lastname}, {firstinitial}, {lastinitial} as placeholders
+- Examples: "{firstname}.{lastname}@domain.com", "{firstinitial}{lastname}@domain.com"
+- NEVER return literal text like "firstname.lastname@domain.com"
+- If you cannot determine a pattern, return null`;
 }
 
 /**

@@ -79,6 +79,43 @@
             <span v-if="fieldErrors.companyName" class="field-error">{{ fieldErrors.companyName }}</span>
           </div>
           
+          <div class="form-group">
+            <label class="form-label">Your Role (Optional)</label>
+            <select
+              v-model="formData.userRole"
+              class="input"
+              @change="clearFieldError('userRole')"
+            >
+              <option value="">Select your role</option>
+              <option value="founder_ceo">Founder/CEO</option>
+              <option value="sales_manager">Sales Manager</option>
+              <option value="marketing_manager">Marketing Manager</option>
+              <option value="operations">Operations</option>
+              <option value="other">Other</option>
+            </select>
+            <span v-if="fieldErrors.userRole" class="field-error">{{ fieldErrors.userRole }}</span>
+            <span v-else class="field-hint">Help us personalize your experience</span>
+          </div>
+          
+          <div class="form-group">
+            <label class="form-label">Company Type (Optional)</label>
+            <select
+              v-model="formData.companyType"
+              class="input"
+              @change="clearFieldError('companyType')"
+            >
+              <option value="">Select company type</option>
+              <option value="agency">Agency</option>
+              <option value="saas">SaaS</option>
+              <option value="ecommerce">E-commerce</option>
+              <option value="service_provider">Service Provider</option>
+              <option value="manufacturing">Manufacturing</option>
+              <option value="other">Other</option>
+            </select>
+            <span v-if="fieldErrors.companyType" class="field-error">{{ fieldErrors.companyType }}</span>
+            <span v-else class="field-hint">Help us improve search results for your industry</span>
+          </div>
+          
           <!-- Company confirmation (shown if similar company found) -->
           <div v-if="companyConfirmation" class="company-confirmation geometric-block">
             <p class="confirmation-message">{{ companyConfirmation.message }}</p>
@@ -132,7 +169,9 @@ const formData = ref({
   name: '',
   email: '',
   password: '',
-  companyName: ''
+  companyName: '',
+  userRole: '',
+  companyType: ''
 });
 
 const loading = ref(false);
@@ -323,7 +362,9 @@ async function handleSignIn() {
       name: formData.value.name.trim(),
       email: formData.value.email.trim(),
       password: formData.value.password,
-      companyName: formData.value.companyName.trim()
+      companyName: formData.value.companyName.trim(),
+      userRole: formData.value.userRole || undefined,
+      companyType: formData.value.companyType || undefined
     });
     
     // Check if confirmation is required
@@ -365,7 +406,9 @@ async function joinExistingCompany() {
       email: formData.value.email.trim(),
       password: formData.value.password,
       companyName: formData.value.companyName.trim(),
-      joinCompanyId: companyConfirmation.value.suggestedCompany.id
+      joinCompanyId: companyConfirmation.value.suggestedCompany.id,
+      userRole: formData.value.userRole || undefined,
+      companyType: formData.value.companyType || undefined
     });
     
     // Store token and user

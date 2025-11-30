@@ -73,6 +73,8 @@ const leadSchema = new mongoose.Schema({
     emailPattern: String,
     contactRelevance: Number, // 0-100
     signalStrength: Number, // 0-100
+    verificationScore: Number, // 0-5, calculated during enrichment
+    verificationSources: [String], // Array of sources used for verification
     linkedinContacts: {
       contacts: [{
         name: String,
@@ -87,6 +89,14 @@ const leadSchema = new mongoose.Schema({
       enrichedAt: Date
     },
     enrichedAt: Date
+  },
+  
+  // Quality scoring (0-5, calculated after extraction)
+  qualityScore: {
+    type: Number,
+    min: 0,
+    max: 5,
+    default: null
   },
   
   // Metadata
