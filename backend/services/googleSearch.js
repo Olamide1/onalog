@@ -462,23 +462,21 @@ export async function fetchGoogleResults(query, country = null, location = null,
   // Step 5: Google Places API (PAID, use when free methods fail or need more)
   const freeResultsCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0);
   
-  // Use Google Places API if:
-  // 1. Free methods returned < minResults, OR
-  // 2. Free methods returned 0 results (complete failure)
-  if (process.env.GOOGLE_PLACES_API_KEY && (freeResultsCount < minResults || freeResultsCount === 0)) {
+  // Use Google Places API ONLY if free methods completely failed (0 results)
+  // This reduces API usage and respects free tier limits
+  // Only use Places as last resort, not as supplement
+  if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount === 0) {
     try {
-      if (freeResultsCount === 0) {
-        console.log(`[SEARCH] 📍 Google Places API (free methods failed, trying paid option)...`);
-      } else {
-        console.log(`[SEARCH] 📍 Google Places API (paid supplement - ${freeResultsCount} free results, need ${minResults}+)...`);
-      }
-      placesResults = await searchGooglePlaces(query, country, location, maxResults);
+      console.log(`[SEARCH] 📍 Google Places API (last resort - free methods returned 0 results)...`);
+      // Limit Places API usage: only request what we need, cap at 20 to reduce API calls
+      const placesMaxResults = Math.min(maxResults, 20);
+      placesResults = await searchGooglePlaces(query, country, location, placesMaxResults);
       console.log(`[SEARCH] ✅ Google Places API: ${placesResults?.length || 0} results`);
     } catch (placesApiError) {
       console.log(`[SEARCH] ⚠️  Google Places API failed: ${placesApiError.message}`);
     }
-  } else if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount >= minResults) {
-    console.log(`[SEARCH] 💰 Skipping Google Places API (cost-saving: ${freeResultsCount} free results >= ${minResults})`);
+  } else if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount > 0) {
+    console.log(`[SEARCH] 💰 Skipping Google Places API (cost-saving: ${freeResultsCount} free results found, only using Places when free methods fail)`);
   } else if (!process.env.GOOGLE_PLACES_API_KEY) {
     console.log('[SEARCH] 💡 Google Places API key not set. Add GOOGLE_PLACES_API_KEY to .env for paid option ($200 free/month)');
   }

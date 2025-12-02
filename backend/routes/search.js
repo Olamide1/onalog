@@ -1005,6 +1005,27 @@ async function processSearch(searchId) {
           return; // Skip this result (no lock created yet)
         }
         
+        // AI-based relevance filtering (only for specific queries to avoid false positives)
+        if (hasSpecificQuery && process.env.OPENAI_API_KEY) {
+          try {
+            const { isLeadRelevant } = await import('../utils/relevanceFilter.js');
+            const relevance = await isLeadRelevant({
+              companyName: finalCompanyName,
+              website: result.link,
+              aboutText: result.snippet || '',
+              categorySignals: []
+            }, search.query, search.industry);
+            
+            if (!relevance.relevant && relevance.confidence > 0.7) {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: AI determined irrelevant (${relevance.reason}, confidence: ${relevance.confidence}): "${finalCompanyName}"`);
+              return; // Skip this result
+            }
+          } catch (relevanceError) {
+            console.log(`[PROCESS] [${i + 1}/${total}] Relevance check error (continuing): ${relevanceError.message}`);
+            // Continue processing if relevance check fails
+          }
+        }
+        
         // Fix: Google search links are unique per query - don't lock them or treat as duplicates
         // Google search links (e.g., https://www.google.com/search?q=...) should be processed independently
         // because each search query is different, even though they all normalize to "google.com"
@@ -1125,23 +1146,52 @@ async function processSearch(searchId) {
           console.log(`[PROCESS] [${i + 1}/${total}] Classifier error (continuing): ${clsErr.message}`);
         }
         
-        // If result has phone/address from Places API, use it
-        if (result.phone && (!extracted.phoneNumbers || extracted.phoneNumbers.length === 0)) {
-          const countryCode = search.country || null;
-          const formattedPhone = formatPhone(result.phone, countryCode);
-          lead.phoneNumbers = [{
-            phone: formattedPhone,
-            country: detectCountry(formattedPhone),
-            formatted: formattedPhone,
-            source: 'google_places_api',
-            confidence: 0.95
-          }];
-          console.log(`[PROCESS] [${i + 1}/${total}] Using phone from Places API: ${formattedPhone}`);
-        }
-        
-        if (result.address && !extracted.address) {
-          lead.address = result.address;
-          console.log(`[PROCESS] [${i + 1}/${total}] Using address from Places API: ${result.address}`);
+        // If result is from Google Places API, prioritize Places data (name, phone, address)
+        if (result.isGooglePlace) {
+          // Use Places API phone if available
+          if (result.phone) {
+            const countryCode = search.country || null;
+            const formattedPhone = formatPhone(result.phone, countryCode);
+            lead.phoneNumbers = [{
+              phone: formattedPhone,
+              country: detectCountry(formattedPhone),
+              formatted: formattedPhone,
+              source: 'google_places_api',
+              confidence: 0.95
+            }];
+            console.log(`[PROCESS] [${i + 1}/${total}] Using phone from Places API: ${formattedPhone}`);
+          }
+          
+          // Use Places API address (more reliable than extracted)
+          if (result.address) {
+            lead.address = result.address;
+            console.log(`[PROCESS] [${i + 1}/${total}] Using address from Places API: ${result.address}`);
+          }
+          
+          // Use Places API name if extracted name is generic
+          if (result.title && (!extracted.companyName || 
+              extracted.companyName.toLowerCase() === 'unknown business' ||
+              extracted.companyName.toLowerCase() === 'unknown company')) {
+            lead.companyName = result.title;
+            console.log(`[PROCESS] [${i + 1}/${total}] Using name from Places API: ${result.title}`);
+          }
+        } else {
+          // For non-Places results, use extracted data but fallback to result data
+          if (result.phone && (!extracted.phoneNumbers || extracted.phoneNumbers.length === 0)) {
+            const countryCode = search.country || null;
+            const formattedPhone = formatPhone(result.phone, countryCode);
+            lead.phoneNumbers = [{
+              phone: formattedPhone,
+              country: detectCountry(formattedPhone),
+              formatted: formattedPhone,
+              source: 'search_result',
+              confidence: 0.8
+            }];
+          }
+          
+          if (result.address && !extracted.address) {
+            lead.address = result.address;
+          }
         }
         
         // Filter emails - only keep valid business emails

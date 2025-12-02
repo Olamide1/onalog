@@ -25,81 +25,91 @@ function cacheSet(cache, key, value, ttl = TTL_MS) {
 export async function extractContactInfo(url, defaultCountry = null) {
   console.log(`[EXTRACT] Starting extraction for: ${url}`);
   
-  // If URL is a Google search link (from OSM results without websites), resolve to a real website first
-  if (url && url.includes('google.com/search')) {
-    console.log(`[EXTRACT] ⚠️  URL is a Google search link (OSM result without website) - attempting to resolve website`);
-    // Extract search query (business name + location)
-    const qMatch = url.match(/[?&]q=([^&]+)/);
-    const rawQ = qMatch ? decodeURIComponent(qMatch[1]).replace(/\+/g, ' ') : '';
-    const resolveQuery = rawQ || 'business';
-    const resolved = await resolveWebsiteFromQuery(resolveQuery);
-    if (resolved) {
-      // Fix: Additional validation - reject example.com/localhost after resolution
-      const invalidDomains = ['example.com', 'localhost', '127.0.0.1', '0.0.0.0', 'test.com', 'placeholder.com', 'domain.com', 'website.com', 'site.com'];
-      try {
-        const resolvedUrl = new URL(resolved);
-        const hostname = resolvedUrl.hostname.toLowerCase();
-        
-        if (invalidDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain))) {
-          console.log(`[EXTRACT] ⚠️  Rejected invalid/placeholder domain after resolution: ${resolved}`);
-          // Fall through to minimal data return
-        } else {
-          console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
-          // Recurse by extracting from the resolved site
-          try {
-            return await extractContactInfo(resolved, defaultCountry);
-          } catch (e) {
-            console.log(`[EXTRACT] ⚠️  Resolution extract failed, falling back to minimal data: ${e.message}`);
-          }
-        }
-      } catch (urlError) {
-        console.log(`[EXTRACT] ⚠️  Invalid resolved URL format: ${resolved}`);
-        // Fall through to minimal data return
-      }
-    } else {
-      console.log(`[EXTRACT] ⚠️  Could not resolve website, returning fallback data`);
-    }
-    // Fix: Improved fallback - extract better business name and location from query
-    // Extract business name (first part before comma or location preposition)
-    let businessName = rawQ.split(',')[0].trim() || 
-                       rawQ.split(/\s+(?:in|at|near|around)\s+/i)[0].trim() || 
-                       'Unknown Business';
+  // Handle Google Places results (marked with "places:" prefix) - skip slow website resolution
+  if (url && url.startsWith('places:')) {
+    console.log(`[EXTRACT] ℹ️  Google Places result - using provided data directly (no website resolution needed)`);
+    // Extract business name from the placeholder URL
+    const businessName = url.replace('places:', '').trim();
     
-    // Fix: Clean up generic terms to get a better company name
-    // Generic terms that indicate a business type (not a specific company name)
-    const genericTerms = ['grocery', 'store', 'shop', 'supermarket', 'market', 'convenience', 'provision', 'food', 'restaurant', 'cafe', 'bar', 'hotel', 'hospital', 'clinic', 'school', 'university', 'bank', 'office', 'company', 'business', 'firm', 'enterprise'];
-    
-    // Try to extract a more specific name by removing generic terms
-    let cleanedName = businessName;
-    for (const term of genericTerms) {
-      // Remove generic terms (case-insensitive, whole word only)
-      cleanedName = cleanedName.replace(new RegExp(`\\b${term}\\b`, 'gi'), '').trim();
-      // Clean up multiple spaces
-      cleanedName = cleanedName.replace(/\s+/g, ' ').trim();
-    }
-    
-    // If cleaned name is too short or empty, use original (but capitalize properly)
-    const finalName = cleanedName.length >= 3 ? cleanedName : businessName;
-    
-    // Capitalize first letter of each word for better presentation
-    const capitalizedName = finalName.split(' ').map(word => 
-      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
-    ).join(' ');
-    
-    // Extract location from query if available (for better address)
-    const locationMatch = rawQ.match(/\s+(?:in|at|near|around)\s+([^,]+)/i);
-    const extractedLocation = locationMatch ? locationMatch[1].trim() : null;
-    
-    // Fix: Return better fallback data instead of completely empty
+    // Return minimal data - the search route will merge this with Places API data (name, address, phone)
     return {
       emails: [],
       phoneNumbers: [],
       socials: {},
-      address: extractedLocation || null, // Include extracted location as address
+      address: null, // Will be set from Places API data in search.js
+      aboutText: '',
+      categorySignals: [],
+      companyName: businessName,
+      website: null, // No website available from Places Text Search
+      decisionMakers: []
+    };
+  }
+  
+  // If URL is a Google search link (from OSM results without websites), resolve to a real website first
+  if (url && url.includes('google.com/search')) {
+    console.log(`[EXTRACT] ⚠️  URL is a Google search link - attempting quick resolution (5s timeout)`);
+    // Extract search query (business name + location)
+    const qMatch = url.match(/[?&]q=([^&]+)/);
+    const rawQ = qMatch ? decodeURIComponent(qMatch[1]).replace(/\+/g, ' ') : '';
+    const resolveQuery = rawQ || 'business';
+    
+    // Quick resolution with timeout - don't block extraction
+    try {
+      const resolved = await Promise.race([
+        resolveWebsiteFromQuery(resolveQuery),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+      ]).catch(() => null); // Return null on timeout instead of throwing
+      
+      if (resolved) {
+        const invalidDomains = ['example.com', 'localhost', '127.0.0.1', '0.0.0.0', 'test.com', 'placeholder.com', 'domain.com', 'website.com', 'site.com'];
+        try {
+          const resolvedUrl = new URL(resolved);
+          const hostname = resolvedUrl.hostname.toLowerCase();
+          
+          if (!invalidDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain))) {
+            console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
+            try {
+              return await extractContactInfo(resolved, defaultCountry);
+            } catch (e) {
+              console.log(`[EXTRACT] ⚠️  Resolution extract failed: ${e.message}`);
+            }
+          }
+        } catch (urlError) {
+          // Invalid URL, fall through
+        }
+      }
+    } catch (e) {
+      console.log(`[EXTRACT] ⚠️  Website resolution timeout/failed: ${e.message}`);
+    }
+    
+    // Fallback: extract business name from query
+    let businessName = rawQ.split(',')[0].trim() || 
+                       rawQ.split(/\s+(?:in|at|near|around)\s+/i)[0].trim() || 
+                       'Unknown Business';
+    
+    const genericTerms = ['grocery', 'store', 'shop', 'supermarket', 'market', 'convenience', 'provision', 'food', 'restaurant', 'cafe', 'bar', 'hotel', 'hospital', 'clinic', 'school', 'university', 'bank', 'office', 'company', 'business', 'firm', 'enterprise'];
+    let cleanedName = businessName;
+    for (const term of genericTerms) {
+      cleanedName = cleanedName.replace(new RegExp(`\\b${term}\\b`, 'gi'), '').trim();
+      cleanedName = cleanedName.replace(/\s+/g, ' ').trim();
+    }
+    const finalName = cleanedName.length >= 3 ? cleanedName : businessName;
+    const capitalizedName = finalName.split(' ').map(word => 
+      word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    ).join(' ');
+    
+    const locationMatch = rawQ.match(/\s+(?:in|at|near|around)\s+([^,]+)/i);
+    const extractedLocation = locationMatch ? locationMatch[1].trim() : null;
+    
+    return {
+      emails: [],
+      phoneNumbers: [],
+      socials: {},
+      address: extractedLocation || null,
       aboutText: '',
       categorySignals: [],
       companyName: capitalizedName,
-      website: url, // Keep original Google search link (better than null)
+      website: null, // Couldn't resolve
       decisionMakers: []
     };
   }
@@ -476,59 +486,69 @@ export async function discoverExecutives(websiteUrl) {
  */
 async function resolveWebsiteFromQuery(query) {
   try {
-    // Try SearxNG if configured
+    // Try SearxNG if configured - but with strict timeout to avoid hanging
+    // Skip if SearxNG is known to be rate-limited (we'll detect this from main search)
     const searxUrls = (process.env.SEARXNG_URLS || '')
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
     const searxSingle = (process.env.SEARXNG_URL || '').trim();
     const searxCandidates = searxUrls.length > 0 ? searxUrls : (searxSingle ? [searxSingle] : []);
-    for (const base of searxCandidates) {
-      try {
-        const endpoint = `${base.replace(/\/+$/, '')}/search?format=json&q=${encodeURIComponent(query)}&categories=general`;
-        const res = await fetch(endpoint, { headers: { 'Accept': 'application/json','User-Agent': 'Onalog/1.0' }, timeout: 12000 });
-        if (res.ok) {
-          const json = await res.json();
-          const results = (json.results || []).filter(r => r.url && r.title);
-          let candidate = results.find(r => r.url.startsWith('http') && !isDirectoryDomain(r.url));
-          // Retry with "official site" bias if the first pass yielded only directories/reviews
-          if (!candidate) {
-            const endpoint2 = `${base.replace(/\/+$/, '')}/search?format=json&q=${encodeURIComponent(query + ' official site')}&categories=general`;
-            const res2 = await fetch(endpoint2, { headers: { 'Accept': 'application/json','User-Agent': 'Onalog/1.0' }, timeout: 12000 });
-            if (res2.ok) {
-              const json2 = await res2.json();
-              const results2 = (json2.results || []).filter(r => r.url && r.title);
-              candidate = results2.find(r => r.url.startsWith('http') && !isDirectoryDomain(r.url));
-            }
+    
+    // Only try SearxNG if we have candidates - skip if empty (means it's rate-limited)
+    if (searxCandidates.length > 0) {
+      for (const base of searxCandidates.slice(0, 2)) { // Only try first 2 to avoid delays
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 5000); // Short 5s timeout
+          
+          const endpoint = `${base.replace(/\/+$/, '')}/search?format=json&q=${encodeURIComponent(query)}&categories=general`;
+          const res = await fetch(endpoint, { 
+            headers: { 'Accept': 'application/json','User-Agent': 'Onalog/1.0' },
+            signal: controller.signal
+          });
+          clearTimeout(timeoutId);
+          
+          if (res.ok) {
+            const json = await res.json();
+            const results = (json.results || []).filter(r => r.url && r.title);
+            let candidate = results.find(r => r.url.startsWith('http') && !isDirectoryDomain(r.url));
+            if (candidate) return candidate.url;
           }
-          if (candidate) return candidate.url;
-        }
-      } catch (_) {}
-    }
-    // Fallback: minimal DuckDuckGo scrape
-    const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
-    const ddgRes = await fetch(ddgUrl, { headers: { 'User-Agent': 'Onalog/1.0', 'Accept': 'text/html' }, timeout: 12000 });
-    if (ddgRes.ok) {
-      const html = await ddgRes.text();
-      const match = html.match(/uddg=([^&"]+)/);
-      if (match) {
-        const decoded = decodeURIComponent(match[1]);
-        if (decoded.startsWith('http') && !isDirectoryDomain(decoded)) {
-          return decoded;
+        } catch (e) {
+          // Skip SearxNG if it fails - continue to DuckDuckGo/LLM
+          if (e.name === 'AbortError') {
+            console.log(`[EXTRACT] ⚠️  SearxNG timeout for website resolution - skipping`);
+          }
         }
       }
-      // Second pass with "official site"
-      const ddgUrl2 = `https://duckduckgo.com/html/?q=${encodeURIComponent(query + ' official site')}`;
-      const ddgRes2 = await fetch(ddgUrl2, { headers: { 'User-Agent': 'Onalog/1.0', 'Accept': 'text/html' }, timeout: 12000 });
-      if (ddgRes2.ok) {
-        const html2 = await ddgRes2.text();
-        const match2 = html2.match(/uddg=([^&"]+)/);
-        if (match2) {
-          const decoded2 = decodeURIComponent(match2[1]);
-          if (decoded2.startsWith('http') && !isDirectoryDomain(decoded2)) {
-            return decoded2;
+    }
+    // Fallback: minimal DuckDuckGo scrape - with timeout to avoid hanging
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout
+      
+      const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+      const ddgRes = await fetch(ddgUrl, { 
+        headers: { 'User-Agent': 'Onalog/1.0', 'Accept': 'text/html' },
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      
+      if (ddgRes.ok) {
+        const html = await ddgRes.text();
+        const match = html.match(/uddg=([^&"]+)/);
+        if (match) {
+          const decoded = decodeURIComponent(match[1]);
+          if (decoded.startsWith('http') && !isDirectoryDomain(decoded)) {
+            return decoded;
           }
         }
+      }
+    } catch (e) {
+      // DuckDuckGo failed or timed out - continue to LLM
+      if (e.name === 'AbortError') {
+        console.log(`[EXTRACT] ⚠️  DuckDuckGo timeout for website resolution - skipping`);
       }
     }
     // LLM guess as a last resort

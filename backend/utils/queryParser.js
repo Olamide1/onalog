@@ -146,6 +146,57 @@ export async function parseQuery(query, existingCountry = null, existingLocation
       }
     }
   }
+  
+  // If no location found via patterns, try LLM extraction (for queries like "farmers lagos" without "in")
+  if (!location && process.env.OPENAI_API_KEY && remainingQuery && remainingQuery.length > 3) {
+    try {
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const prompt = `Extract the location/city/region from this search query: "${query}"
+
+Return ONLY a JSON object:
+{
+  "location": "the location name (e.g., 'Lagos', 'Abuja', 'Nigeria', 'New York') or null if none found",
+  "confidence": 0.0 to 1.0
+}
+
+Rules:
+- Extract city names, state/province names, country names, or region names
+- Common locations: Lagos, Abuja, Accra, Nairobi, Johannesburg, etc.
+- If the query is "farmers lagos" (no preposition), extract "lagos"
+- If no clear location, return null
+- Confidence should reflect certainty
+
+Examples:
+- "farmers lagos" → {"location": "Lagos", "confidence": 0.9}
+- "hr companies in Lagos" → {"location": "Lagos", "confidence": 0.95}
+- "phone stores Abuja" → {"location": "Abuja", "confidence": 0.9}
+- "grocery shops" → {"location": null, "confidence": 0.0}
+
+Output the JSON object only:`;
+
+      const resp = await openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: 'You extract locations from search queries. Output JSON only.' },
+          { role: 'user', content: prompt }
+        ]
+      });
+      
+      const text = resp.choices?.[0]?.message?.content?.trim() || '{}';
+      const result = JSON.parse(text);
+      
+      if (result.location && result.confidence > 0.6) {
+        location = result.location.trim();
+        // Remove location from cleaned query
+        cleanedQuery = cleanedQuery.replace(new RegExp(`\\b${location.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi'), '').trim();
+        console.log(`[QUERY_PARSER] LLM extracted location: "${location}" from query: "${query}"`);
+      }
+    } catch (error) {
+      console.log(`[QUERY_PARSER] LLM location extraction failed: ${error.message}`);
+    }
+  }
 
   // Extract industry dynamically using LLM (no hardcoded keywords)
   // This handles any industry type: farmers, phone stores, grocery shops, etc.

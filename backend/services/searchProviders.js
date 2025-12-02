@@ -267,21 +267,24 @@ export async function searchSearxng(query, country = null, location = null, maxR
     const singleUrl = (process.env.SEARXNG_URL || '').trim();
     
     // Expanded list of public SearxNG instances (from searx.space and community)
-    // These are known to be more reliable and have fewer restrictions
+    // Updated with more reliable instances that are less likely to rate-limit
     const fallback = [
-      'https://searx.be',
       'https://searx.tiekoetter.com',
       'https://search.bus-hit.me',
       'https://searxng.bissisoft.com',
       'https://searx.prvcy.eu',
-      'https://searx.xyz',
-      'https://searx.org',
       'https://searx.fmac.xyz',
       'https://searx.sapti.me',
       'https://searx.rasp.fr',
       'https://searx.work',
       'https://searx.divided-by-zero.eu',
-      'https://searx.0x1f4.space'
+      'https://searx.0x1f4.space',
+      'https://searx.be',
+      'https://searx.xyz',
+      'https://searx.org',
+      'https://searxng.eu',
+      'https://searx.privacytools.io',
+      'https://searx.mastodontech.de'
     ];
     
     const candidates = urlsFromEnv.length > 0 ? urlsFromEnv : (singleUrl ? [singleUrl] : fallback);
@@ -292,10 +295,23 @@ export async function searchSearxng(query, country = null, location = null, maxR
     // Shuffle candidates to distribute load
     const shuffled = [...candidates].sort(() => Math.random() - 0.5);
 
-    // Build query once
+    // Build query once - avoid duplicate location if already in query
     let q = query;
-    if (location) q += ` ${location}`;
-    if (country) q += ` ${country}`;
+    const queryLower = query.toLowerCase();
+    const locationLower = location ? location.toLowerCase() : '';
+    const locationInQuery = locationLower && (
+      queryLower.includes(` ${locationLower}`) || 
+      queryLower.includes(`${locationLower} `) ||
+      queryLower.includes(` in ${locationLower}`) ||
+      queryLower.endsWith(locationLower)
+    );
+    
+    if (location && !locationInQuery) {
+      q += ` ${location}`;
+    }
+    if (country) {
+      q += ` ${country}`;
+    }
 
     // Rotate User-Agents to appear more natural
     const userAgents = [
@@ -330,6 +346,11 @@ export async function searchSearxng(query, country = null, location = null, maxR
           'Referer': baseUrl
         }, 12000);
         
+        // Check if response is HTML instead of JSON (common when instance is down or blocking)
+        if (raw.trim().startsWith('<!DOCTYPE') || raw.trim().startsWith('<html')) {
+          throw new Error(`Instance returned HTML instead of JSON (likely blocked or down)`);
+        }
+        
         const json = JSON.parse(raw);
         const items = json.results || [];
         const results = items
@@ -345,37 +366,38 @@ export async function searchSearxng(query, country = null, location = null, maxR
         // If zero results, try next instance
       } catch (e) {
         const errorMsg = e.message || '';
-        const isRateLimit = errorMsg.includes('403') || errorMsg.includes('429');
+        const isRateLimit = errorMsg.includes('403') || errorMsg.includes('429') || errorMsg.includes('Rate limited');
+        const isHtmlResponse = errorMsg.includes('HTML') || errorMsg.includes('<!DOCTYPE') || errorMsg.includes('Unexpected token');
         
         if (isRateLimit) {
           lastRateLimitError = e;
-          console.log(`[SEARXNG] ⚠️  ${baseUrl} rate-limited (${errorMsg.includes('403') ? '403' : '429'}) - trying next instance`);
-          
-          // If this is the last instance and we got rate-limited, implement exponential backoff
-          if (i === shuffled.length - 1 && lastRateLimitError) {
-            console.log(`[SEARXNG] ⚠️  All instances rate-limited. Implementing exponential backoff...`);
-            // Don't retry immediately - let the caller handle fallback to other providers
-            // This prevents hammering the instances
-          }
+          console.log(`[SEARXNG] ⚠️  ${baseUrl} rate-limited - trying next instance`);
+        } else if (isHtmlResponse) {
+          console.log(`[SEARXNG] ⚠️  ${baseUrl} returned HTML (blocked/down) - trying next instance`);
         } else {
-          console.log(`[SEARXNG] ⚠️  ${baseUrl} failed: ${errorMsg}`);
+          console.log(`[SEARXNG] ⚠️  ${baseUrl} failed: ${errorMsg} - trying next instance`);
         }
         
         if (!firstError) firstError = e;
-        // Continue to next candidate
+        // Continue to next candidate - don't stop early
       }
     }
     
     // If all failed or returned empty
-    if (lastRateLimitError) {
-      // If we got rate-limited, provide helpful message
-      throw new Error(`SearxNG rate-limited (403/429): All public instances are blocking requests. Consider: 1) Adding BING_API_KEY for digital businesses, 2) Using your own SearxNG instance, 3) Waiting before retrying.`);
+    // Only throw rate-limit error if ALL instances were rate-limited (not just some HTML responses)
+    const allWereRateLimited = lastRateLimitError && shuffled.length > 0;
+    if (allWereRateLimited) {
+      throw new Error(`SearxNG rate-limited: All ${shuffled.length} instances tried were rate-limited. Consider: 1) Adding BING_API_KEY for digital businesses, 2) Using your own SearxNG instance, 3) Waiting before retrying.`);
     }
     
+    // If we tried all instances but got errors (HTML responses, timeouts, etc.), just return empty
+    // Don't throw - let other providers handle it
     if (firstError) {
-      throw firstError;
+      console.log(`[SEARXNG] ⚠️  All ${shuffled.length} instances failed or returned no results - continuing with other providers`);
+      return [];
     }
-    throw new Error('All SearxNG instances returned 0 results');
+    
+    return [];
   } catch (e) {
     console.log(`[SEARXNG] ❌ Error: ${e.message}`);
     throw new Error(`SearxNG failed: ${e.message}`);
@@ -387,6 +409,12 @@ export async function searchSearxng(query, country = null, location = null, maxR
  * Requires: GOOGLE_PLACES_API_KEY in .env
  * Good for local business searches - PRIMARY METHOD
  */
+// Track Google Places API usage to respect free tier limits
+let placesApiCallCount = 0;
+let placesApiResetDate = new Date();
+const PLACES_API_FREE_TIER_LIMIT = 40000; // $200/month = ~40k requests (Text Search = $32 per 1000)
+const PLACES_API_DAILY_LIMIT = Math.floor(PLACES_API_FREE_TIER_LIMIT / 30); // ~1333 per day
+
 export async function searchGooglePlaces(query, country = null, location = null, maxResults = 50) {
   try {
     const apiKey = process.env.GOOGLE_PLACES_API_KEY;
@@ -395,7 +423,27 @@ export async function searchGooglePlaces(query, country = null, location = null,
       throw new Error('Google Places API key not configured');
     }
     
-    console.log(`[PLACES_API] Starting search: "${query}", Country: ${country || 'none'}, Location: ${location || 'none'}, Max: ${maxResults}`);
+    // Reset counter daily
+    const today = new Date().toDateString();
+    if (placesApiResetDate.toDateString() !== today) {
+      placesApiCallCount = 0;
+      placesApiResetDate = new Date();
+      console.log(`[PLACES_API] Daily counter reset`);
+    }
+    
+    // Enforce daily limit to avoid exceeding free tier
+    if (placesApiCallCount >= PLACES_API_DAILY_LIMIT) {
+      throw new Error(`Google Places API daily limit reached (${PLACES_API_DAILY_LIMIT} calls/day). Free tier: $200/month = ~40k requests.`);
+    }
+    
+    // Cap maxResults to reduce API usage (Text Search costs $32 per 1000 requests)
+    // Each page = 1 request, so limit pages to reduce costs
+    const cappedMaxResults = Math.min(maxResults, 20); // Cap at 20 to reduce API calls
+    if (maxResults > cappedMaxResults) {
+      console.log(`[PLACES_API] ⚠️  Capping results from ${maxResults} to ${cappedMaxResults} to reduce API usage`);
+    }
+    
+    console.log(`[PLACES_API] Starting search: "${query}", Country: ${country || 'none'}, Location: ${location || 'none'}, Max: ${cappedMaxResults} (API calls: ${placesApiCallCount}/${PLACES_API_DAILY_LIMIT})`);
     
     // Build search query
     let searchQuery = query;
@@ -426,9 +474,13 @@ export async function searchGooglePlaces(query, country = null, location = null,
     const results = [];
     let nextPageToken = null;
     let pageCount = 0;
-    const maxPages = Math.ceil(maxResults / 20); // 20 results per page
+    const maxPages = Math.ceil(cappedMaxResults / 20); // 20 results per page, but limit pages
+    const actualMaxPages = Math.min(maxPages, 1); // Only fetch 1 page (20 results) to reduce API usage
     
     do {
+      // Increment API call counter
+      placesApiCallCount++;
+      
       // Use Text Search API with better parameters
       let url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(searchQuery)}&key=${apiKey}`;
       
@@ -525,41 +577,50 @@ TO FIX (MOST COMMON ISSUES):
       }
       
       // Filter directory sites and map results
-      // Google Places API provides high-quality data - prioritize places with websites
+      // Note: Google Places Text Search doesn't return website field - need Place Details for that
+      // So we include all places and let the extractor resolve websites later
       const pageResults = (json.results || [])
         .filter(place => {
+          // Filter out directory sites if website is present (rare in Text Search results)
           const website = place.website || '';
-          // Filter out directory sites
           if (website && isDirectorySite(website)) {
             return false;
           }
-          // Only include places with actual websites (not just Google Maps links)
-          // This ensures we get real business websites, not just map locations
-          return !!website && website.length > 0;
+          // Include all places - website will be resolved by extractor using Place Details or LLM
+          return true;
         })
-        .map(place => ({
-          title: place.name,
-          link: place.website, // Always use website (we filtered out places without websites)
-          snippet: place.formatted_address || place.vicinity || '',
-          phone: place.formatted_phone_number || place.international_phone_number || null,
-          address: place.formatted_address || place.vicinity || null
-        }));
+        .map(place => {
+          // For Google Places, we have name, address, phone - use these directly
+          // Don't create Google search links - they're slow to resolve
+          // Use a placeholder link that extractor can recognize as "use Places data directly"
+          const link = place.website || `places:${place.place_id || place.name}`;
+          
+          return {
+            title: place.name,
+            link: link,
+            snippet: place.formatted_address || place.vicinity || '',
+            phone: place.formatted_phone_number || place.international_phone_number || null,
+            address: place.formatted_address || place.vicinity || null,
+            placeId: place.place_id || null, // Store place_id for potential Place Details lookup
+            isGooglePlace: true // Flag to indicate this is from Google Places
+          };
+        });
       
       results.push(...pageResults);
       nextPageToken = json.next_page_token;
       pageCount++;
       
-      console.log(`[PLACES_API] Page ${pageCount}: Found ${pageResults.length} results (Total: ${results.length})`);
+      console.log(`[PLACES_API] Page ${pageCount}: Found ${pageResults.length} results (Total: ${results.length}, API calls: ${placesApiCallCount}/${PLACES_API_DAILY_LIMIT})`);
       
-      // Stop if we have enough results or no more pages
-      if (results.length >= maxResults || !nextPageToken || pageCount >= maxPages) {
+      // Stop if we have enough results, no more pages, or hit page limit (to reduce API usage)
+      if (results.length >= cappedMaxResults || !nextPageToken || pageCount >= actualMaxPages) {
         break;
       }
       
     } while (nextPageToken && results.length < maxResults && pageCount < maxPages);
     
-    const finalResults = results.slice(0, maxResults);
-    console.log(`[PLACES_API] ✅ Found ${finalResults.length} results (filtered from ${results.length} total)`);
+    const finalResults = results.slice(0, cappedMaxResults);
+    console.log(`[PLACES_API] ✅ Found ${finalResults.length} results (filtered from ${results.length} total, API calls used: ${placesApiCallCount}/${PLACES_API_DAILY_LIMIT})`);
     return finalResults;
     
   } catch (error) {
@@ -988,7 +1049,17 @@ export async function searchOpenStreetMap(query, country = null, location = null
     // The LLM in buildAdaptiveExpansions() generates OSM-friendly terms dynamically.
     // This ensures we can handle any search query without maintaining a manual list.
     
-    if (location) {
+    // Fix: Check if location is already in the query to avoid duplicates like "hr companies in lagos Lagos"
+    const queryLower = searchQuery.toLowerCase();
+    const locationLower = location ? location.toLowerCase() : '';
+    const locationInQuery = locationLower && (
+      queryLower.includes(` ${locationLower}`) || 
+      queryLower.includes(`${locationLower} `) ||
+      queryLower.includes(` in ${locationLower}`) ||
+      queryLower.endsWith(locationLower)
+    );
+    
+    if (location && !locationInQuery) {
       searchQuery += ` ${location}`;
     }
     if (country) {
@@ -1014,8 +1085,22 @@ export async function searchOpenStreetMap(query, country = null, location = null
     }
     
     // Prepare synonym expansion to avoid 0 results on specific labels
+    // Use LLM-generated terms if available (from allSearchTerms), otherwise use local synonyms
     const base = searchQuery;
     const synonyms = new Set([base]);
+    
+    // If LLM-generated terms are provided, use them (better than hardcoded synonyms)
+    if (allSearchTerms && allSearchTerms.length > 0) {
+      allSearchTerms.forEach(term => {
+        const termLower = term.toLowerCase();
+        // Only add terms that are different from base query
+        if (termLower !== base.toLowerCase()) {
+          synonyms.add(termLower);
+        }
+      });
+      console.log(`[OSM] Using ${synonyms.size} search terms (including LLM expansions)`);
+    }
+    
     const contains = (w) => base.includes(w);
     if (contains('hairdresser') || contains('hair') || contains('salon')) {
       const basePlace = `${location ? location + ' ' : ''}${country ? (country.length <= 3 ? '' : country) : ''}`.trim();
