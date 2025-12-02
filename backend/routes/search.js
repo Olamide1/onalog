@@ -713,6 +713,8 @@ async function processSearch(searchId) {
     console.log(`[PROCESS] Step 1/3: Searching...`);
     
     const searchStartTime = Date.now();
+    
+    // Start search
     const fetchedResults = await fetchGoogleResults(
       search.query,
       search.country,
@@ -815,14 +817,17 @@ async function processSearch(searchId) {
     }
     console.log(`[PROCESS] Directory expansion: Found ${directoryCount} directory pages, expanded to ${expandedResults.length} total results`);
     
-    // Step 2: Extract contact info (early-return at 20, background fill)
+    // PROGRESSIVE EXTRACTION: Start extracting immediately with first batch
+    // Don't wait for all results - start as soon as we have enough to begin
     const initialTarget = Math.min(30, expandedResults.length);
     const MAX_WORKERS = 4; // cap parallelism
     const TIME_BUDGET_MS = 25000; // ~25s budget for initial reveal
     const deadline = Date.now() + TIME_BUDGET_MS;
+    
+    // Start extraction immediately with first batch (progressive approach)
     const initialBatch = expandedResults.slice(0, initialTarget);
     const backgroundBatch = expandedResults.slice(initialTarget);
-    console.log(`[PROCESS] Step 2/3: Extracting up to ${initialBatch.length} initially (budget ${TIME_BUDGET_MS}ms, of ${expandedResults.length})...`);
+    console.log(`[PROCESS] Step 2/3: Starting PROGRESSIVE extraction - ${initialBatch.length} leads ready now (of ${expandedResults.length} total)...`);
     const leads = [];
     let extractedCount = 0;
     let errorCount = 0;
@@ -1379,6 +1384,13 @@ async function processSearch(searchId) {
           leads.push(lead);
           extractedCount++;
           
+          // STREAMING UPDATE: Update search status immediately after each lead is extracted
+          // This allows frontend to see progress in real-time
+          search.extractedCount = extractedCount;
+          await search.save().catch(err => {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Failed to update search status: ${err.message}`);
+          });
+          
           // Step 3: Enrich lead (with billing gate)
           let reserved = false;
           if (billingEnabled() && searchCompanyId) {
@@ -1411,9 +1423,35 @@ async function processSearch(searchId) {
               const enrichDuration = Date.now() - enrichStartTime;
               
               lead.enrichment = enrichment;
+              
+              // IMPROVED DECISION MAKER EXTRACTION: Use AI to validate and filter decision makers
               if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
-                lead.decisionMakers = enrichment.decisionMakers;
+                // Validate decision makers with AI to filter out noise
+                try {
+                  const { validateDecisionMakers } = await import('../utils/decisionMakerValidator.js');
+                  const validated = await validateDecisionMakers(
+                    enrichment.decisionMakers,
+                    lead.companyName,
+                    lead.website
+                  );
+                  lead.decisionMakers = validated;
+                  console.log(`[PROCESS] [${i + 1}/${total}] ✅ Validated ${validated.length} decision makers (filtered from ${enrichment.decisionMakers.length})`);
+                } catch (validateErr) {
+                  console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Decision maker validation failed, using original: ${validateErr.message}`);
+                  lead.decisionMakers = enrichment.decisionMakers; // Fallback to original
+                }
               }
+              
+              // STREAMING UPDATE: Update enriched count immediately
+              const currentEnriched = await Lead.countDocuments({ 
+                searchId: search._id, 
+                enrichmentStatus: 'enriched',
+                isDuplicate: false 
+              });
+              search.enrichedCount = currentEnriched;
+              await search.save().catch(err => {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Failed to update enriched count: ${err.message}`);
+              });
               
               // Calculate verification score
               try {
@@ -1459,10 +1497,22 @@ async function processSearch(searchId) {
       console.log(`[PROCESS] [${i + 1}/${total}] ✅ Complete in ${itemDuration}ms: ${lead.companyName}`);
       console.log(`[PROCESS] [${i + 1}/${total}]   - Emails: ${lead.emails.length}, Phones: ${lead.phoneNumbers.length}, Website: ${lead.website ? 'Yes' : 'No'}`);
         
-        // Update search progress
-        search.extractedCount = extractedCount;
-        search.enrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
-      if (i % 5 === 0 || i === total - 1) {
+        // STREAMING UPDATE: Progress is already updated immediately after each lead (see above)
+        // This batch update is just for final sync
+        if (i % 10 === 0 || i === total - 1) {
+          // Re-fetch actual counts from DB for accuracy
+          const actualExtracted = await Lead.countDocuments({ 
+            searchId: search._id, 
+            extractionStatus: { $in: ['extracted', 'enriched'] },
+            isDuplicate: false 
+          });
+          const actualEnriched = await Lead.countDocuments({ 
+            searchId: search._id, 
+            enrichmentStatus: 'enriched',
+            isDuplicate: false 
+          });
+          search.extractedCount = actualExtracted;
+          search.enrichedCount = actualEnriched;
           await search.save();
         }
         
@@ -1617,23 +1667,28 @@ async function processSearch(searchId) {
               // Fix: Wrap processOne in try-catch to prevent silent failures
               await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
               
-              // Fix: Update progress periodically (every 5 items or on last item)
-              if ((j + 1) % 5 === 0 || j === bgList.length - 1) {
-                const s = await Search.findById(search._id);
-                if (s) {
-                  const currentExtracted = await Lead.countDocuments({ 
-                    searchId: search._id, 
-                    isDuplicate: false,
-                    extractionStatus: 'extracted'
-                  });
-                  const currentEnriched = await Lead.countDocuments({ 
-                    searchId: search._id, 
-                    isDuplicate: false,
-                    enrichmentStatus: 'enriched'
-                  });
-                  s.extractedCount = currentExtracted;
-                  s.enrichedCount = currentEnriched;
-                  await s.save();
+              // STREAMING UPDATE: Update progress after EACH item for real-time frontend updates
+              const s = await Search.findById(search._id);
+              if (s) {
+                const currentExtracted = await Lead.countDocuments({ 
+                  searchId: search._id, 
+                  isDuplicate: false,
+                  extractionStatus: { $in: ['extracted', 'enriched'] }
+                });
+                const currentEnriched = await Lead.countDocuments({ 
+                  searchId: search._id, 
+                  isDuplicate: false,
+                  enrichmentStatus: 'enriched'
+                });
+                s.extractedCount = currentExtracted;
+                s.enrichedCount = currentEnriched;
+                s.status = 'processing_backfill'; // Ensure status is set
+                await s.save().catch(err => {
+                  console.log(`[PROCESS] ⚠️  Failed to update backfill progress: ${err.message}`);
+                });
+                
+                // Log every 5 items to avoid spam, but save every item
+                if ((j + 1) % 5 === 0 || j === bgList.length - 1) {
                   console.log(`[PROCESS] 🔄 Background fill progress: ${currentExtracted} extracted, ${currentEnriched} enriched (${j + 1}/${bgList.length} processed)`);
                 }
               }

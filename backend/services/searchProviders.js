@@ -1090,15 +1090,57 @@ export async function searchOpenStreetMap(query, country = null, location = null
     const synonyms = new Set([base]);
     
     // If LLM-generated terms are provided, use them (better than hardcoded synonyms)
+    // IMPORTANT: Append location/country to each LLM term to ensure location-specific queries
     if (allSearchTerms && allSearchTerms.length > 0) {
+      // Build location suffix once (location and country are already in base query, but LLM terms might not have them)
+      let locationSuffix = '';
+      if (location) {
+        locationSuffix += ` ${location}`;
+      }
+      if (country) {
+        const countryNames = {
+          'ng': 'Nigeria', 'za': 'South Africa', 'ke': 'Kenya', 'gh': 'Ghana',
+          'ug': 'Uganda', 'tz': 'Tanzania', 'et': 'Ethiopia', 'eg': 'Egypt',
+          'zm': 'Zambia', 'zw': 'Zimbabwe', 'rw': 'Rwanda', 'sn': 'Senegal',
+          'ci': 'Ivory Coast', 'cm': 'Cameroon', 'ao': 'Angola', 'ma': 'Morocco',
+          'tn': 'Tunisia', 'dz': 'Algeria', 'mg': 'Madagascar', 'mw': 'Malawi',
+          'us': 'United States', 'ca': 'Canada', 'mx': 'Mexico',
+          'gb': 'United Kingdom', 'de': 'Germany', 'fr': 'France', 'it': 'Italy',
+          'es': 'Spain', 'nl': 'Netherlands', 'be': 'Belgium', 'ch': 'Switzerland',
+          'at': 'Austria', 'se': 'Sweden', 'no': 'Norway', 'dk': 'Denmark',
+          'pl': 'Poland', 'ie': 'Ireland', 'pt': 'Portugal',
+          'in': 'India', 'cn': 'China', 'jp': 'Japan', 'kr': 'South Korea',
+          'sg': 'Singapore', 'my': 'Malaysia', 'th': 'Thailand', 'id': 'Indonesia',
+          'ph': 'Philippines', 'vn': 'Vietnam', 'ae': 'United Arab Emirates',
+          'sa': 'Saudi Arabia', 'il': 'Israel', 'pk': 'Pakistan', 'bd': 'Bangladesh',
+          'au': 'Australia', 'nz': 'New Zealand',
+          'br': 'Brazil', 'ar': 'Argentina', 'co': 'Colombia', 'cl': 'Chile', 'pe': 'Peru'
+        };
+        locationSuffix += ` ${countryNames[country] || country}`;
+      }
+      locationSuffix = locationSuffix.trim();
+      
       allSearchTerms.forEach(term => {
         const termLower = term.toLowerCase();
         // Only add terms that are different from base query
         if (termLower !== base.toLowerCase()) {
-          synonyms.add(termLower);
+          // Check if location is already in this LLM term to avoid duplicates
+          const termHasLocation = location && (
+            termLower.includes(` ${locationLower}`) || 
+            termLower.includes(`${locationLower} `) ||
+            termLower.includes(` in ${locationLower}`) ||
+            termLower.endsWith(locationLower)
+          );
+          
+          // Append location/country to each LLM term if not already present
+          // This ensures all OSM queries are location-specific from the start
+          const termWithLocation = (locationSuffix && !termHasLocation) 
+            ? `${termLower} ${locationSuffix}`.trim() 
+            : termLower;
+          synonyms.add(termWithLocation);
         }
       });
-      console.log(`[OSM] Using ${synonyms.size} search terms (including LLM expansions)`);
+      console.log(`[OSM] Using ${synonyms.size} search terms (including LLM expansions, all location-specific)`);
     }
     
     const contains = (w) => base.includes(w);
@@ -1210,14 +1252,112 @@ export async function searchOpenStreetMap(query, country = null, location = null
           return false;
         }
 
-        // Prefer location and country matches, but be PERMISSIVE - don't reject everything if they don't match
-        // This handles cases like "Accra" (Ghana) with country "Nigeria" - still show results
-        // We'd rather show potentially relevant results than filter everything out
-        // The search intent matching below will still filter appropriately
+        // STRICT LOCATION FILTERING: When location is provided, enforce it strictly
+        // This prevents results from wrong locations (e.g., India results for "Lagos" search)
+        if (location) {
+          const locationLower = location.toLowerCase();
+          const displayNameLower = displayName.toLowerCase();
+          const addrCity = (addr.city || '').toLowerCase();
+          const addrState = (addr.state || '').toLowerCase();
+          const addrCountry = (addr.country || '').toLowerCase();
+          const addrRegion = (addr.region || '').toLowerCase();
+          
+          // Check if location appears in address components or display name
+          const locationInAddress = 
+            displayNameLower.includes(locationLower) ||
+            addrCity.includes(locationLower) ||
+            addrState.includes(locationLower) ||
+            addrRegion.includes(locationLower);
+          
+          // If location is specified, STRICTLY require it to match
+          // This prevents "design agencies Lagos" from returning results from India/Hong Kong
+          if (!locationInAddress) {
+            console.log(`[OSM] ⚠️  Rejecting result: location "${location}" not found in "${displayName}" (city: ${addrCity}, state: ${addrState}, country: ${addrCountry})`);
+            return false;
+          }
+        }
         
-        // Note: We used to strictly require location/country matches, but that caused 0 results
-        // when users selected mismatched location/country (e.g., Accra + Nigeria).
-        // Now we're permissive - if it matches search intent (salon, barber, etc.), show it.
+        // STRICT COUNTRY FILTERING: When country is provided, enforce it
+        if (country) {
+          const countryNames = {
+            'ng': ['nigeria', 'ng'],
+            'za': ['south africa', 'za'],
+            'ke': ['kenya', 'ke'],
+            'gh': ['ghana', 'gh'],
+            'us': ['united states', 'usa', 'us'],
+            'gb': ['united kingdom', 'uk', 'gb', 'england', 'scotland', 'wales'],
+            'in': ['india', 'in'],
+            'hk': ['hong kong', 'hk'],
+            'pk': ['pakistan', 'pk'],
+            'bd': ['bangladesh', 'bd'],
+            'sg': ['singapore', 'sg'],
+            'my': ['malaysia', 'my'],
+            'th': ['thailand', 'th'],
+            'id': ['indonesia', 'id'],
+            'ph': ['philippines', 'ph'],
+            'vn': ['vietnam', 'vn'],
+            'ae': ['united arab emirates', 'uae', 'ae'],
+            'sa': ['saudi arabia', 'sa'],
+            'il': ['israel', 'il'],
+            'au': ['australia', 'au'],
+            'nz': ['new zealand', 'nz'],
+            'ca': ['canada', 'ca'],
+            'mx': ['mexico', 'mx'],
+            'br': ['brazil', 'br'],
+            'ar': ['argentina', 'ar'],
+            'co': ['colombia', 'co'],
+            'cl': ['chile', 'cl'],
+            'pe': ['peru', 'pe'],
+            'de': ['germany', 'de'],
+            'fr': ['france', 'fr'],
+            'it': ['italy', 'it'],
+            'es': ['spain', 'es'],
+            'nl': ['netherlands', 'nl'],
+            'be': ['belgium', 'be'],
+            'ch': ['switzerland', 'ch'],
+            'at': ['austria', 'at'],
+            'se': ['sweden', 'se'],
+            'no': ['norway', 'no'],
+            'dk': ['denmark', 'dk'],
+            'pl': ['poland', 'pl'],
+            'ie': ['ireland', 'ie'],
+            'pt': ['portugal', 'pt'],
+            'cn': ['china', 'cn'],
+            'jp': ['japan', 'jp'],
+            'kr': ['south korea', 'kr'],
+            'ug': ['uganda', 'ug'],
+            'tz': ['tanzania', 'tz'],
+            'et': ['ethiopia', 'et'],
+            'eg': ['egypt', 'eg'],
+            'zm': ['zambia', 'zm'],
+            'zw': ['zimbabwe', 'zw'],
+            'rw': ['rwanda', 'rw'],
+            'sn': ['senegal', 'sn'],
+            'ci': ['ivory coast', 'ci', 'côte d\'ivoire'],
+            'cm': ['cameroon', 'cm'],
+            'ao': ['angola', 'ao'],
+            'ma': ['morocco', 'ma'],
+            'tn': ['tunisia', 'tn'],
+            'dz': ['algeria', 'dz'],
+            'mg': ['madagascar', 'mg'],
+            'mw': ['malawi', 'mw']
+          };
+          
+          const expectedCountries = countryNames[country.toLowerCase()] || [country.toLowerCase()];
+          const addrCountryLower = addrCountry.toLowerCase();
+          const displayNameLower = displayName.toLowerCase();
+          
+          // Check if country matches
+          const countryMatches = expectedCountries.some(expected => 
+            addrCountryLower.includes(expected) ||
+            displayNameLower.includes(expected)
+          );
+          
+          if (!countryMatches) {
+            console.log(`[OSM] ⚠️  Rejecting result: country "${country}" not found in "${displayName}" (country: ${addrCountry})`);
+            return false;
+          }
+        }
 
         // Accept if it has a name and is a business-related place
         // Don't filter too strictly - accept most places with names

@@ -459,15 +459,23 @@ export async function fetchGoogleResults(query, country = null, location = null,
   const freeEarly = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0);
   console.log(`[SEARCH] Free results after parallel stage: ${freeEarly}`);
   
-  // Step 5: Google Places API (PAID, use when free methods fail or need more)
+  // Step 5: Google Places API (PAID, use when OSM returns 0 location-specific results)
   const freeResultsCount = (overpassResults?.length || 0) + (searxResults?.length || 0) + (osmResults?.length || 0) + (bingResults?.length || 0) + (customSearchResults?.length || 0);
+  const osmResultsCount = osmResults?.length || 0;
   
-  // Use Google Places API ONLY if free methods completely failed (0 results)
-  // This reduces API usage and respects free tier limits
-  // Only use Places as last resort, not as supplement
-  if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount === 0) {
+  // Use Google Places API as fallback when:
+  // 1. OSM returns 0 location-specific results (OSM is our primary location-based source)
+  // 2. OR all free methods completely failed (0 results total)
+  // This ensures we get location-specific results when OSM can't find any
+  const shouldUsePlaces = (location && osmResultsCount === 0) || (freeResultsCount === 0);
+  
+  if (process.env.GOOGLE_PLACES_API_KEY && shouldUsePlaces) {
     try {
-      console.log(`[SEARCH] 📍 Google Places API (last resort - free methods returned 0 results)...`);
+      if (location && osmResultsCount === 0) {
+        console.log(`[SEARCH] 📍 Google Places API (fallback - OSM returned 0 location-specific results for "${location}")...`);
+      } else {
+        console.log(`[SEARCH] 📍 Google Places API (last resort - all free methods returned 0 results)...`);
+      }
       // Limit Places API usage: only request what we need, cap at 20 to reduce API calls
       const placesMaxResults = Math.min(maxResults, 20);
       placesResults = await searchGooglePlaces(query, country, location, placesMaxResults);
@@ -475,8 +483,8 @@ export async function fetchGoogleResults(query, country = null, location = null,
     } catch (placesApiError) {
       console.log(`[SEARCH] ⚠️  Google Places API failed: ${placesApiError.message}`);
     }
-  } else if (process.env.GOOGLE_PLACES_API_KEY && freeResultsCount > 0) {
-    console.log(`[SEARCH] 💰 Skipping Google Places API (cost-saving: ${freeResultsCount} free results found, only using Places when free methods fail)`);
+  } else if (process.env.GOOGLE_PLACES_API_KEY && !shouldUsePlaces) {
+    console.log(`[SEARCH] 💰 Skipping Google Places API (cost-saving: ${freeResultsCount} free results found, OSM: ${osmResultsCount} location-specific)`);
   } else if (!process.env.GOOGLE_PLACES_API_KEY) {
     console.log('[SEARCH] 💡 Google Places API key not set. Add GOOGLE_PLACES_API_KEY to .env for paid option ($200 free/month)');
   }

@@ -49,9 +49,13 @@
           </span>
         </div>
         <div class="status-stats">
-          <div>Total: {{ leadsStore.currentSearch.totalResults || 0 }}</div>
+          <div>Total Found: {{ leadsStore.currentSearch.totalResults || 0 }}</div>
           <div>Extracted: {{ leadsStore.currentSearch.extractedCount || 0 }}</div>
           <div>Enriched: {{ leadsStore.enrichedCount }}</div>
+          <div v-if="leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching'" class="processing-indicator">
+            <span class="pulse-dot"></span>
+            <span>{{ processingCount }} being processed...</span>
+          </div>
         </div>
         <div v-if="leadsStore.currentSearch.status === 'processing' || leadsStore.currentSearch.status === 'queued' || leadsStore.currentSearch.status === 'searching' || leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching'" class="progress-indicator">
           <div class="progress-message">
@@ -123,6 +127,23 @@ const lastUpdateTime = ref(null);
 const lastExtractedCount = ref(0);
 const lastEnrichedCount = ref(0);
 const lastUpdateTimestamp = ref(Date.now());
+
+// Calculate how many leads are currently being processed
+const processingCount = computed(() => {
+  if (!leadsStore.currentSearch) return 0;
+  const status = leadsStore.currentSearch.status;
+  const total = leadsStore.currentSearch.totalResults || 0;
+  const extracted = leadsStore.currentSearch.extractedCount || 0;
+  const enriched = leadsStore.enrichedCount || 0;
+  
+  if (status === 'extracting') {
+    return Math.max(0, total - extracted);
+  }
+  if (status === 'enriching' || status === 'processing_backfill') {
+    return Math.max(0, extracted - enriched);
+  }
+  return 0;
+});
 
 const progressPercent = computed(() => {
   if (!leadsStore.currentSearch) return 0;
@@ -233,7 +254,7 @@ async function handleSearch(searchData) {
 function startPolling(searchId) {
   if (pollInterval) clearInterval(pollInterval);
   
-  // Use faster polling (1s) for better real-time updates
+  // Poll every 2-3 seconds during active processing for better UX (not too aggressive, not too slow)
   pollInterval = setInterval(async () => {
     try {
       const data = await leadsStore.fetchSearch(searchId);
@@ -253,6 +274,17 @@ function startPolling(searchId) {
         lastUpdateTimestamp.value = Date.now();
         lastExtractedCount.value = extracted;
         lastEnrichedCount.value = enriched;
+        
+        // IMPORTANT: Refetch leads list when counts change during backfill
+        // This ensures the UI updates in real-time as backfill processes leads
+        if (status === 'processing_backfill' || status === 'completed') {
+          try {
+            await leadsStore.fetchLeads({ searchId });
+          } catch (err) {
+            // Silently fail - leads will be fetched on next poll
+            console.warn('Failed to refetch leads during backfill:', err.message);
+          }
+        }
       }
       
       // Determine if we should keep polling
@@ -279,7 +311,7 @@ function startPolling(searchId) {
       // Log error but continue polling (network issues shouldn't stop updates)
       console.warn('Polling error (will retry):', err.message);
     }
-  }, 1000); // Poll every 1 second for faster updates
+  }, 2500); // Poll every 2.5 seconds - good balance between responsiveness and server load
 }
 
 function formatStatus(status) {
@@ -434,6 +466,35 @@ onUnmounted(() => {
   gap: var(--spacing-lg);
   margin-bottom: var(--spacing-md);
   font-weight: var(--font-weight-semibold);
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.processing-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  color: var(--accent);
+  font-size: 0.875rem;
+}
+
+.pulse-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse-dot 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { 
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% { 
+    opacity: 0.5;
+    transform: scale(1.2);
+  }
 }
 
 .progress-indicator {
