@@ -1,6 +1,8 @@
 import OpenAI from 'openai';
 import * as cheerio from 'cheerio';
 import dotenv from 'dotenv';
+import { extractEmployeeCountFromLinkedIn, getEmployeeCountRange } from '../utils/employeeCountExtractor.js';
+import { normalizeJobTitle, getSeniorityLevel, extractDepartment } from '../utils/jobTitleNormalizer.js';
 
 dotenv.config();
 
@@ -40,6 +42,9 @@ export async function enrichLinkedInContacts(leadData) {
     return {
       contacts: suggestedContacts,
       linkedinCompanyUrl: leadData.socials?.linkedin || null,
+      employeeCount: linkedinCompanyData?.employeeCount || null,
+      employeeCountRange: linkedinCompanyData?.employeeCountRange || null,
+      foundedYear: linkedinCompanyData?.foundedYear || null,
       enrichedAt: new Date()
     };
     
@@ -69,20 +74,35 @@ async function extractLinkedInCompanyInfo(linkedinUrl) {
     
     console.log(`[LINKEDIN] Fetching company page: ${cleanUrl}`);
     
+    // Add timeout to prevent hanging
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+    
     const response = await fetch(cleanUrl, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9'
-      }
+      },
+      signal: controller.signal
     });
+    
+    clearTimeout(timeoutId);
     
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
     
+    // Read HTML with timeout (should be fast, but add safety)
     const html = await response.text();
     const $ = cheerio.load(html);
+    
+    // Extract employee count using enhanced utility
+    const employeeCountNum = extractEmployeeCountFromLinkedIn(html);
+    const employeeCountRange = employeeCountNum ? getEmployeeCountRange(employeeCountNum) : null;
+    
+    // Extract founded year
+    const foundedYear = extractFoundedYear($, html);
     
     // Try to extract company info from meta tags
     const companyInfo = {
@@ -90,38 +110,64 @@ async function extractLinkedInCompanyInfo(linkedinUrl) {
             $('title').text().replace(' | LinkedIn', ''),
       description: $('meta[property="og:description"]').attr('content') || 
                    $('meta[name="description"]').attr('content') || '',
-      employeeCount: extractEmployeeCount($),
+      employeeCount: employeeCountNum,
+      employeeCountRange: employeeCountRange,
+      foundedYear: foundedYear,
       location: extractLocation($)
     };
     
     return companyInfo;
     
   } catch (error) {
-    console.log(`[LINKEDIN] Could not extract company info: ${error.message}`);
+    if (error.name === 'AbortError') {
+      console.log(`[LINKEDIN] Request timeout while fetching company page`);
+    } else {
+      console.log(`[LINKEDIN] Could not extract company info: ${error.message}`);
+    }
     return null;
   }
 }
 
 /**
- * Extract employee count from LinkedIn page
+ * Extract founded year from LinkedIn page
  */
-function extractEmployeeCount($) {
-  // Look for employee count in various formats
-  const text = $('body').text();
-  const patterns = [
-    /(\d+[\d,]*)\s*employees?/i,
-    /(\d+[\d,]*)\s*people/i,
-    /company size[:\s]*(\d+[\d,]*)/i
-  ];
-  
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) {
-      return match[1].replace(/,/g, '');
+function extractFoundedYear($, html) {
+  try {
+    // Look for founded year in various formats
+    const text = html || $('body').text();
+    
+    // Pattern 1: "Founded 2020" or "Established 2020"
+    const foundedPattern = /(?:founded|established|since|started)\s+(?:in\s+)?(\d{4})/i;
+    const foundedMatch = text.match(foundedPattern);
+    if (foundedMatch) {
+      const year = parseInt(foundedMatch[1], 10);
+      if (!isNaN(year) && year >= 1800 && year <= new Date().getFullYear()) {
+        return year;
+      }
     }
+    
+    // Pattern 2: Look in structured data
+    const structuredMatch = text.match(/"foundingDate"\s*:\s*"?(\d{4})"?/i);
+    if (structuredMatch) {
+      const year = parseInt(structuredMatch[1], 10);
+      if (!isNaN(year) && year >= 1800 && year <= new Date().getFullYear()) {
+        return year;
+      }
+    }
+    
+    // Pattern 3: Look for date in company description
+    const descMatch = text.match(/(?:since|from|established|founded)\s+(\d{4})/i);
+    if (descMatch) {
+      const year = parseInt(descMatch[1], 10);
+      if (!isNaN(year) && year >= 1800 && year <= new Date().getFullYear()) {
+        return year;
+      }
+    }
+    
+    return null;
+  } catch (error) {
+    return null;
   }
-  
-  return null;
 }
 
 /**
@@ -169,15 +215,23 @@ async function suggestKeyContacts(companyData) {
     // Validate and format contacts
     return contacts
       .filter(contact => contact.name && contact.title)
-      .map(contact => ({
-        name: contact.name,
-        title: contact.title,
-        department: contact.department || 'General',
-        relevance: contact.relevance || 70,
-        suggestedEmail: contact.suggestedEmail || null,
-        linkedinSearchQuery: `${contact.name} ${companyData.companyName} LinkedIn`,
-        notes: contact.notes || ''
-      }))
+      .map(contact => {
+        const normalizedTitle = normalizeJobTitle(contact.title) || contact.title;
+        const seniority = getSeniorityLevel(contact.title);
+        const department = extractDepartment(contact.title) || contact.department || 'General';
+        
+        return {
+          name: contact.name,
+          title: contact.title,
+          normalizedTitle: normalizedTitle,
+          seniority: seniority,
+          department: department,
+          relevance: contact.relevance || 70,
+          suggestedEmail: contact.suggestedEmail || null,
+          linkedinSearchQuery: `${contact.name} ${companyData.companyName} LinkedIn`,
+          notes: contact.notes || ''
+        };
+      })
       .slice(0, 5); // Limit to top 5 contacts
     
   } catch (error) {
@@ -253,10 +307,19 @@ function generateDefaultContacts(companyData) {
     );
   }
   
-  return contacts.map(contact => ({
-    ...contact,
-    suggestedEmail: null,
-    linkedinSearchQuery: `${contact.title} ${companyData.companyName} LinkedIn`
-  }));
+  return contacts.map(contact => {
+    const normalizedTitle = normalizeJobTitle(contact.title) || contact.title;
+    const seniority = getSeniorityLevel(contact.title);
+    const department = extractDepartment(contact.title) || contact.department || 'General';
+    
+    return {
+      ...contact,
+      normalizedTitle: normalizedTitle,
+      seniority: seniority,
+      department: department,
+      suggestedEmail: null,
+      linkedinSearchQuery: `${contact.title} ${companyData.companyName} LinkedIn`
+    };
+  });
 }
 

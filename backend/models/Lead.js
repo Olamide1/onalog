@@ -31,7 +31,13 @@ const leadSchema = new mongoose.Schema({
   emails: [{
     email: String,
     source: String, // 'website', 'social', 'extracted'
-    confidence: Number
+    confidence: Number,
+    deliverability: { // NEW: Email deliverability scoring
+      score: Number, // 0-100, deliverability score
+      status: String, // 'valid', 'invalid', 'risky', 'unknown'
+      checkedAt: Date,
+      method: String // 'syntax', 'api', 'unknown'
+    }
   }],
   phoneNumbers: [{
     phone: String,
@@ -68,6 +74,8 @@ const leadSchema = new mongoose.Schema({
   enrichment: {
     businessSummary: String,
     companySize: String, // 'micro', 'small', 'medium', 'large'
+    employeeCount: Number, // Exact employee count or range (e.g., 25, 150)
+    employeeCountRange: String, // '1-10', '11-50', '51-200', '201-500', '501-1000', '1000+'
     revenueBracket: String, // '0-50k', '50k-200k', '200k-1m', '1m+'
     industry: String,
     emailPattern: String,
@@ -75,10 +83,25 @@ const leadSchema = new mongoose.Schema({
     signalStrength: Number, // 0-100
     verificationScore: Number, // 0-5, calculated during enrichment
     verificationSources: [String], // Array of sources used for verification
+    foundedYear: Number, // Company founded year
+    location: {
+      city: String,
+      state: String,
+      country: String,
+      formatted: String
+    },
+    hiringSignals: {
+      isHiring: Boolean,
+      hasCareersPage: Boolean,
+      hasJobPostings: Boolean,
+      detectedAt: Date
+    },
     linkedinContacts: {
       contacts: [{
         name: String,
         title: String,
+        normalizedTitle: String, // Normalized job title
+        seniority: String, // 'executive', 'senior', 'mid', 'junior'
         department: String,
         relevance: Number, // 0-100
         suggestedEmail: String,

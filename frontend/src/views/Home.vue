@@ -57,10 +57,13 @@
             <span>{{ processingCount }} being processed...</span>
           </div>
         </div>
-        <div v-if="leadsStore.currentSearch.status === 'processing' || leadsStore.currentSearch.status === 'queued' || leadsStore.currentSearch.status === 'searching' || leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching'" class="progress-indicator">
+        <div v-if="leadsStore.currentSearch.status === 'processing' || leadsStore.currentSearch.status === 'queued' || leadsStore.currentSearch.status === 'searching' || leadsStore.currentSearch.status === 'extracting' || leadsStore.currentSearch.status === 'enriching' || leadsStore.currentSearch.status === 'processing_backfill'" class="progress-indicator">
           <div class="progress-message">
             <span class="progress-icon">⏳</span>
             <span>{{ getProgressMessage(leadsStore.currentSearch.status) }}</span>
+            <span v-if="leadsStore.currentSearch.status === 'processing_backfill'" class="backfill-note">
+              (More leads are being processed in the background - results will update automatically)
+            </span>
           </div>
           <div class="progress-details">
             <div class="progress-section">
@@ -113,7 +116,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useLeadsStore } from '../stores/leads';
 import SearchForm from '../components/SearchForm.vue';
 import LeadList from '../components/LeadList.vue';
@@ -127,6 +130,7 @@ const lastUpdateTime = ref(null);
 const lastExtractedCount = ref(0);
 const lastEnrichedCount = ref(0);
 const lastUpdateTimestamp = ref(Date.now());
+const currentSearchId = ref(null);
 
 // Calculate how many leads are currently being processed
 const processingCount = computed(() => {
@@ -242,6 +246,9 @@ async function handleSearch(searchData) {
       searchFormRef.value.setSearchId(search.searchId);
     }
     
+    // Store current search ID for watchers
+    currentSearchId.value = search.searchId;
+    
     // Start polling for updates
     startPolling(search.searchId);
     // Prime UI immediately (don't wait 2s for first tick)
@@ -251,10 +258,40 @@ async function handleSearch(searchData) {
   }
 }
 
+// CRITICAL FIX: Watch for count changes during backfill and refetch leads
+watch(
+  () => [leadsStore.currentSearch?.extractedCount, leadsStore.enrichedCount, leadsStore.currentSearch?.status],
+  async ([newExtracted, newEnriched, newStatus], [oldExtracted, oldEnriched, oldStatus]) => {
+    // Only refetch if:
+    // 1. Counts actually changed OR status changed to backfill/completed
+    // 2. Status is processing_backfill or completed
+    // 3. We have a current search ID
+    const countsChanged = (newExtracted !== oldExtracted) || (newEnriched !== oldEnriched);
+    const statusChanged = newStatus !== oldStatus;
+    const isBackfillOrCompleted = newStatus === 'processing_backfill' || newStatus === 'completed';
+    
+    if ((countsChanged || statusChanged) && isBackfillOrCompleted && currentSearchId.value) {
+      // CRITICAL: Force refetch leads to get updated list with new leads from backfill
+      try {
+        console.log('[HOME] Counts/status changed during backfill, refetching leads...', {
+          extracted: `${oldExtracted} → ${newExtracted}`,
+          enriched: `${oldEnriched} → ${newEnriched}`,
+          status: `${oldStatus} → ${newStatus}`
+        });
+        await leadsStore.fetchSearch(currentSearchId.value);
+        console.log('[HOME] ✅ Refetched leads due to count/status change during backfill');
+      } catch (error) {
+        console.error('[HOME] Error refetching leads:', error);
+      }
+    }
+  },
+  { deep: true, immediate: false }
+);
+
 function startPolling(searchId) {
   if (pollInterval) clearInterval(pollInterval);
   
-  // Poll every 2-3 seconds during active processing for better UX (not too aggressive, not too slow)
+  // Use faster polling (2s) for better real-time updates during backfill
   pollInterval = setInterval(async () => {
     try {
       const data = await leadsStore.fetchSearch(searchId);
@@ -268,6 +305,14 @@ function startPolling(searchId) {
       const countsChanged = 
         extracted !== lastExtractedCount.value || 
         enriched !== lastEnrichedCount.value;
+      
+      // CRITICAL FIX: Always refetch leads during backfill, even if counts haven't changed
+      // This ensures new leads from backfill appear in the UI immediately
+      // During backfill, leads are being added continuously, so we need to check every poll
+      // The fetchSearch call above already fetches leads, but we ensure it updates the list
+      if (status === 'processing_backfill' || status === 'completed') {
+        console.log('[HOME] Polling during backfill (status:', status, ', extracted:', extracted, ', enriched:', enriched, ', current leads:', leadsStore.filteredLeads.length, ')');
+      }
       
       if (countsChanged) {
         // Reset stale detection when counts change
@@ -311,7 +356,7 @@ function startPolling(searchId) {
       // Log error but continue polling (network issues shouldn't stop updates)
       console.warn('Polling error (will retry):', err.message);
     }
-  }, 2500); // Poll every 2.5 seconds - good balance between responsiveness and server load
+  }, 2000); // Poll every 2 seconds for better real-time updates during backfill
 }
 
 function formatStatus(status) {
@@ -321,6 +366,7 @@ function formatStatus(status) {
     'extracting': 'Extracting',
     'enriching': 'Enriching',
     'processing': 'Processing',
+    'processing_backfill': 'Processing Backfill',
     'completed': 'Completed',
     'failed': 'Failed'
   };
@@ -333,7 +379,8 @@ function getProgressMessage(status) {
     'searching': 'Searching for businesses...',
     'extracting': 'Extracting contact information...',
     'enriching': 'Enriching leads with additional data...',
-    'processing': 'Processing your search...'
+    'processing': 'Processing your search...',
+    'processing_backfill': 'Processing remaining leads in background...'
   };
   return messages[status] || 'Processing...';
 }
@@ -512,6 +559,20 @@ onUnmounted(() => {
 
 .progress-icon {
   font-size: 1.2rem;
+}
+
+.backfill-note {
+  display: block;
+  margin-top: var(--spacing-sm);
+  margin-left: var(--spacing-md);
+  font-size: 0.9rem;
+  color: var(--accent);
+  font-style: italic;
+  font-weight: var(--font-weight-medium);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  background: rgba(0, 123, 255, 0.1);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
 }
 
 .progress-details {

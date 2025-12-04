@@ -3,25 +3,13 @@
  * Improved approach: Extract from embedded JSON data
  */
 import puppeteer from 'puppeteer';
-
-// Directory/aggregator sites to filter out - COMPREHENSIVE LIST
-const FILTER_DOMAINS = [
-  // Data aggregators
-  'tomba.io', 'cybo.com', 'cience.com', 'wrkr.com', 'zoominfo.com',
-  'opencorporates.com', 'micompanyregistry.com', 'poidata.io',
-  'dnb.com', 'f6s.com', 'ensun.io', 'aeroleads.com',
-  // Business directories
-  'yelp.com', 'yellowpages.com', 'whitepages.com', 'business.com',
-  'manta.com', 'bbb.org', 'indeed.com', 'glassdoor.com',
-  // Other aggregators
-  'wikipedia.org', 'thumbwind.com', 'afrikta.com', 'hospi.info',
-  'tannoshealth.com', 'dfuilts.com'
-];
+import { isKnownDirectoryDomain } from '../config/domainValidation.js';
+import { isDirectorySite as isDirectorySiteFromProviders } from '../services/searchProviders.js';
 
 function isDirectorySite(url) {
   try {
-    const domain = new URL(url).hostname.replace('www.', '');
-    return FILTER_DOMAINS.some(filter => domain.includes(filter));
+    // Use centralized directory detection (pattern-based)
+    return isDirectorySiteFromProviders(url) || isKnownDirectoryDomain(new URL(url).hostname);
   } catch {
     return false;
   }

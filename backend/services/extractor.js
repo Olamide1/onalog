@@ -1,6 +1,16 @@
 import * as cheerio from 'cheerio';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
+import { 
+  isInvalidDomain, 
+  isUniversalBlocked, 
+  isSocialMediaDomain,
+  isGenericCompanyName as isGenericNameFromConfig,
+  isKnownDirectoryDomain,
+  DIRECTORY_DOMAIN_PATTERNS,
+  DIRECTORY_FALSE_POSITIVES,
+  DOMAIN_MARKETPLACE_PATTERNS
+} from '../config/domainValidation.js';
 dotenv.config();
 
 // In-memory short TTL caches
@@ -274,15 +284,25 @@ export async function extractContactInfo(url, defaultCountry = null) {
     const html = await response.text();
     const $ = cheerio.load(html);
     
-    // Extract emails
+    // Extract emails (enhanced - handles obfuscation, contact forms, data attributes, meta tags)
     console.log(`[EXTRACT] Extracting emails...`);
-    const emails = extractEmails(html, url);
+    let emails = extractEmails(html, url);
     console.log(`[EXTRACT] Found ${emails.length} emails`);
     
-            // Extract phone numbers
-            console.log(`[EXTRACT] Extracting phone numbers...`);
-            const phoneNumbers = extractPhoneNumbers(html, url, defaultCountry);
-            console.log(`[EXTRACT] Found ${phoneNumbers.length} phone numbers`);
+    // Debug: Log if no emails found to help diagnose issues
+    if (emails.length === 0) {
+      console.log(`[EXTRACT] ⚠️  No emails found. HTML length: ${html.length}, Has mailto links: ${html.includes('mailto:')}, Has data-email: ${html.includes('data-email')}`);
+    }
+    
+    // Extract phone numbers
+    console.log(`[EXTRACT] Extracting phone numbers...`);
+    const phoneNumbers = extractPhoneNumbers(html, url, defaultCountry);
+    console.log(`[EXTRACT] Found ${phoneNumbers.length} phone numbers`);
+    
+    // Debug: Log if no phone numbers found to help diagnose issues
+    if (phoneNumbers.length === 0) {
+      console.log(`[EXTRACT] ⚠️  No phone numbers found. HTML length: ${html.length}, Has tel: links: ${html.includes('tel:')}, Has phone patterns: ${/phone|call|contact|tel/i.test(html)}`);
+    }
     
     // Extract WhatsApp links
     const whatsappLinks = extractWhatsAppLinks(html, url);
@@ -354,6 +374,35 @@ export async function extractContactInfo(url, defaultCountry = null) {
     console.log(`[EXTRACT] Extracting decision makers...`);
     const decisionMakers = extractDecisionMakers($, url);
     console.log(`[EXTRACT] Found ${decisionMakers.length} decision makers`);
+    
+    // Debug: Log if no decision makers found to help diagnose issues
+    if (decisionMakers.length === 0) {
+      const hasTeamSelectors = $('.team-member, .team, .staff, .leadership, .executive, .about-team, .our-team').length > 0;
+      const hasAboutPage = /about|team|leadership|management/i.test(url);
+      console.log(`[EXTRACT] ⚠️  No decision makers found. Has team selectors: ${hasTeamSelectors}, Is about page: ${hasAboutPage}, HTML length: ${html.length}`);
+    }
+    
+    // Extract emails from decision makers and merge with main emails list
+    const dmEmails = decisionMakers
+      .filter(dm => dm.email && dm.email.includes('@'))
+      .map(dm => ({
+        email: dm.email.toLowerCase(),
+        source: 'decision_maker',
+        confidence: 0.9 // Higher confidence for decision maker emails
+      }));
+    
+    // Merge decision maker emails with main emails (avoid duplicates)
+    const existingEmails = new Set(emails.map(e => e.email.toLowerCase()));
+    dmEmails.forEach(dmEmail => {
+      if (!existingEmails.has(dmEmail.email)) {
+        emails.push(dmEmail);
+        existingEmails.add(dmEmail.email);
+      }
+    });
+    
+    if (dmEmails.length > 0) {
+      console.log(`[EXTRACT] Found ${dmEmails.length} additional emails from decision makers`);
+    }
     
     const result = {
       companyName,
@@ -669,11 +718,7 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
     html = await res.text();
     const $ = cheerio.load(html);
     const anchors = $('a[href]');
-    // Only filter out well-known social/aggregator platforms (universal, not business-type specific)
-    const badDomains = [
-      'facebook.com','instagram.com','twitter.com','x.com','linkedin.com','youtube.com',
-      'wikipedia.org'
-    ];
+    // Use centralized domain validation (pattern-based, not hardcoded list)
     // Generic path patterns for listicles (works for any business type)
     const badPath = /(\/category\/|\/tags\/|\/top-|\/best|\/list|\/explore\/|shareArticle|\/companies|\/directory|\/listings)/i;
     const seenHosts = new Set();
@@ -693,7 +738,7 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
                 try {
                   const u = new URL(url);
                   const host = u.hostname.replace('www.', '');
-                  if (host !== baseHost && !badDomains.some(d => host.includes(d)) && !seenHosts.has(host)) {
+                  if (host !== baseHost && !isSocialMediaDomain(host) && !isUniversalBlocked(host) && !seenHosts.has(host)) {
                     seenHosts.add(host);
                     results.push({
                       title: item.name || item.legalName || host,
@@ -717,7 +762,7 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
         const u = new URL(href);
         const host = u.hostname.replace('www.','');
         if (host === baseHost) return; // skip same-host links
-        if (badDomains.some(d => host.includes(d))) return;
+        if (isSocialMediaDomain(host) || isUniversalBlocked(host)) return;
         if (seenHosts.has(host)) return;
         seenHosts.add(host);
         const title = ($(el).text() || host).trim() || host;
@@ -758,8 +803,23 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
         // ignore LLM assist failure
       }
     }
-    cacheSet(directoryCache, `${listPageUrl}|${maxCompanies}`, final);
-    return final;
+    
+    // CRITICAL FIX: Filter out directory pages from expanded results
+    // Import isDirectorySite dynamically to avoid circular dependency
+    const { isDirectorySite } = await import('../services/searchProviders.js');
+    const filteredFinal = [];
+    for (const item of final) {
+      // Check if this expanded result is itself a directory page
+      const isStillDirectory = isDirectorySite(item.link, item.title);
+      if (!isStillDirectory) {
+        filteredFinal.push(item);
+      } else {
+        console.log(`[EXPAND] Filtering out directory page from expansion: ${item.title} → ${item.link}`);
+      }
+    }
+    
+    cacheSet(directoryCache, `${listPageUrl}|${maxCompanies}`, filteredFinal);
+    return filteredFinal;
   } catch {
     return [];
   }
@@ -801,7 +861,7 @@ ${text}`;
       try {
         const u = new URL(c.url);
         const host = u.hostname.replace('www.','');
-        if (['facebook.com','instagram.com','twitter.com','x.com','linkedin.com','youtube.com','wikipedia.org'].some(d => host.includes(d))) continue;
+        if (isSocialMediaDomain(host) || isUniversalBlocked(host)) continue;
         if (seen.has(host)) continue;
         seen.add(host);
         filtered.push({ title: c.title || host, link: u.toString(), snippet: '' });
@@ -826,29 +886,54 @@ function scoreTitle(title = '') {
 }
 function isDirectoryDomain(url) {
   try {
-    // Fully dynamic pattern-based detection (no hardcoded business-type-specific domains)
-    // Uses path and domain pattern matching that works for any business type
+    // DYNAMIC-FIRST APPROACH: Pattern-based detection (no hardcoded business-type-specific domains)
     const urlObj = new URL(url);
     const domain = urlObj.hostname.replace('www.', '').toLowerCase();
     const path = (urlObj.pathname || '').toLowerCase();
+    const fullUrl = url.toLowerCase();
     
-    // Only block universal social/aggregator platforms (not business-type specific)
-    const universalBlocked = ['google.com', 'facebook.com', 'instagram.com', 'twitter.com', 'x.com', 'linkedin.com', 'youtube.com', 'wikipedia.org'];
-    if (universalBlocked.some(b => domain.includes(b))) return true;
+    // Use centralized domain validation
+    if (isUniversalBlocked(domain)) return true;
     
-    // Pattern-based path detection (works for any business type, not hardcoded)
+    // ============================================
+    // DYNAMIC PATTERN DETECTION (Primary)
+    // ============================================
+    
+    // 1. DOMAIN NAME PATTERN DETECTION (using centralized config)
+    const domainHasDirectoryKeyword = DIRECTORY_DOMAIN_PATTERNS.some(pattern => pattern.test(domain));
+    const isFalsePositive = DIRECTORY_FALSE_POSITIVES.some(fp => domain.includes(fp));
+    
+    if (domainHasDirectoryKeyword && !isFalsePositive) {
+      // If domain has directory keyword AND path suggests listing, it's likely a directory
+      if (/\/(directory|listings?|companies|businesses|agencies|providers)/i.test(path)) {
+        return true;
+      }
+      // If domain is clearly a directory (e.g., "businessdirectory.com"), block it
+      if (/^(business|company|service|provider).*(directory|listings?|marketplace)/i.test(domain) ||
+          /(directory|listings?|marketplace).*(business|company|service|provider)/i.test(domain)) {
+        return true;
+      }
+    }
+    
+    // 2. DOMAIN MARKETPLACE PATTERNS (using centralized config)
+    if (DOMAIN_MARKETPLACE_PATTERNS.some(pattern => pattern.test(fullUrl) || pattern.test(domain) || pattern.test(path))) {
+      return true;
+    }
+    
+    // 3. PATH PATTERN DETECTION
     const listiclePathPatterns = [
       /\/(category|tags|companies|agencies|directory|listings|businesses|list|explore|locations)\b/i,
       /\/(top-|best-|leading-|top\d+|best\d+)/i,
-      /\/(list|lists|listing|directory|guide|roundup|compilation)/i,
+      /\/(list|lists|listing|directory|guide|roundup|compilation|ranking|rankings|rank)\b/i,
       /sharearticle|article-list|company-list|location-list/i,
       // Generic numbered list patterns
-      /-\d+-best-|-\d+-top-|-\d+-companies/i
+      /-\d+-best-|-\d+-top-|-\d+-companies/i,
+      // Domain marketplace paths
+      /domain_profile|domain_profile\.cfm|domain_profile\.php/i
     ];
     if (listiclePathPatterns.some(pattern => pattern.test(path))) return true;
     
-    // Dynamic domain pattern detection (looks for directory indicators in domain names)
-    // Uses generic patterns, not specific domain names
+    // 4. DOMAIN PATTERN INDICATORS (Enhanced)
     const directoryDomainIndicators = [
       /directory/i,
       /listings?/i,
@@ -858,7 +943,16 @@ function isDirectoryDomain(url) {
       /place/i, // Generic place listing sites
       /bizinfo/i, // Generic business info sites
       /college.*list/i, // Generic college/school listing patterns
-      /school.*list/i
+      /school.*list/i,
+      // Domain marketplace indicators
+      /hugedomains/i,
+      /sortlist/i,
+      /domainmarket/i,
+      // Additional patterns
+      /marketplace/i,
+      /aggregator/i,
+      /catalog/i,
+      /registry/i
     ];
     if (directoryDomainIndicators.some(pattern => pattern.test(domain))) return true;
     
@@ -869,28 +963,180 @@ function isDirectoryDomain(url) {
 }
 
 /**
- * Extract email addresses from HTML
+ * Extract email addresses from HTML - ENHANCED VERSION
+ * Handles: obfuscated emails, contact forms, data attributes, meta tags, JavaScript-rendered
  */
 function extractEmails(html, baseUrl) {
-  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-  const matches = html.match(emailRegex) || [];
+  const emails = new Set();
+  const $ = cheerio.load(html);
   
-  // Filter out common false positives
-  const filtered = matches.filter(email => {
+  // 1. STANDARD EMAIL EXTRACTION (regex on HTML)
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const standardMatches = html.match(emailRegex) || [];
+  standardMatches.forEach(email => emails.add(email.toLowerCase()));
+  
+  // 2. OBFUSCATED EMAIL PATTERNS
+  // Pattern: email@domain[dot]com or email@domain(dot)com
+  const dotObfuscated = html.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+)\s*\[?\(?dot\)?\]?\s*([a-zA-Z]{2,})/gi) || [];
+  dotObfuscated.forEach(match => {
+    const cleaned = match.replace(/\[?\(?dot\)?\]?/gi, '.').toLowerCase();
+    if (emailRegex.test(cleaned)) {
+      emails.add(cleaned);
+    }
+  });
+  
+  // Pattern: email [at] domain [dot] com
+  const atObfuscated = html.match(/([a-zA-Z0-9._%+-]+)\s*\[?\(?at\)?\]?\s*([a-zA-Z0-9.-]+)\s*\[?\(?dot\)?\]?\s*([a-zA-Z]{2,})/gi) || [];
+  atObfuscated.forEach(match => {
+    const cleaned = match
+      .replace(/\[?\(?at\)?\]?/gi, '@')
+      .replace(/\[?\(?dot\)?\]?/gi, '.')
+      .replace(/\s+/g, '')
+      .toLowerCase();
+    if (emailRegex.test(cleaned)) {
+      emails.add(cleaned);
+    }
+  });
+  
+  // Pattern: base64 encoded emails (common obfuscation)
+  const base64Pattern = /data:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
+  const base64Matches = html.match(/data-email="([^"]+)"/gi) || [];
+  base64Matches.forEach(match => {
+    try {
+      const encoded = match.match(/data-email="([^"]+)"/i)?.[1];
+      if (encoded) {
+        const decoded = Buffer.from(encoded, 'base64').toString('utf-8');
+        if (emailRegex.test(decoded)) {
+          emails.add(decoded.toLowerCase());
+        }
+      }
+    } catch {}
+  });
+  
+  // 3. DATA ATTRIBUTES (data-email, data-contact, data-mailto)
+  $('[data-email], [data-contact], [data-mailto], [data-email-address]').each((i, el) => {
+    const email = $(el).attr('data-email') || 
+                  $(el).attr('data-contact') || 
+                  $(el).attr('data-mailto') ||
+                  $(el).attr('data-email-address');
+    if (email && emailRegex.test(email)) {
+      emails.add(email.toLowerCase());
+    }
+  });
+  
+  // 4. META TAGS AND STRUCTURED DATA
+  // JSON-LD structured data
+  $('script[type="application/ld+json"]').each((i, el) => {
+    try {
+      const json = JSON.parse($(el).html() || '{}');
+      const extractFromObject = (obj) => {
+        if (typeof obj === 'string' && emailRegex.test(obj)) {
+          emails.add(obj.toLowerCase());
+        } else if (typeof obj === 'object' && obj !== null) {
+          Object.values(obj).forEach(val => extractFromObject(val));
+        }
+      };
+      extractFromObject(json);
+    } catch {}
+  });
+  
+  // Meta tags
+  $('meta[property*="email"], meta[name*="email"], meta[itemprop*="email"]').each((i, el) => {
+    const email = $(el).attr('content');
+    if (email && emailRegex.test(email)) {
+      emails.add(email.toLowerCase());
+    }
+  });
+  
+  // 5. CONTACT FORMS (input fields with type="email" or name/placeholder containing "email")
+  $('input[type="email"], input[name*="email"], input[placeholder*="email"], input[id*="email"]').each((i, el) => {
+    const email = $(el).attr('value') || $(el).attr('placeholder') || $(el).attr('data-default');
+    if (email && emailRegex.test(email) && !email.includes('@example') && !email.includes('your-email')) {
+      emails.add(email.toLowerCase());
+    }
+  });
+  
+  // 6. MAILTO LINKS (including obfuscated)
+  $('a[href^="mailto:"]').each((i, el) => {
+    const href = $(el).attr('href');
+    if (href) {
+      const email = href.replace(/^mailto:/i, '').split('?')[0].trim();
+      if (email && emailRegex.test(email)) {
+        emails.add(email.toLowerCase());
+      }
+    }
+  });
+  
+  // Also check for obfuscated mailto in text
+  const mailtoObfuscated = html.match(/mailto:\s*([a-zA-Z0-9._%+-]+)\s*\[?\(?at\)?\]?\s*([a-zA-Z0-9.-]+)\s*\[?\(?dot\)?\]?\s*([a-zA-Z]{2,})/gi) || [];
+  mailtoObfuscated.forEach(match => {
+    const cleaned = match
+      .replace(/mailto:\s*/i, '')
+      .replace(/\[?\(?at\)?\]?/gi, '@')
+      .replace(/\[?\(?dot\)?\]?/gi, '.')
+      .replace(/\s+/g, '')
+      .toLowerCase();
+    if (emailRegex.test(cleaned)) {
+      emails.add(cleaned);
+    }
+  });
+  
+  // 7. TEXT CONTENT WITH EMAIL PATTERNS (catch emails in visible text)
+  $('body').find('*').each((i, el) => {
+    const text = $(el).text();
+    const textMatches = text.match(emailRegex) || [];
+    textMatches.forEach(email => {
+      // Only add if it's not in a script or style tag
+      const tagName = $(el).prop('tagName')?.toLowerCase();
+      if (tagName !== 'script' && tagName !== 'style') {
+        emails.add(email.toLowerCase());
+      }
+    });
+  });
+  
+  // 8. FILTER OUT FALSE POSITIVES
+  const filtered = Array.from(emails).filter(email => {
     const lower = email.toLowerCase();
     return !lower.includes('example.com') &&
            !lower.includes('test@') &&
            !lower.includes('placeholder') &&
-           !lower.includes('your-email');
+           !lower.includes('your-email') &&
+           !lower.includes('email@') &&
+           !lower.includes('@example') &&
+           !lower.includes('sample@') &&
+           !lower.includes('demo@') &&
+           !lower.includes('noreply@') &&
+           !lower.includes('no-reply@') &&
+           !lower.match(/^[a-z0-9._%+-]+@(localhost|127\.0\.0\.1|example|test|placeholder)/i) &&
+           lower.length > 5 && // Minimum email length
+           lower.length < 100; // Maximum email length
   });
   
-  // Remove duplicates and add source
+  // 9. REMOVE DUPLICATES AND ADD SOURCE/CONFIDENCE
   const unique = [...new Set(filtered)];
-  return unique.map(email => ({
-    email: email.toLowerCase(),
-    source: 'website',
-    confidence: 0.8
-  }));
+  return unique.map(email => {
+    // Higher confidence for mailto links and data attributes
+    let confidence = 0.8;
+    let source = 'website';
+    
+    // Check if email came from specific high-confidence sources
+    const mailtoInHtml = html.includes(`mailto:${email}`);
+    const dataAttrInHtml = html.includes(`data-email="${email}"`) || html.includes(`data-contact="${email}"`);
+    
+    if (mailtoInHtml || dataAttrInHtml) {
+      confidence = 0.95;
+      source = mailtoInHtml ? 'mailto_link' : 'data_attribute';
+    } else if (html.includes(`data-email`) || html.includes(`data-contact`)) {
+      confidence = 0.9;
+      source = 'structured_data';
+    }
+    
+    return {
+      email: email.toLowerCase(),
+      source: source,
+      confidence: confidence
+    };
+  });
 }
 
 /**
@@ -1023,23 +1269,46 @@ function extractPhoneNumbers(html, baseUrl, defaultCountry = null) {
  * Extract website URL - Improved
  */
 function extractWebsite($, baseUrl) {
+  // CRITICAL FIX: Filter out invalid domains using centralized config
   // Try to find canonical URL first (most reliable)
   const canonical = $('link[rel="canonical"]').attr('href');
   if (canonical && canonical.startsWith('http')) {
-    return canonical;
+    try {
+      const url = new URL(canonical);
+      const hostname = url.hostname.toLowerCase();
+      if (!isInvalidDomain(hostname)) {
+        return canonical;
+      }
+    } catch {}
   }
   
   // Try og:url
   const ogUrl = $('meta[property="og:url"]').attr('content');
   if (ogUrl && ogUrl.startsWith('http')) {
-    return ogUrl;
+    try {
+      const url = new URL(ogUrl);
+      const hostname = url.hostname.toLowerCase();
+      if (!isInvalidDomain(hostname)) {
+        return ogUrl;
+      }
+    } catch {}
   }
   
   // Use base URL if it's a valid website
   try {
     const url = new URL(baseUrl);
+    const hostname = url.hostname.toLowerCase();
+    // Reject if it's an invalid domain
+    if (isInvalidDomain(hostname)) {
+      return null; // Return null instead of invalid URL
+    }
     return url.origin;
   } catch {
+    // If baseUrl is invalid, check if it contains invalid domains
+    const baseUrlLower = baseUrl.toLowerCase();
+    if (isInvalidDomain(baseUrlLower)) {
+      return null;
+    }
     return baseUrl;
   }
 }
@@ -1160,234 +1429,281 @@ function extractCategorySignals($) {
 }
 
 /**
- * Extract company name
+ * Extract company name - Enhanced with validation to reject generic/placeholder names
+ * Also handles social media profiles (TikTok, Instagram, etc.) to extract business names
  */
 function extractCompanyName($, url) {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase().replace('www.', '');
+    
+    // CRITICAL FIX: Extract business name from social media profiles
+    if (hostname.includes('tiktok.com')) {
+      // TikTok: Try to extract from meta tags or page title
+      const ogTitle = $('meta[property="og:title"]').attr('content');
+      if (ogTitle && !ogTitle.toLowerCase().includes('tiktok')) {
+        // Remove "on TikTok" suffix if present
+        const cleaned = ogTitle.replace(/\s*on\s+tiktok.*$/i, '').trim();
+        if (cleaned && !isGenericCompanyName(cleaned)) {
+          return cleaned;
+        }
+      }
+      // Try title tag
+      const title = $('title').text();
+      if (title) {
+        const cleaned = title.replace(/\s*[-|]\s*.*$/, '').replace(/\s*on\s+tiktok.*$/i, '').trim();
+        if (cleaned && !isGenericCompanyName(cleaned) && !cleaned.toLowerCase().includes('tiktok')) {
+          return cleaned;
+        }
+      }
+      // Try to extract from username in URL (@username)
+      const pathMatch = urlObj.pathname.match(/@([^\/]+)/);
+      if (pathMatch && pathMatch[1]) {
+        const username = pathMatch[1];
+        // Capitalize username as fallback (e.g., "digiaskcollegeke" -> "Digiaskcollegeke")
+        return username.charAt(0).toUpperCase() + username.slice(1);
+      }
+    }
+    
+    // For other social media platforms, try similar extraction
+    if (hostname.includes('instagram.com') || hostname.includes('facebook.com') || hostname.includes('linkedin.com')) {
+      const ogTitle = $('meta[property="og:title"]').attr('content');
+      if (ogTitle) {
+        const cleaned = ogTitle.replace(/\s*[-|]\s*.*$/, '').trim();
+        if (cleaned && !isGenericCompanyName(cleaned)) {
+          return cleaned;
+        }
+      }
+    }
+  } catch {}
+  
   // Try meta tags first
   const ogTitle = $('meta[property="og:title"]').attr('content');
-  if (ogTitle) return ogTitle.trim();
+  if (ogTitle) {
+    const cleaned = ogTitle.trim();
+    // Validate: reject generic names
+    if (!isGenericCompanyName(cleaned)) {
+      return cleaned;
+    }
+  }
   
   const title = $('title').text();
   if (title) {
     // Clean up title (remove common suffixes)
-    return title.replace(/\s*[-|]\s*.*$/, '').trim();
+    const cleaned = title.replace(/\s*[-|]\s*.*$/, '').trim();
+    // Validate: reject generic names
+    if (!isGenericCompanyName(cleaned)) {
+      return cleaned;
+    }
   }
   
-  // Fallback to domain name
+  // Try h1 tag as fallback
+  const h1 = $('h1').first().text();
+  if (h1) {
+    const cleaned = h1.trim();
+    if (!isGenericCompanyName(cleaned) && cleaned.length > 3 && cleaned.length < 100) {
+      return cleaned;
+    }
+  }
+  
+  // Fallback to domain name (but validate it's not a marketplace)
   try {
     const domain = new URL(url).hostname.replace('www.', '');
-    return domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+    const domainName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+    // Reject if domain looks like a marketplace
+    if (isDirectoryDomain(url)) {
+      return null; // Return null to indicate invalid
+    }
+    return domainName;
   } catch {
-    return 'Unknown Company';
+    return null; // Return null instead of "Unknown Company"
   }
 }
 
 /**
+ * Validate if a company name is generic/placeholder and should be rejected
+ */
+function isGenericCompanyName(name) {
+  if (!name || name.length < 2) return true;
+  
+  const nameLower = name.toLowerCase().trim();
+  
+  // Reject generic/placeholder names
+  const genericNames = [
+    'home', 'homepage', 'welcome', 'index', 'default', 'page', 'site', 'website',
+    'domain details page', 'domain profile', 'domain for sale', 'is for sale',
+    'for sale', 'domain sale', 'buy domain', 'premium domain',
+    'domain marketplace', 'domain auction', 'domain details',
+    'unknown company', 'company', 'business', 'organization',
+    'untitled', 'new page', 'page title', 'default page',
+    'coming soon', 'under construction', 'maintenance'
+  ];
+  
+  if (genericNames.some(generic => nameLower === generic || nameLower.startsWith(generic + ' ') || nameLower.endsWith(' ' + generic))) {
+    return true;
+  }
+  
+  // Reject "X is for sale" patterns
+  if (/is\s+for\s+sale|for\s+sale|domain\s+sale|buy\s+domain|premium\s+domain/i.test(nameLower)) {
+    return true;
+  }
+  
+  // Reject domain marketplace patterns
+  if (/hugedomains|domain.*profile|domain.*marketplace/i.test(nameLower)) {
+    return true;
+  }
+  
+  // Reject if name is just a domain extension pattern (e.g., ".com is for sale")
+  if (/\.(com|net|org|io|co)\s+is\s+for\s+sale/i.test(nameLower)) {
+    return true;
+  }
+  
+  // Reject single-word generic terms
+  if (nameLower.length < 4 && ['home', 'page', 'site', 'web'].includes(nameLower)) {
+    return true;
+  }
+  
+  return false;
+}
+
+/**
  * Extract decision makers from About Us / Team pages
- * Looks for names and titles in common patterns - ENHANCED VERSION
+ * STRICT VERSION - Only extracts real person names, rejects marketing copy and page headings
  */
 function extractDecisionMakers($, baseUrl) {
   const decisionMakers = [];
   const seen = new Set();
   
-  // Common selectors for team/about pages - EXPANDED LIST
-  const teamSelectors = [
-    '.team-member', '.team', '.staff', '.leadership', '.executive',
-    '.about-team', '.our-team', '.meet-team', '.team-list',
-    '.management', '.board', '.founders', '.directors',
-    '[class*="team"]', '[class*="staff"]', '[class*="leadership"]',
-    '[class*="executive"]', '[class*="management"]', '[class*="founder"]',
-    '[id*="team"]', '[id*="staff"]', '[id*="leadership"]', '[id*="about"]'
-  ];
+  // Check if we're on a relevant page (about, team, leadership, etc.)
+  let currentPath = '';
+  let isRelevantPage = false;
   
-  // Pattern 1: Look for structured team sections - MORE AGGRESSIVE
-  for (const selector of teamSelectors) {
-    $(selector).each((i, elem) => {
-      const $el = $(elem);
-      // Try multiple name selectors - be more aggressive
-      const name = $el.find('h1, h2, h3, h4, h5, h6, .name, [class*="name"], [data-name], strong, b, .person-name, .member-name').first().text().trim() ||
-                   $el.find('img').attr('alt') || // Sometimes names are in image alt text
-                   $el.text().split('\n')[0].trim(); // First line of text
-      // Try multiple title selectors
-      const title = $el.find('.title, .role, .position, [class*="title"], [class*="role"], [class*="position"], [data-title], [data-role], .job-title, .designation').first().text().trim() ||
-                    $el.find('p, span, div').filter((i, el) => {
-                      const txt = $(el).text().toLowerCase();
-                      return /(ceo|cto|cfo|director|manager|president|founder|head|lead|vp|chief|executive)/.test(txt);
-                    }).first().text().trim();
-      
-      if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/) && !name.toLowerCase().includes('click here')) {
-        // Fix: More restrictive validation - require actual name patterns (two capitalized words)
-        // Reject common navigation/UI text like "Skip to main content", "Product details", etc.
-        const commonNonNamePatterns = [
-          /^(skip|click|read|view|see|learn|more|about|home|menu|navigation|product|service|contact|login|sign|register|search|filter|sort|close|open|next|previous|back|forward|submit|cancel|save|delete|edit|add|remove|select|choose|browse|shop|buy|cart|checkout|account|profile|settings|help|support|faq|terms|privacy|policy|cookie|legal|copyright|all rights reserved)/i,
-          /^(the|a|an|and|or|but|in|on|at|to|for|of|with|by|from|as|is|was|are|were|be|been|being|have|has|had|do|does|did|will|would|should|could|may|might|must|can|cannot|shall|ought)/i,
-          /^(details|information|description|summary|overview|features|benefits|pricing|plans|packages|options|solutions|products|services|resources|blog|news|events|careers|jobs|team|company|about|contact|support|help|faq|terms|privacy|policy)/i
-        ];
-        
-        // Check if it matches common non-name patterns
-        const isNonNamePattern = commonNonNamePatterns.some(pattern => pattern.test(name));
-        if (isNonNamePattern) {
-          return; // Skip this match
-        }
-        
-        // Require actual name pattern: two or more capitalized words (e.g., "John Smith", "Mary Jane")
-        // Or single word with title prefix (e.g., "Dr. Smith", "Mr. Johnson")
-        // Pattern: (optional title prefix) + at least one capitalized word + (optional second capitalized word)
-        const namePattern = /^(?:Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.|Professor|Rev\.|Reverend)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$|^[A-Z][a-z]+\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/;
-        
-        if (namePattern.test(name)) {
-          const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            decisionMakers.push({
-              name: name,
-              title: title || 'Team Member',
-              source: 'website',
-              confidence: title ? 0.85 : 0.6
-            });
-          }
-        }
-      }
-    });
+  try {
+    if (baseUrl) {
+      const urlObj = new URL(baseUrl);
+      currentPath = urlObj.pathname.toLowerCase();
+      const aboutPageIndicators = ['about', 'team', 'leadership', 'management', 'founders', 'executives', 'staff', 'people', 'directors'];
+      isRelevantPage = aboutPageIndicators.some(indicator => currentPath.includes(indicator));
+    }
+  } catch (urlError) {
+    // Invalid URL - skip page relevance check, continue with extraction
+    console.log(`[EXTRACT] ⚠️  Invalid URL in decision maker extraction: ${baseUrl}`);
+    isRelevantPage = false;
   }
   
-  // Pattern 2: Look for "Name, Title" patterns in text - ENHANCED & MORE AGGRESSIVE
-  const text = $('body').text();
-  // Define patterns with their group structure: [pattern, nameGroupIndex, titleGroupIndex]
-  const nameTitlePatterns = [
-    // Pattern 1: "John Smith, CEO" or "John Smith - CEO" - (name, title)
-    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*([A-Z][A-Za-z\s&]+(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor|Administrator|Officer|Specialist))/gi, nameIdx: 1, titleIdx: 2 },
-    // Pattern 2: "CEO: John Smith" or "CEO John Smith" - (title, name)
-    { pattern: /(CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor)[:\s]+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)/gi, nameIdx: 2, titleIdx: 1 },
-    // Pattern 3: "John Smith - Managing Director" or "John Smith, Managing Director" - (name, title)
-    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[-–—,]\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s*(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer))/gi, nameIdx: 1, titleIdx: 2 },
-    // Pattern 4: "Dr. John Smith" or "Mr. John Smith" followed by title - (name, title)
-    { pattern: /(?:Dr\.|Mr\.|Mrs\.|Ms\.|Prof\.)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*([A-Z][A-Za-z\s&]+(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive))/gi, nameIdx: 1, titleIdx: 2 },
-    // Pattern 5: "John Smith, john.smith@company.com" - extract name and email, infer title from context
-    { pattern: /([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\s*[,\-–—]\s*([a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,})/gi, nameIdx: 1, titleIdx: null, hasEmail: true }
+  // Comprehensive list of non-name patterns to reject
+  const rejectPatterns = [
+    // Marketing/CTA phrases
+    /^(book|schedule|reserve|order|buy|purchase|get|try|start|sign|register|login|subscribe|download|install|view|see|read|learn|explore|discover|join|follow|share|like|comment|contact|call|email|message|chat|support|help)/i,
+    /(your|our|the|this|that|these|those|all|every|each|some|any|many|most|few|several)/i,
+    /(now|today|tomorrow|yesterday|soon|quick|fast|easy|simple|free|best|top|new|latest|popular|trending|viral)/i,
+    /(boost|increase|improve|enhance|optimize|maximize|minimize|reduce|decrease|grow|scale|expand|develop|build|create|make|design|craft|deliver|provide|offer|give|take|get|receive)/i,
+    // Page structure elements
+    /^(skip|menu|navigation|breadcrumb|footer|header|sidebar|main|content|section|article|post|page|home|index)/i,
+    // Common UI elements
+    /^(click|tap|press|hover|scroll|swipe|drag|drop|select|choose|pick|filter|sort|search|find)/i,
+    // Business/marketing terms that aren't names
+    /^(marketing|advertising|sales|business|company|organization|enterprise|firm|agency|consulting|services|solutions|products|software|technology|digital|online|web|internet|social|media|content|blog|news|press|media|publication)/i,
+    /(strategy|tactic|campaign|initiative|project|program|system|platform|tool|application|service|product|solution|feature|benefit|advantage|value|quality|performance|results|outcome|impact|effect|success|growth|revenue|profit|sales|leads|customers|clients|partners|vendors|suppliers)/i,
+    // Phrases and incomplete sentences
+    /^(of|in|on|at|to|for|with|by|from|as|is|was|are|were|be|been|being|have|has|had|do|does|did|will|would|should|could|may|might|must|can)/i,
+    /(and|or|but|not|no|yes|ok|okay|yes|sure|certainly|absolutely|definitely|probably|maybe|perhaps|possibly)/i,
+    // Numbers and dates
+    /^\d+/,
+    /\d{4}/, // Years
+    /^(january|february|march|april|may|june|july|august|september|october|november|december|monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i,
+    // Email-like patterns that aren't names
+    /@/,
+    // URLs and domains
+    /(http|https|www|\.com|\.net|\.org|\.io|\.co)/i,
+    // Very common non-name words
+    /^(day|night|morning|evening|afternoon|week|month|year|time|date|place|location|address|city|state|country|world|globe|earth|universe)/i,
+    // Action verbs
+    /(engages|drives|leads|guides|helps|supports|enables|empowers|transforms|revolutionizes|innovates|creates|builds|develops|delivers|provides|offers|sells|markets|promotes|advertises)/i
   ];
   
-  nameTitlePatterns.forEach(({ pattern, nameIdx, titleIdx, hasEmail }) => {
-    // Fix: Reset lastIndex before using global regex to ensure clean state
-    // This prevents issues if the loop exits early, leaving lastIndex at a non-zero value
-    pattern.lastIndex = 0;
+  // Validate if a string is a real person name
+  function isValidPersonName(name) {
+    if (!name || typeof name !== 'string') return false;
     
-    let match;
-    while ((match = pattern.exec(text)) !== null && decisionMakers.length < 15) {
-      const name = match[nameIdx]?.trim();
-      let title = titleIdx ? match[titleIdx]?.trim() : null;
-      const email = hasEmail ? match[2]?.trim() : null;
-      
-      // Fix: Validate name exists before attempting title inference
-      // If name extraction failed (undefined), skip this match entirely
-      // Fix: Use if-else instead of continue (continue doesn't work in forEach callbacks)
-      if (!name || name.length < 2) {
-        // Skip this match if name is invalid - the while loop will continue to next iteration
-        // We can't use continue in forEach, but wrapping in else ensures we skip processing
-      } else {
-        // For email pattern, try to infer title from surrounding context
-        if (hasEmail && !title) {
-          // Look for title before or after the match in nearby text
-          const matchStart = match.index;
-          const contextStart = Math.max(0, matchStart - 150);
-          const contextEnd = Math.min(text.length, matchStart + match[0].length + 150);
-          const context = text.substring(contextStart, contextEnd);
-          
-          // Try to find a title near the name (look for common patterns)
-          // Fix: Only create dynamic regex patterns if name is valid (already validated above)
-          const titlePatterns = [
-            /(?:CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing|General|Coordinator|Supervisor|Administrator|Officer|Medical Director|Chief Medical Officer|Dr\.|Professor|Prof\.)/i,
-            // Look for "Name, Title" or "Title: Name" patterns in context
-            // name is guaranteed to be valid at this point (checked above)
-            new RegExp(`${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}[,\\-–—]\\s*([A-Z][A-Za-z\\s&]+(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer|Medical|Chief))`, 'i'),
-            new RegExp(`([A-Z][A-Za-z\\s&]+(?:Director|Manager|President|Owner|Head|Lead|VP|Chief|Executive|Coordinator|Supervisor|Administrator|Officer|Medical|Chief))[:\\.]\\s*${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'i')
-          ];
-          
-          for (const titlePattern of titlePatterns) {
-            const titleMatch = context.match(titlePattern);
-            if (titleMatch) {
-              title = titleMatch[1] || titleMatch[0];
-              break;
-            }
-          }
-          
-          if (!title) {
-            title = 'Contact'; // Default if no title found
-          }
-        }
-        
-        // Validate name and title before adding (name already validated above, but double-check)
-        if (name && name.length > 2 && name.length < 50 && !name.includes('@') && !name.match(/^\d+$/) && title && title.length > 0) {
-          const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            // Validate email if present (should not contain placeholder text)
-            let validEmail = email || null;
-            if (validEmail) {
-              const placeholderTerms = ['firstname', 'lastname', 'firstinitial', 'lastinitial'];
-              if (placeholderTerms.some(term => validEmail.toLowerCase().includes(term))) {
-                validEmail = null; // Reject placeholder emails
-              }
-            }
-            
-            decisionMakers.push({
-              name: name,
-              title: title,
-              email: validEmail, // Include email if found and valid
-              source: 'website',
-              confidence: validEmail ? 0.9 : 0.75 // Higher confidence if email found
-            });
-          }
-        }
-      }
+    const trimmed = name.trim();
+    
+    // Must be between 3 and 50 characters
+    if (trimmed.length < 3 || trimmed.length > 50) return false;
+    
+    // Reject if matches any rejection patterns
+    if (rejectPatterns.some(pattern => pattern.test(trimmed))) return false;
+    
+    // Must match proper name pattern: FirstName LastName (at least 2 capitalized words)
+    // Or Title FirstName LastName (e.g., "Dr. John Smith")
+    const properNamePattern = /^(?:Dr\.|Mr\.|Mrs\.|Ms\.|Miss|Prof\.|Professor|Rev\.|Reverend)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+$|^[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)*$/;
+    
+    if (!properNamePattern.test(trimmed)) return false;
+    
+    // Must have at least two words (after removing title)
+    const words = trimmed.replace(/^(?:Dr\.|Mr\.|Mrs\.|Ms\.|Miss|Prof\.|Professor|Rev\.|Reverend)\s+/i, '').split(/\s+/);
+    if (words.length < 2) return false;
+    
+    // Each word must start with capital letter and be at least 2 characters
+    if (!words.every(word => /^[A-Z][a-z]{1,}$/.test(word))) return false;
+    
+    // Reject if contains common business/marketing words
+    const businessWords = ['marketing', 'business', 'company', 'services', 'solutions', 'digital', 'online', 'agency', 'consulting', 'strategy', 'day', 'book', 'call', 'now', 'your', 'audience', 'leads', 'trends'];
+    const nameLower = trimmed.toLowerCase();
+    if (businessWords.some(word => nameLower.includes(word) && !nameLower.match(new RegExp(`\\b${word}\\b`)))) {
+      // If it's a standalone word, reject
+      return false;
     }
     
-    // Fix: Reset lastIndex after loop to ensure clean state for potential future use
-    // This is especially important if the loop exited early due to decisionMakers.length < 15
-    pattern.lastIndex = 0;
-  });
+    // Additional check: reject if name contains multiple business terms
+    const businessTermCount = businessWords.filter(word => nameLower.includes(word)).length;
+    if (businessTermCount >= 2) return false;
+    
+    return true;
+  }
   
-  // Pattern 3: Look in structured data (JSON-LD) - ENHANCED
+  // Pattern 1: Structured data (JSON-LD) - MOST RELIABLE
   $('script[type="application/ld+json"]').each((i, elem) => {
     try {
       const json = JSON.parse($(elem).html());
+      const items = Array.isArray(json) ? json : [json];
       
-      // Organization founder
-      // Fix: Enforce 15-item limit during extraction to prevent unnecessary processing
-      if (json['@type'] === 'Organization' && json.founder && decisionMakers.length < 15) {
-        const founders = Array.isArray(json.founder) ? json.founder : [json.founder];
-        for (const founder of founders) {
-          if (decisionMakers.length >= 15) break; // Early exit when limit reached
-          if (founder.name || founder['@id']) {
-            const name = founder.name || (founder['@id'] ? founder['@id'].split('/').pop() : null);
-            if (name) {
+      for (const item of items) {
+        if (decisionMakers.length >= 10) break;
+        
+        // Organization founder
+        if (item['@type'] === 'Organization' && item.founder) {
+          const founders = Array.isArray(item.founder) ? item.founder : [item.founder];
+          for (const founder of founders) {
+            if (decisionMakers.length >= 10) break;
+            const name = founder.name || (founder['@type'] === 'Person' ? founder.name : null);
+            if (name && isValidPersonName(name)) {
               const key = name.toLowerCase();
               if (!seen.has(key)) {
                 seen.add(key);
                 decisionMakers.push({
                   name: name,
-                  title: 'Founder',
+                  title: founder.jobTitle || 'Founder',
                   source: 'structured_data',
-                  confidence: 0.9
+                  confidence: 0.95
                 });
               }
             }
           }
         }
-      }
-      
-      // Person schema
-      // Fix: Enforce 15-item limit during extraction to prevent unnecessary processing
-      if (json['@type'] === 'Person' && json.name && decisionMakers.length < 15) {
-        const key = json.name.toLowerCase();
-        if (!seen.has(key)) {
-          seen.add(key);
-          decisionMakers.push({
-            name: json.name,
-            title: json.jobTitle || 'Team Member',
-            source: 'structured_data',
-            confidence: 0.85
-          });
+        
+        // Person schema
+        if (item['@type'] === 'Person' && item.name && isValidPersonName(item.name)) {
+          const key = item.name.toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+            decisionMakers.push({
+              name: item.name,
+              title: item.jobTitle || 'Team Member',
+              source: 'structured_data',
+              confidence: 0.9
+            });
+          }
         }
       }
     } catch (e) {
@@ -1395,32 +1711,113 @@ function extractDecisionMakers($, baseUrl) {
     }
   });
   
-  // Pattern 4: Look for names in headings on About/Team pages - NEW
-  const aboutPageIndicators = ['about', 'team', 'leadership', 'management', 'founders', 'executives'];
-  const currentPath = new URL(baseUrl).pathname.toLowerCase();
-  if (aboutPageIndicators.some(indicator => currentPath.includes(indicator))) {
-    $('h1, h2, h3, h4').each((i, elem) => {
-      const text = $(elem).text().trim();
-      // Look for "Name - Title" or "Name, Title" in headings
-      const headingMatch = text.match(/^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)[,\-–—]\s*(.+)$/);
-      if (headingMatch && decisionMakers.length < 15) {
-        const name = headingMatch[1];
-        const title = headingMatch[2];
+  // Pattern 2: Specific team member selectors - ONLY on relevant pages or with specific classes
+  if (isRelevantPage || $('.team-member, .team-member-card, .staff-member, .executive-card, .leadership-card, [data-team-member]').length > 0) {
+    const teamSelectors = [
+      '.team-member', '.team-member-card', '.staff-member', '.executive-card',
+      '.leadership-card', '[data-team-member]', '[data-person]',
+      '.person-card', '.member-card', '.employee-card'
+    ];
+    
+    for (const selector of teamSelectors) {
+      if (decisionMakers.length >= 10) break;
+      
+      $(selector).each((i, elem) => {
+        if (decisionMakers.length >= 10) return false; // Break loop
+        
+        const $el = $(elem);
+        
+        // Look for name in specific name-related selectors only
+        let name = null;
+        const nameSelectors = ['.name', '.person-name', '.member-name', '[data-name]', 'h3', 'h4'];
+        for (const nameSel of nameSelectors) {
+          const candidate = $el.find(nameSel).first().text().trim();
+          if (candidate && isValidPersonName(candidate)) {
+            name = candidate;
+            break;
+          }
+        }
+        
+        // If not found, try image alt text
+        if (!name) {
+          const altText = $el.find('img').attr('alt') || '';
+          if (altText && isValidPersonName(altText)) {
+            name = altText;
+          }
+        }
+        
+        if (!name) return; // Skip if no valid name found
+        
+        // Look for title
+        const titleSelectors = ['.title', '.role', '.position', '.job-title', '[data-title]', '[data-role]'];
+        let title = null;
+        for (const titleSel of titleSelectors) {
+          const candidate = $el.find(titleSel).first().text().trim();
+          if (candidate && candidate.length > 2 && candidate.length < 100) {
+            title = candidate;
+            break;
+          }
+        }
+        
+        // If no title found, look in paragraph text for job-related keywords
+        if (!title) {
+          const text = $el.text().toLowerCase();
+          const titleMatch = text.match(/\b(ceo|cto|cfo|director|manager|president|founder|owner|head|lead|vp|vice president|chief|executive|coordinator|supervisor|administrator|officer)\b/i);
+          if (titleMatch) {
+            title = titleMatch[0];
+          }
+        }
+        
+        if (!title) title = 'Team Member';
+        
         const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
-        if (!seen.has(key) && name.length > 2 && name.length < 50) {
+        if (!seen.has(key)) {
           seen.add(key);
           decisionMakers.push({
             name: name,
             title: title,
             source: 'website',
-            confidence: 0.8
+            confidence: 0.85
           });
         }
-      }
-    });
+      });
+    }
   }
   
-  return decisionMakers.slice(0, 15); // Increased limit to 15
+  // Pattern 3: "Name, Title" or "Name - Title" patterns - ONLY on relevant pages
+  if (isRelevantPage && decisionMakers.length < 10) {
+    const text = $('body').text();
+    const patterns = [
+      // "John Smith, CEO" or "John Smith - CEO"
+      /([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)\s*[,\-–—]\s*(CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing Director|General Manager|Coordinator|Supervisor|Administrator|Officer)/gi,
+      // "CEO: John Smith" or "CEO John Smith"
+      /(CEO|CTO|CFO|Founder|Director|Manager|President|Owner|Head|Lead|VP|Vice President|Chief|Executive|Managing Director|General Manager)\s*[:]\s*([A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)?)/gi
+    ];
+    
+    for (const pattern of patterns) {
+      pattern.lastIndex = 0;
+      let match;
+      while ((match = pattern.exec(text)) !== null && decisionMakers.length < 10) {
+        const name = pattern === patterns[0] ? match[1]?.trim() : match[2]?.trim();
+        const title = pattern === patterns[0] ? match[2]?.trim() : match[1]?.trim();
+        
+        if (name && title && isValidPersonName(name)) {
+          const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            decisionMakers.push({
+              name: name,
+              title: title,
+              source: 'website',
+              confidence: 0.8
+            });
+          }
+        }
+      }
+    }
+  }
+  
+  return decisionMakers.slice(0, 10); // Limit to 10 high-quality decision makers
 }
 
 /**
@@ -1535,29 +1932,157 @@ export async function quickClassifyUrl(url) {
     const reasons = [];
     let score = 0; // >0 => first-party, <0 => directory
 
-    // Path/title patterns
+    // ============================================
+    // DYNAMIC PATTERN DETECTION (Primary)
+    // ============================================
+    
+    // 1. URL/DOMAIN PATTERN ANALYSIS
     try {
       const u = new URL(url);
+      const domain = u.hostname.replace('www.', '').toLowerCase();
       const path = (u.pathname || '').toLowerCase();
-      if (/(^|\/)(category|tags|companies|agencies|directory|list|locations|explore)(\/|$)/.test(path)) {
+      const fullUrl = url.toLowerCase();
+      
+      // Domain name pattern detection
+      const directoryDomainKeywords = [
+        /directory/i,
+        /listings?/i,
+        /marketplace/i,
+        /aggregator/i,
+        /bizinfo/i,
+        /yellow/i,
+        /businesslist/i,
+        /companylist/i,
+        /database/i // Ranking/database sites (e.g., footballdatabase.com)
+      ];
+      const falsePositives = ['hubspot', 'hubdoc', 'hubstaff', 'hubpages'];
+      const domainHasKeyword = directoryDomainKeywords.some(pattern => pattern.test(domain));
+      const isFalsePositive = falsePositives.some(fp => domain.includes(fp));
+      
+      if (domainHasKeyword && !isFalsePositive) {
+        reasons.push('domain:keyword');
+        score -= 3;
+        // If path also suggests directory, stronger signal
+        if (/\/(directory|listings?|companies|businesses|ranking|rankings|rank)/i.test(path)) {
+          score -= 2;
+        }
+      }
+      
+      // Path patterns
+      if (/(^|\/)(category|tags|companies|agencies|directory|list|locations|explore|ranking|rankings|rank)(\/|$)/.test(path)) {
         reasons.push('path:listlike');
         score -= 2;
       }
-      if (/top-\d+|best|list-of|the-\d+-best/.test(path)) {
+      if (/top-\d+|best|list-of|the-\d+-best|\/ranking|\/rankings|\/rank\b/.test(path)) {
         reasons.push('path:ranked');
         score -= 2;
       }
+      
+      // Domain marketplace patterns
+      // Use centralized config for domain marketplace detection
+      if (DOMAIN_MARKETPLACE_PATTERNS.some(pattern => pattern.test(fullUrl) || pattern.test(path) || pattern.test(domain))) {
+        reasons.push('domain:marketplace');
+        score -= 5; // Strong negative signal
+      }
     } catch {}
 
+    // 2. HTML STRUCTURE ANALYSIS (Enhanced)
     if (html) {
       const $ = cheerio.load(html);
       const title = ($('title').text() || '').trim().toLowerCase();
-      if (/\b(top\s*\d+|\d+\s*best|list of|directory)\b/.test(title)) {
+      
+      // Title patterns
+      if (/\b(top\s*\d+|\d+\s*best|list of|directory|ranking|rankings|rank)\b/.test(title)) {
         reasons.push('title:listlike');
         score -= 2;
       }
+      
+      // Domain marketplace in title
+      if (/is\s+for\s+sale|for\s+sale|domain\s+sale|buy\s+domain|premium\s+domain|hugedomains|domain.*profile|domain.*marketplace/i.test(title)) {
+        reasons.push('title:domain_sale');
+        score -= 5; // Strong negative signal
+      }
+      
+      // Check for directory keywords once (used in multiple checks)
+      const hasDirectoryKeywords = /directory|listing|business.*list|company.*list|ranking|rankings/i.test(title) || 
+                                   /directory|listing|business.*list|company.*list|ranking|rankings/i.test(path);
+      
+      // ENHANCED: Multiple external links analysis
+      try {
+        const origin = new URL(url).hostname.replace(/^www\./, '');
+        let external = 0, internal = 0;
+        const hosts = new Set();
+        const externalLinks = [];
+        
+        $('a[href]').each((_, a) => {
+          const href = ($(a).attr('href') || '').trim();
+          if (!href.startsWith('http')) { internal++; return; }
+          try {
+            const h = new URL(href).hostname.replace(/^www\./, '');
+            if (h === origin) internal++; 
+            else { 
+              external++; 
+              hosts.add(h);
+              externalLinks.push(h);
+            }
+          } catch { external++; }
+        });
+        
+        // If many external links to different domains, likely a directory
+        // BUT: Restaurants often link to social media, reservations, delivery, etc.
+        // Only flag if very high external link count AND has directory-like patterns
+        if (hosts.size >= 10 && external > internal && hasDirectoryKeywords) {
+          reasons.push('links:many-external');
+          score -= 2;
+        }
+        // Very strong signal: 20+ unique external domains (not just social media)
+        if (hosts.size >= 20 && external > internal * 2) {
+          reasons.push('links:very-many-external');
+          score -= 3;
+        }
+      } catch {}
+      
+      // ENHANCED: List-like structure detection
+      // BUT: Restaurants often have menu lists, so be more careful
+      const listItems = $('ul li, ol li').length;
+      const listContainers = $('ul, ol').length;
+      // Only flag if very high list count AND has directory-like patterns
+      if (listItems >= 100 && listContainers >= 5 && hasDirectoryKeywords) {
+        reasons.push('structure:many-lists');
+        score -= 2;
+      }
+      
+      // ENHANCED: Card/grid layout detection (common in directories)
+      // BUT: Restaurants/venues also use cards for menus/galleries, so be more careful
+      const cards = $('[class*="card"], [class*="grid"], [class*="item"], [class*="listing"]').length;
+      // Only flag if very high card count AND has directory-like patterns
+      if (cards >= 20 && hasDirectoryKeywords) {
+        reasons.push('structure:card-layout');
+        score -= 1;
+      }
+      
+      // ENHANCED: "View Profile" / "Visit Website" button patterns
+      const profileButtons = $('a, button').filter((_, el) => {
+        const text = $(el).text().toLowerCase();
+        return /view\s+(profile|website|site)|visit\s+(website|site)|learn\s+more|see\s+details/i.test(text);
+      }).length;
+      if (profileButtons >= 5) {
+        reasons.push('content:profile-buttons');
+        score -= 2;
+      }
+      
+      // ENHANCED: Multiple company name patterns (e.g., "Company Name - Location - Rating")
+      const companyNamePatterns = $('*').filter((_, el) => {
+        const text = $(el).text();
+        // Look for patterns like "Company - Location" or "Company | Location"
+        return /^[A-Z][a-zA-Z\s&]+[-|]\s*[A-Z]/.test(text.trim()) && text.length < 100;
+      }).length;
+      if (companyNamePatterns >= 10) {
+        reasons.push('content:company-patterns');
+        score -= 2;
+      }
 
-      // Detect ItemList/CollectionPage
+      // Detect ItemList/CollectionPage (strong directory signal)
       let hasItemList = false;
       $('script[type="application/ld+json"]').each((_, el) => {
         try {
@@ -1578,9 +2103,12 @@ export async function quickClassifyUrl(url) {
           }
         } catch {}
       });
-      if (hasItemList) { reasons.push('schema:itemList'); score -= 3; }
+      if (hasItemList) { 
+        reasons.push('schema:itemList'); 
+        score -= 3; // Strong negative signal
+      }
 
-      // LocalBusiness/Organization (first-party)
+      // LocalBusiness/Organization (first-party - positive signal)
       let hasLocalBusiness = false;
       $('script[type="application/ld+json"]').each((_, el) => {
         try {
@@ -1596,26 +2124,10 @@ export async function quickClassifyUrl(url) {
           }
         } catch {}
       });
-      if (hasLocalBusiness) { reasons.push('schema:localbusiness'); score += 2; }
-
-      // External link ratio
-      try {
-        const origin = new URL(url).hostname.replace(/^www\./, '');
-        let external = 0, internal = 0;
-        const hosts = new Set();
-        $('a[href]').each((_, a) => {
-          const href = ($(a).attr('href') || '').trim();
-          if (!href.startsWith('http')) { internal++; return; }
-          try {
-            const h = new URL(href).hostname.replace(/^www\./, '');
-            if (h === origin) internal++; else { external++; hosts.add(h); }
-          } catch { external++; }
-        });
-        if (hosts.size >= 5 && external > internal) {
-          reasons.push('links:many-external');
-          score -= 2;
-        }
-      } catch {}
+      if (hasLocalBusiness) { 
+        reasons.push('schema:localbusiness'); 
+        score += 2; // Positive signal for first-party
+      }
     }
 
     const result = { isFirstParty: score > 0, score, reasons };

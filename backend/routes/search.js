@@ -9,6 +9,9 @@ import { enrichLead } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
 import { normalizeUrl } from '../utils/urlNormalizer.js';
 import { isSocialMediaUrl } from '../utils/socialMediaDetector.js';
+import { verifyEmails } from '../services/emailVerifier.js';
+import { isInvalidDomain, isGenericCompanyName as isGenericNameFromConfig } from '../config/domainValidation.js';
+import { isLeadRelevant } from '../utils/relevanceFilter.js';
 import jwt from 'jsonwebtoken';
 import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
@@ -926,12 +929,22 @@ async function processSearch(searchId) {
           finalCompanyName = fallbackCompanyName;
         }
         
-        // Fix: Validate company name before creating lead
+        // CRITICAL FIX: Validate company name using centralized config (pattern-based)
+        const isGenericName = (name) => {
+          return isGenericNameFromConfig(name);
+        };
+        
         // Fix: Check if this is a Google search link (fallback data)
         const isGoogleSearchLink = result.link && (
           result.link.includes('google.com/search') ||
           result.link.includes('google.com/search?')
         );
+        
+        // CRITICAL FIX: Reject generic names regardless of source
+        if (isGenericName(finalCompanyName)) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Generic/placeholder company name "${finalCompanyName}" from ${result.link}`);
+          return; // Skip this result (no lock created yet)
+        }
         
         // Fix: Relax validation for Google search links (they have limited data)
         // Allow generic names like "Grocery store" if they're at least 2 chars
@@ -959,55 +972,31 @@ async function processSearch(searchId) {
         // These should not appear in phone store or other specific business searches
         const companyNameLower = finalCompanyName.toLowerCase();
         const titleLower = (result.title || '').toLowerCase();
-        const snippetLower = (result.snippet || '').toLowerCase();
-        const combinedText = `${companyNameLower} ${titleLower} ${snippetLower}`;
-        
-        // Domain sellers/marketplaces
-        const domainSellerPatterns = [
-          /domain.*sale/i,
-          /domain.*marketplace/i,
-          /domain.*for sale/i,
-          /buy.*domain/i,
-          /premium.*domain/i,
-          /corporate.*domain/i,
-          /paccenter/i,
-          /domain.*auction/i
-        ];
-        
-        // Computer repair/services (not phone stores)
-        const computerRepairPatterns = [
-          /computer.*repair/i,
-          /pc.*repair/i,
-          /laptop.*repair/i,
-          /naples.*pc/i,
-          /goodypc/i,
-          /computer.*service/i,
-          /tech.*repair/i
-        ];
-        
-        // Military/defense contractors (not phone stores)
-        const militaryPatterns = [
-          /wagner.*group/i,
-          /military.*contractor/i,
-          /defense.*contractor/i,
-          /national.*guard/i,
-          /\.mil/i,
-          /army.*contractor/i
-        ];
-        
-        // Check if this is an irrelevant business type
-        const isDomainSeller = domainSellerPatterns.some(pattern => pattern.test(combinedText));
-        const isComputerRepair = computerRepairPatterns.some(pattern => pattern.test(combinedText));
-        const isMilitary = militaryPatterns.some(pattern => pattern.test(combinedText));
-        
-        // Only reject if we have a specific query (not generic "companies" search)
-        // For specific queries like "phone stores", reject these irrelevant types
+        // CRITICAL FIX: Use AI-based relevance filtering instead of hardcoded patterns
+        // This dynamically checks if the lead is relevant to the search query
         const hasSpecificQuery = search.industry && search.industry.trim().length > 0;
         
-        if (hasSpecificQuery && (isDomainSeller || isComputerRepair || isMilitary)) {
-          const reason = isDomainSeller ? 'domain seller' : (isComputerRepair ? 'computer repair service' : 'military contractor');
-          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Irrelevant business type (${reason}): "${finalCompanyName}" from ${result.link}`);
-          return; // Skip this result (no lock created yet)
+        if (hasSpecificQuery) {
+          try {
+            const relevanceCheck = await isLeadRelevant(
+              {
+                companyName: finalCompanyName,
+                website: result.link,
+                aboutText: extracted.aboutText || '',
+                categorySignals: extracted.categorySignals || []
+              },
+              search.query,
+              search.industry
+            );
+            
+            if (!relevanceCheck.isRelevant && relevanceCheck.confidence > 0.7) {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Irrelevant business (${relevanceCheck.reason}): "${finalCompanyName}" from ${result.link}`);
+              return; // Skip this result (no lock created yet)
+            }
+          } catch (relevanceError) {
+            // If AI relevance check fails, continue processing (don't block leads)
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Relevance check failed: ${relevanceError.message}, continuing anyway`);
+          }
         }
         
         // AI-based relevance filtering (only for specific queries to avoid false positives)
@@ -1038,11 +1027,19 @@ async function processSearch(searchId) {
         
         // Fix: Check for concurrent processing of same website (but skip for Google search links)
         if (normalizedWebsite && !isGoogleSearchLink && websiteLocks.has(normalizedWebsite)) {
-          // Another lead with same website is being processed - wait for it
+          // Another lead with same website is being processed - wait for it (with timeout)
           console.log(`[PROCESS] [${i + 1}/${total}] ⏳ Waiting for concurrent processing of ${normalizedWebsite}...`);
           try {
-            await websiteLocks.get(normalizedWebsite);
+            // Add timeout to prevent infinite waiting (30 seconds max)
+            await Promise.race([
+              websiteLocks.get(normalizedWebsite),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('Lock wait timeout')), 30000))
+            ]);
           } catch (err) {
+            if (err.message === 'Lock wait timeout') {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Lock wait timeout for ${normalizedWebsite}, skipping to prevent deadlock`);
+              return; // Skip this item to prevent deadlock
+            }
             // Previous processing failed, continue anyway
           }
           // After waiting, check if duplicate was already created
@@ -1097,25 +1094,41 @@ async function processSearch(searchId) {
         // Try extracted website first, then original link, but reject social media URLs
         let websiteUrl = null;
         
+        // CRITICAL FIX: Skip social media URLs early (before processing)
+        if (isSocialMediaUrl(result.link)) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping social media URL: ${result.link}`);
+          return; // Skip immediately - don't process social media URLs as leads
+        }
+        
         if (extracted.website && !isSocialMediaUrl(extracted.website)) {
           websiteUrl = extracted.website;
           console.log(`[PROCESS] [${i + 1}/${total}] Using extracted website: ${extracted.website}`);
         } else if (result.link && !isSocialMediaUrl(result.link)) {
           websiteUrl = result.link;
         } else {
-          // Both are social media URLs - try to resolve real website from social media page
+          // Both are social media URLs - skip this lead
           const socialUrl = extracted.website || result.link;
           if (socialUrl && isSocialMediaUrl(socialUrl)) {
             console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping social media URL as website: ${socialUrl}`);
-            // Skip this lead - we can't use social media URLs as main website
-            // The lead will be created but without a valid website URL
-            // This will result in a lower quality score, which is correct
           }
         }
         
         if (!websiteUrl) {
           console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  No valid website URL (both were social media), skipping lead`);
           return; // Skip this result - no valid website
+        }
+        
+        // CRITICAL FIX: Reject invalid domains using centralized config
+        try {
+          const urlObj = new URL(websiteUrl);
+          const hostname = urlObj.hostname.toLowerCase();
+          if (isInvalidDomain(hostname)) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website domain "${hostname}"`);
+            return; // Skip this result - invalid domain
+          }
+        } catch (urlError) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website URL "${websiteUrl}"`);
+          return; // Skip this result - invalid URL
         }
         
         lead.website = websiteUrl;
@@ -1140,11 +1153,15 @@ async function processSearch(searchId) {
             }
             
             // Also use quickClassifyUrl for additional validation (pattern-based)
+            // BUT: Be more lenient - only skip if strongly directory (score <= -3)
+            // This prevents false positives for restaurants/venues that might have directory-like patterns
             const cls = await quickClassifyUrl(lead.website);
-            // Only skip when strongly directory (negative score). Borderline (0) proceeds.
-            if (cls && typeof cls.score === 'number' && cls.score < 0) {
+            if (cls && typeof cls.score === 'number' && cls.score <= -3) {
               console.log(`[PROCESS] [${i + 1}/${total}] Classified as directory/list (score=${cls.score}): ${lead.website}. Skipping.`);
               return;
+            } else if (cls && typeof cls.score === 'number' && cls.score < 0) {
+              // Log borderline cases but don't skip (score between -1 and -2)
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Borderline directory classification (score=${cls.score}), proceeding anyway: ${lead.website}`);
             }
           }
         } catch (clsErr) {
@@ -1200,7 +1217,7 @@ async function processSearch(searchId) {
         }
         
         // Filter emails - only keep valid business emails
-        lead.emails = (extracted.emails || []).filter(email => {
+        let filteredEmails = (extracted.emails || []).filter(email => {
           const emailStr = email.email || email;
           // Filter out generic/non-business emails
           return !emailStr.includes('noreply') && 
@@ -1208,6 +1225,48 @@ async function processSearch(searchId) {
                  !emailStr.includes('donotreply') &&
                  !emailStr.includes('example.com');
         });
+        
+        // NEW: Verify emails and add deliverability scores (non-blocking)
+        if (filteredEmails.length > 0) {
+          try {
+            // Check if email verification is enabled (default: true, uses free syntax validation)
+            const enableEmailVerification = process.env.ENABLE_EMAIL_VERIFICATION !== 'false';
+            const useEmailAPI = process.env.USE_EMAIL_VERIFICATION_API === 'true'; // Optional paid API
+            
+            if (enableEmailVerification) {
+              console.log(`[PROCESS] [${i + 1}/${total}] Verifying ${filteredEmails.length} email(s)...`);
+              const verifiedEmails = await verifyEmails(filteredEmails, useEmailAPI);
+              
+              // Update emails with deliverability data
+              lead.emails = verifiedEmails.map(emailObj => ({
+                email: emailObj.email,
+                source: emailObj.source || 'website',
+                confidence: emailObj.confidence || 0.8,
+                deliverability: emailObj.deliverability || {
+                  score: 0,
+                  status: 'unknown',
+                  checkedAt: new Date(),
+                  method: 'unknown'
+                }
+              }));
+              
+              // Log deliverability summary
+              const validCount = lead.emails.filter(e => e.deliverability?.status === 'valid').length;
+              const riskyCount = lead.emails.filter(e => e.deliverability?.status === 'risky').length;
+              const invalidCount = lead.emails.filter(e => e.deliverability?.status === 'invalid').length;
+              console.log(`[PROCESS] [${i + 1}/${total}] Email deliverability: ${validCount} valid, ${riskyCount} risky, ${invalidCount} invalid`);
+            } else {
+              // Email verification disabled, use filtered emails as-is
+              lead.emails = filteredEmails;
+            }
+          } catch (emailVerifyError) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Email verification failed: ${emailVerifyError.message}, using filtered emails`);
+            // Fallback to filtered emails without deliverability data
+            lead.emails = filteredEmails;
+          }
+        } else {
+          lead.emails = filteredEmails;
+        }
         
         // Filter phone numbers - only keep valid ones
         lead.phoneNumbers = (extracted.phoneNumbers || []).filter(phone => {
@@ -1667,7 +1726,7 @@ async function processSearch(searchId) {
               // Fix: Wrap processOne in try-catch to prevent silent failures
               await processOne(bgList[j], initialBatch.length + j, expandedResults.length);
               
-              // STREAMING UPDATE: Update progress after EACH item for real-time frontend updates
+              // CRITICAL FIX: Update progress after EVERY item for real-time updates
               const s = await Search.findById(search._id);
               if (s) {
                 const currentExtracted = await Lead.countDocuments({ 

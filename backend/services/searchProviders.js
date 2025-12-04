@@ -3,77 +3,104 @@
  */
 import https from 'https';
 import * as cheerio from 'cheerio';
- import http from 'http';
+import http from 'http';
+import { 
+  isKnownDirectoryDomain,
+  DIRECTORY_DOMAIN_PATTERNS,
+  DIRECTORY_FALSE_POSITIVES,
+  DOMAIN_MARKETPLACE_PATTERNS
+} from '../config/domainValidation.js';
 
-// Directory/aggregator sites to filter out - COMPREHENSIVE LIST
-const FILTER_DOMAINS = [
-  // Data aggregators
-  'tomba.io', 'cybo.com', 'cience.com', 'wrkr.com', 'zoominfo.com',
-  'opencorporates.com', 'micompanyregistry.com', 'poidata.io',
-  'dnb.com', 'f6s.com', 'ensun.io', 'aeroleads.com',
-  'tracxn.com', 'ghanayello.com', 'techcartel.net', 'yen.com.gh', 'tremhost.com',
-  // Business directories
-  'yelp.com', 'yellowpages.com', 'whitepages.com', 'business.com',
-  'manta.com', 'bbb.org', 'indeed.com', 'glassdoor.com',
-  // Other aggregators
-  'wikipedia.org', 'thumbwind.com', 'afrikta.com', 'hospi.info',
-  'tannoshealth.com', 'dfuilts.com',
-  // Real-estate/listing/review aggregators we must expand/block (not final leads)
-  'goodfirms.co', 'kyero.com', 'properstar.com', 'realting.com', 'jamesedition.com',
-  'tripadvisor.com', 'yelp.com', 'zomato.com', 'foursquare.com', 'opentable.com',
-  'google.com/maps', 'restaurantguru.com', 'eircode.ie', 'food.ireland724.info', 'coffeeee-ai.com',
-  // Regional directory/listicle domains (trigger expansion instead of treating as leads)
-  'finelib.com', 'worldorgs.com', 'infoaboutcompanies.com', 'starofservice.com.ng',
-  'africabizinfo.com', 'nigeria24.me', 'businesslist.com.ng',
-  // Additional listicle/directory domains
-  'wigmoretrading.com', 'naijatrends.ng', 'wellfound.com', 'getlatka.com',
-  'techbehemoths.com', 'f6s.com', 'crunchbase.com', 'producthunt.com',
-  // OpenStreetMap pages (not actual business websites)
-  'openstreetmap.org'
-];
+// FILTER_DOMAINS is now replaced by pattern-based detection in domainValidation.js
+// This is kept as a fast-path cache for known directories (performance optimization)
+// Primary detection should use isDirectorySite() which uses pattern matching
 
 export function isDirectorySite(url, title = null) {
   try {
     const urlObj = new URL(url);
-    const domain = urlObj.hostname.replace('www.', '');
+    const domain = urlObj.hostname.replace('www.', '').toLowerCase();
     const path = (urlObj.pathname || '').toLowerCase();
+    const fullUrl = url.toLowerCase();
     
-    // Domain-based block
-    if (FILTER_DOMAINS.some(filter => domain.includes(filter))) return true;
+    // ============================================
+    // DYNAMIC-FIRST APPROACH: Pattern detection
+    // ============================================
     
-    // Path heuristics that commonly indicate lists/aggregators (generic patterns)
+    // 1. DOMAIN NAME PATTERN DETECTION (Dynamic - using centralized config)
+    // Check if domain contains directory keywords (but exclude false positives)
+    const domainHasDirectoryKeyword = DIRECTORY_DOMAIN_PATTERNS.some(pattern => pattern.test(domain));
+    // Exclude common false positives (e.g., "hubspot.com" is not a directory)
+    const isFalsePositive = DIRECTORY_FALSE_POSITIVES.some(fp => domain.includes(fp));
+    
+    if (domainHasDirectoryKeyword && !isFalsePositive) {
+      // Additional check: if domain has directory keyword AND path suggests listing, it's likely a directory
+      if (/\/(directory|listings?|companies|businesses|agencies|providers)/i.test(path)) {
+        return true;
+      }
+      // If domain is clearly a directory (e.g., "businessdirectory.com"), block it
+      if (/^(business|company|service|provider).*(directory|listings?|marketplace)/i.test(domain) ||
+          /(directory|listings?|marketplace).*(business|company|service|provider)/i.test(domain)) {
+        return true;
+      }
+    }
+    
+    // 2. DOMAIN MARKETPLACE PATTERNS (Dynamic - using centralized config)
+    if (DOMAIN_MARKETPLACE_PATTERNS.some(pattern => pattern.test(fullUrl) || pattern.test(path) || pattern.test(domain))) {
+      return true;
+    }
+    
+    // 3. URL PATH PATTERNS (Dynamic - works for any business type)
     const listiclePathPatterns = [
       /\/(category|tags|companies|agencies|estate-agents|real-estate-agents|company-directory|partners|directory|listings|businesses)\b/i,
       /\/(top-|best-|leading-|top\d+|best\d+)/i,
-      /\/(list|lists|listing|explore|directory|guide|roundup|compilation)/i,
+      /\/(list|lists|listing|explore|directory|guide|roundup|compilation|ranking|rankings|rank)\b/i,
       /sharearticle|article-list|company-list/i,
-      // Generic business type patterns (not hardcoded to specific types)
-      /-\d+-best-|-\d+-top-|-\d+-companies/i
+      // Generic numbered list patterns
+      /-\d+-best-|-\d+-top-|-\d+-companies/i,
+      // Domain marketplace paths
+      /domain_profile|domain_profile\.cfm|domain.*sale|buy.*domain/i
     ];
     if (listiclePathPatterns.some(pattern => pattern.test(path))) {
       return true;
     }
     
-    // Title-based heuristics for listicles (generic patterns - works for any business type)
+    // 4. TITLE PATTERNS (Dynamic - works for any business type)
     if (title) {
       const titleLower = title.toLowerCase();
+      
+      // Domain marketplace in title
+      if (/is.*for.*sale|for.*sale.*domain|domain.*sale|hugedomains/i.test(titleLower)) {
+        return true;
+      }
+      
       // Generic listicle patterns that work for any business category
       const listiclePatterns = [
         // "Top/Best X in Y" or "X Companies to Know"
         /^(top|best|leading|top \d+|best \d+)\s+.*\s+(companies|providers|solutions|services|businesses|firms|agencies)/i,
         /(companies|providers|solutions|services|businesses|firms|agencies).*(to know|to work|in \w+|for \w+|to watch)/i,
-        // "List/Directory/Guide of X"
-        /^(list|directory|guide|roundup|compilation).*(of|to|for).*(companies|providers|businesses)/i,
-        // "N Best/Top X"
+        // "List/Directory/Guide/Ranking of X"
+        /^(list|directory|guide|roundup|compilation|ranking|rankings|rank).*(of|to|for).*(companies|providers|businesses)/i,
+        // "N Best/Top X" or "X Ranking"
         /\d+\s+(best|top|leading|greatest).*(companies|providers|businesses|firms)/i,
-        // "X Companies/Providers in/for Y"
+        // "X Companies/Providers in/for Y" or "X Ranking"
         /.*\s+(companies|providers|businesses|firms).*(in|for|to)\s+\w+/i,
         // Generic "X to Y" patterns
-        /.*\s+(to know|to work|to watch|to follow|to invest).*companies/i
+        /.*\s+(to know|to work|to watch|to follow|to invest).*companies/i,
+        // "X Ranking" or "Ranking of X" patterns
+        /.*\s+(ranking|rankings|rank)\b/i,
+        /\b(ranking|rankings|rank)\s+(of|for|in|to)\s+/i
       ];
       if (listiclePatterns.some(pattern => pattern.test(titleLower))) {
         return true;
       }
+    }
+    
+    // ============================================
+    // FAST-PATH: Known directory domains (performance optimization)
+    // Use as fallback for performance, but pattern-based detection is primary
+    // ============================================
+    if (isKnownDirectoryDomain(domain)) {
+      return true;
     }
     
     return false;
@@ -1704,5 +1731,6 @@ export async function searchBing(query, country = null, location = null, maxResu
     throw new Error(`Bing Search API failed: ${error.message}`);
   }
 }
+
 
 
