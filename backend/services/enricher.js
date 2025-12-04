@@ -1,6 +1,10 @@
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 import { enrichLinkedInContacts } from './linkedinEnricher.js';
+import { parseLocation } from '../utils/locationParser.js';
+import { detectHiringSignals } from '../utils/hiringSignalDetector.js';
+import { normalizeJobTitle, getSeniorityLevel, extractDepartment } from '../utils/jobTitleNormalizer.js';
+import { getEmployeeCountRange, estimateEmployeeCountFromSize } from '../utils/employeeCountExtractor.js';
 
 dotenv.config();
 
@@ -107,8 +111,12 @@ export async function enrichLead(leadData) {
       }
     }
     
-    // Enrich with LinkedIn contacts
+    // Enrich with LinkedIn contacts (this also extracts employee count and founded year)
     let linkedinContacts = null;
+    let employeeCount = null;
+    let employeeCountRange = null;
+    let foundedYear = null;
+    
     try {
       console.log('[ENRICH] Enriching LinkedIn contacts...');
       linkedinContacts = await enrichLinkedInContacts({
@@ -123,32 +131,83 @@ export async function enrichLead(leadData) {
         }
       });
       console.log(`[ENRICH] ✅ Found ${linkedinContacts.contacts?.length || 0} suggested contacts`);
+      
+      // Extract employee count and founded year from LinkedIn data
+      if (linkedinContacts) {
+        employeeCount = linkedinContacts.employeeCount || null;
+        employeeCountRange = linkedinContacts.employeeCountRange || null;
+        foundedYear = linkedinContacts.foundedYear || null;
+      }
     } catch (linkedinError) {
       console.log(`[ENRICH] ⚠️  LinkedIn enrichment failed: ${linkedinError.message}`);
     }
     
-    // Generate emails for decision makers using email pattern
-    const enrichedDecisionMakers = (leadData.decisionMakers || []).map(dm => {
-      if (enrichment.emailPattern && dm.name) {
-        // Generate email from name + pattern
-        const email = generateEmailFromName(dm.name, enrichment.emailPattern, leadData.website);
-        return {
-          ...dm,
-          email: email,
-          source: dm.source === 'website' ? 'website' : 'ai_inferred'
-        };
+    // Try to get employee count - first from LinkedIn, then estimate from company size
+    if (!employeeCount && enrichment.companySize && enrichment.companySize !== 'unknown') {
+      // Estimate from company size if we have it
+      const estimatedCount = estimateEmployeeCountFromSize(enrichment.companySize);
+      if (estimatedCount) {
+        employeeCount = estimatedCount;
+        employeeCountRange = getEmployeeCountRange(estimatedCount);
       }
-      return dm;
-    });
+    }
+    
+    // Parse location
+    const locationData = parseLocation(leadData.address, leadData.website);
+    
+    // Detect hiring signals
+    let hiringSignals = {
+      isHiring: false,
+      hasCareersPage: false,
+      hasJobPostings: false,
+      detectedAt: new Date()
+    };
+    try {
+      hiringSignals = await detectHiringSignals(leadData);
+    } catch (hiringError) {
+      console.log(`[ENRICH] ⚠️  Hiring signal detection failed: ${hiringError.message}`);
+    }
+    
+    // Generate emails for decision makers using email pattern and normalize titles
+    const enrichedDecisionMakers = (leadData.decisionMakers || []).map(dm => {
+      if (!dm.name) return null; // Skip invalid decision makers
+      
+      // Normalize job title
+      const normalizedTitle = normalizeJobTitle(dm.title) || dm.title;
+      const seniority = getSeniorityLevel(dm.title);
+      const department = extractDepartment(dm.title);
+      
+      let email = dm.email || null;
+      if (enrichment.emailPattern && dm.name && !email) {
+        // Generate email from name + pattern
+        email = generateEmailFromName(dm.name, enrichment.emailPattern, leadData.website);
+      }
+      
+      return {
+        name: dm.name,
+        title: dm.title,
+        normalizedTitle: normalizedTitle,
+        seniority: seniority,
+        department: department,
+        email: email,
+        source: dm.source === 'website' ? 'website' : 'ai_inferred',
+        confidence: dm.confidence || 0.75
+      };
+    }).filter(dm => dm !== null); // Remove null entries
     
     return {
       businessSummary: enrichment.businessSummary || '',
       companySize: enrichment.companySize || 'unknown',
+      employeeCount: employeeCount || null,
+      employeeCountRange: employeeCountRange || null,
       revenueBracket: enrichment.revenueBracket || 'unknown',
       industry: enrichment.industry || 'unknown',
       emailPattern: enrichment.emailPattern || '',
       contactRelevance: enrichment.contactRelevance || 50,
       signalStrength: enrichment.signalStrength || 50,
+      foundedYear: foundedYear || null,
+      location: locationData,
+      hiringSignals: hiringSignals,
       linkedinContacts: linkedinContacts || null,
       decisionMakers: enrichedDecisionMakers.length > 0 ? enrichedDecisionMakers : null,
       enrichedAt: new Date()
@@ -160,11 +219,21 @@ export async function enrichLead(leadData) {
     return {
       businessSummary: '',
       companySize: 'unknown',
+      employeeCount: null,
+      employeeCountRange: null,
       revenueBracket: 'unknown',
       industry: 'unknown',
       emailPattern: '',
       contactRelevance: 50,
       signalStrength: 50,
+      foundedYear: null,
+      location: parseLocation(null, leadData?.website || null),
+      hiringSignals: {
+        isHiring: false,
+        hasCareersPage: false,
+        hasJobPostings: false,
+        detectedAt: new Date()
+      },
       linkedinContacts: null,
       decisionMakers: null,
       enrichedAt: new Date()
@@ -179,6 +248,24 @@ function generateEmailFromName(name, emailPattern, website) {
   if (!name || !emailPattern || !website) return null;
   
   try {
+    // CRITICAL: Reject marketing copy, headings, and non-name text
+    const marketingCopyPatterns = [
+      /^(of|in|on|at|to|for|with|by|from|as|is|was|are|were|be|been|being|have|has|had|do|does|did|will|would|should|could|may|might|must|can)/i,
+      /(book|schedule|order|buy|get|try|start|sign|register|login|subscribe|download|view|see|read|learn|explore|join|follow|contact|call|email|message|chat|support|help|now|today|boost|increase|improve|enhance|marketing|business|company|services|solutions|products|software|technology|digital|online|web|internet|social|media|content|blog|news|press|strategy|tactic|campaign|project|program|system|platform|tool|application|service|product|solution|feature|benefit|value|quality|performance|results|outcome|impact|effect|success|growth|revenue|sales|leads|customers|clients|partners|engages|drives|leads|guides|helps|supports|enables|empowers|transforms|revolutionizes|innovates|creates|builds|develops|delivers|provides|offers|sells|markets|promotes|advertises|audience|trends|day|night|morning|evening|afternoon)/i
+    ];
+    
+    const nameLower = name.toLowerCase().trim();
+    if (marketingCopyPatterns.some(pattern => pattern.test(nameLower))) {
+      console.log(`[EMAIL_GEN] ⚠️  Rejected marketing copy as name: ${name}`);
+      return null; // Reject marketing copy
+    }
+    
+    // Reject if name doesn't look like a proper person name (must have at least 2 capitalized words)
+    if (!/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/.test(name)) {
+      console.log(`[EMAIL_GEN] ⚠️  Rejected invalid name pattern: ${name}`);
+      return null;
+    }
+    
     // Extract domain from website
     const domain = new URL(website).hostname.replace('www.', '');
     

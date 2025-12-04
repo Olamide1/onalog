@@ -78,8 +78,25 @@ export const useLeadsStore = defineStore('leads', () => {
       // Fix: If this is the current search, update it and leads (improved ID matching)
       if (currentSearch.value && (currentSearchId === normalizedSearchId || String(currentSearch.value.searchId) === normalizedSearchId)) {
         currentSearch.value = { ...search };
-        // Force reactivity by creating new array reference
-        leads.value = [...(searchLeads || [])];
+        // CRITICAL FIX: Always update leads during backfill or when counts change
+        // During backfill, new leads are being added, so we must always update
+        const newLeads = [...(searchLeads || [])];
+        const oldLeadIds = new Set(leads.value.map(l => String(l._id || l.id || '')));
+        const newLeadIds = new Set(newLeads.map(l => String(l._id || l.id || '')));
+        
+        // Check if we have new leads (not just reordered)
+        const hasNewLeads = Array.from(newLeadIds).some(id => !oldLeadIds.has(id));
+        const leadCountChanged = newLeads.length !== leads.value.length;
+        const isBackfillOrCompleted = search.status === 'processing_backfill' || search.status === 'completed';
+        
+        // Always update if:
+        // 1. We have new leads (new IDs)
+        // 2. Lead count changed
+        // 3. Status is backfill or completed (leads are being added)
+        if (hasNewLeads || leadCountChanged || isBackfillOrCompleted) {
+          leads.value = newLeads;
+          console.log('[STORE] Updated leads list:', newLeads.length, 'leads (hasNewLeads:', hasNewLeads, ', countChanged:', leadCountChanged, ', isBackfill:', isBackfillOrCompleted, ')');
+        }
       } 
       // If this is a background search, update it
       else if (updateBackground) {

@@ -110,7 +110,21 @@
                 @change="toggleSelection(lead._id)"
               />
             </td>
-            <td class="company-name">{{ lead.companyName }}</td>
+            <td class="company-name">
+              <div class="company-name-wrapper">
+                <span>{{ lead.companyName }}</span>
+                <span v-if="lead.enrichment?.hiringSignals?.isHiring" 
+                      class="hiring-indicator" 
+                      title="This company is currently hiring">
+                  🎯
+                </span>
+                <span v-if="lead.enrichment?.employeeCount || lead.enrichment?.employeeCountRange" 
+                      class="employee-count-badge"
+                      :title="getEmployeeCountTooltip(lead)">
+                  👥 {{ formatEmployeeCountDisplay(lead) }}
+                </span>
+              </div>
+            </td>
             <td class="website-cell">
               <a
                 v-if="lead.website"
@@ -128,7 +142,15 @@
               {{ lead.phoneNumbers?.[0]?.formatted || lead.phoneNumbers?.[0]?.phone || '—' }}
             </td>
             <td>
-              {{ getPrimaryEmail(lead) || '—' }}
+              <div v-if="getPrimaryEmail(lead)" class="email-cell">
+                <span>{{ getPrimaryEmail(lead) }}</span>
+                <span v-if="getPrimaryEmailDeliverability(lead)" 
+                      :class="['deliverability-badge-small', `deliverability-${getPrimaryEmailDeliverability(lead).status}`]"
+                      :title="getDeliverabilityTooltip(getPrimaryEmailDeliverability(lead))">
+                  {{ getDeliverabilityLabelShort(getPrimaryEmailDeliverability(lead).status) }}
+                </span>
+              </div>
+              <span v-else class="text-muted">—</span>
             </td>
             <td class="decision-maker-cell">
               <div v-if="getPrimaryDecisionMaker(lead)" class="decision-maker-info">
@@ -432,6 +454,91 @@ function getPrimaryDecisionMaker(lead) {
   // Fallback to first decision maker
   return lead.decisionMakers[0];
 }
+
+// Get deliverability for primary email
+function getPrimaryEmailDeliverability(lead) {
+  // First, try to get deliverability for decision maker email
+  const primaryDM = getPrimaryDecisionMaker(lead);
+  if (primaryDM?.email) {
+    // Check if decision maker email matches any email in lead.emails array
+    const emailObj = lead.emails?.find(e => {
+      const emailStr = typeof e === 'string' ? e : e.email;
+      return emailStr && emailStr.toLowerCase() === primaryDM.email.toLowerCase();
+    });
+    if (emailObj && emailObj.deliverability) {
+      return emailObj.deliverability;
+    }
+  }
+  
+  // Fallback to first company email deliverability
+  const firstEmail = lead.emails?.[0];
+  if (firstEmail) {
+    const emailObj = typeof firstEmail === 'string' ? null : firstEmail;
+    return emailObj?.deliverability || null;
+  }
+  
+  return null;
+}
+
+// Email deliverability helpers
+function getDeliverabilityLabelShort(status) {
+  const labels = {
+    'valid': '✓',
+    'risky': '⚠',
+    'invalid': '✗',
+    'unknown': '?'
+  };
+  return labels[status] || '?';
+}
+
+function getDeliverabilityTooltip(deliverability) {
+  if (!deliverability) return '';
+  
+  const status = deliverability.status || 'unknown';
+  const score = deliverability.score;
+  const method = deliverability.method || 'unknown';
+  const reason = deliverability.reason || '';
+  
+  let tooltip = `Status: ${status}`;
+  if (score !== undefined) {
+    tooltip += `\nScore: ${score}/100`;
+  }
+  if (method !== 'unknown') {
+    tooltip += `\nMethod: ${method}`;
+  }
+  if (reason) {
+    tooltip += `\n${reason}`;
+  }
+  return tooltip;
+}
+
+function formatEmployeeCount(count) {
+  if (typeof count !== 'number' || isNaN(count)) {
+    return String(count || '—');
+  }
+  try {
+    return count.toLocaleString();
+  } catch (error) {
+    return String(count);
+  }
+}
+
+function formatEmployeeCountDisplay(lead) {
+  if (lead.enrichment?.employeeCount && typeof lead.enrichment.employeeCount === 'number') {
+    return formatEmployeeCount(lead.enrichment.employeeCount);
+  }
+  return lead.enrichment?.employeeCountRange || '—';
+}
+
+function getEmployeeCountTooltip(lead) {
+  if (lead.enrichment?.employeeCount && typeof lead.enrichment.employeeCount === 'number') {
+    return `${formatEmployeeCount(lead.enrichment.employeeCount)} employees`;
+  }
+  if (lead.enrichment?.employeeCountRange) {
+    return `${lead.enrichment.employeeCountRange} employees`;
+  }
+  return '';
+}
 </script>
 
 <style scoped>
@@ -516,6 +623,32 @@ function getPrimaryDecisionMaker(lead) {
   max-width: 250px;
   word-wrap: break-word;
   overflow-wrap: break-word;
+}
+
+.company-name-wrapper {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.hiring-indicator {
+  font-size: 0.9rem;
+  cursor: help;
+  display: inline-block;
+  line-height: 1;
+}
+
+.employee-count-badge {
+  display: inline-block;
+  font-size: 0.7rem;
+  padding: 2px 6px;
+  background: var(--neutral-1);
+  border: var(--border-thin) solid var(--neutral-2);
+  border-radius: 3px;
+  color: var(--neutral-2);
+  white-space: nowrap;
+  font-weight: var(--font-weight-normal);
 }
 
 .table td:nth-child(2) {
@@ -681,6 +814,46 @@ function getPrimaryDecisionMaker(lead) {
   background: #e2e3e5;
   color: #383d41;
   border-color: #6c757d;
+}
+
+.email-cell {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.deliverability-badge-small {
+  display: inline-block;
+  padding: 1px 4px;
+  font-size: 0.65rem;
+  font-weight: var(--font-weight-semibold);
+  border-radius: 2px;
+  white-space: nowrap;
+}
+
+.deliverability-badge-small.deliverability-valid {
+  background: #d4edda;
+  color: #155724;
+  border: 1px solid #28a745;
+}
+
+.deliverability-badge-small.deliverability-risky {
+  background: #fff3cd;
+  color: #856404;
+  border: 1px solid #ffc107;
+}
+
+.deliverability-badge-small.deliverability-invalid {
+  background: #f8d7da;
+  color: #721c24;
+  border: 1px solid #dc3545;
+}
+
+.deliverability-badge-small.deliverability-unknown {
+  background: #e2e3e5;
+  color: #383d41;
+  border: 1px solid #6c757d;
 }
 
 /* Pagination Styles */

@@ -24,8 +24,8 @@
           Country
           <span class="field-help" title="Filter results to a specific country. Leave empty to search globally.">ℹ️</span>
         </label>
-        <select v-model="formData.country" class="input" title="Filter results to a specific country">
-          <option value="">All Countries</option>
+        <select v-model="formData.country" class="input" title="Filter results to a specific country" required>
+          <option value="">Select Country (Required)</option>
           <optgroup label="Africa">
             <option value="ng">Nigeria</option>
             <option value="za">South Africa</option>
@@ -113,8 +113,9 @@
           class="input"
           placeholder="e.g., Lagos, Nairobi, Accra"
           title="Enter a specific city or region"
+          required
         />
-        <p class="helper-text">Optional: narrow results to a specific city or region</p>
+        <p class="helper-text">Required: Enter a city or region to narrow results</p>
       </div>
 
       <div class="filter-block">
@@ -267,7 +268,19 @@ const currentSearchId = ref(null);
 const authStore = useAuthStore();
 
 async function handleSubmit() {
-  if (!formData.value.query.trim()) return;
+  // CRITICAL: Validate required fields
+  if (!formData.value.query.trim()) {
+    alert('Please enter a search query');
+    return;
+  }
+  if (!formData.value.country) {
+    alert('Please select a country');
+    return;
+  }
+  if (!formData.value.location || !formData.value.location.trim()) {
+    alert('Please enter a location (city or region)');
+    return;
+  }
   
   loading.value = true;
   const searchData = { ...formData.value };

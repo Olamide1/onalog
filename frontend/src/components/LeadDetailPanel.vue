@@ -62,9 +62,29 @@
               <label>Company Size</label>
               <div>{{ lead.enrichment?.companySize || '—' }}</div>
             </div>
+            <div class="info-item" v-if="lead.enrichment?.employeeCount || lead.enrichment?.employeeCountRange">
+              <label>Employee Count</label>
+              <div>
+                <span v-if="lead.enrichment?.employeeCount && typeof lead.enrichment.employeeCount === 'number'">{{ formatEmployeeCount(lead.enrichment.employeeCount) }} employees</span>
+                <span v-else-if="lead.enrichment?.employeeCountRange">{{ lead.enrichment.employeeCountRange }}</span>
+              </div>
+            </div>
             <div class="info-item">
               <label>Revenue Bracket</label>
               <div>{{ lead.enrichment?.revenueBracket || '—' }}</div>
+            </div>
+            <div class="info-item" v-if="lead.enrichment?.foundedYear">
+              <label>Founded</label>
+              <div>{{ lead.enrichment.foundedYear }}</div>
+            </div>
+            <div class="info-item" v-if="lead.enrichment?.hiringSignals?.isHiring">
+              <label>Hiring Status</label>
+              <div class="hiring-badge hiring-active">
+                <span class="hiring-icon">🎯</span>
+                <span>Currently Hiring</span>
+                <span v-if="lead.enrichment?.hiringSignals?.hasCareersPage" class="hiring-detail">• Careers Page</span>
+                <span v-if="lead.enrichment?.hiringSignals?.hasJobPostings" class="hiring-detail">• Job Postings</span>
+              </div>
             </div>
             <div class="info-item">
               <label>Signal Strength</label>
@@ -141,8 +161,18 @@
           <div class="contact-item" v-if="lead.emails?.length > 0">
             <label>Emails</label>
             <div v-for="(email, idx) in lead.emails" :key="idx" class="email-row">
-              <a :href="`mailto:${email.email}`" class="contact-link">{{ email.email }}</a>
-              <button @click="copyToClipboard(email.email)" class="copy-btn">Copy</button>
+              <div class="email-info">
+                <a :href="`mailto:${getEmailAddress(email)}`" class="contact-link">{{ getEmailAddress(email) }}</a>
+                <span v-if="getEmailDeliverability(email)" 
+                      :class="['deliverability-badge', `deliverability-${getEmailDeliverability(email).status}`]"
+                      :title="getDeliverabilityTooltip(getEmailDeliverability(email))">
+                  {{ getDeliverabilityLabel(getEmailDeliverability(email).status) }}
+                  <span v-if="getEmailDeliverability(email).score !== undefined" class="deliverability-score">
+                    ({{ getEmailDeliverability(email).score }})
+                  </span>
+                </span>
+              </div>
+              <button @click="copyToClipboard(getEmailAddress(email))" class="copy-btn">Copy</button>
             </div>
           </div>
           
@@ -162,9 +192,44 @@
             </div>
           </div>
           
-          <div class="contact-item" v-if="lead.address">
-            <label>Address</label>
-            <div>{{ lead.address }}</div>
+          <div class="contact-item" v-if="lead.address || lead.enrichment?.location">
+            <label>Location</label>
+            <div v-if="lead.enrichment?.location?.formatted">
+              <div class="location-structured">
+                <span v-if="lead.enrichment?.location?.city">{{ lead.enrichment.location.city }}</span>
+                <span v-if="lead.enrichment?.location?.state" class="location-separator">{{ lead.enrichment?.location?.city ? ', ' : '' }}{{ lead.enrichment.location.state }}</span>
+                <span v-if="lead.enrichment?.location?.country" class="location-separator">{{ (lead.enrichment?.location?.city || lead.enrichment?.location?.state) ? ', ' : '' }}{{ lead.enrichment.location.country }}</span>
+              </div>
+              <div v-if="lead.address && lead.address !== lead.enrichment?.location?.formatted" class="location-full">
+                <small>{{ lead.address }}</small>
+              </div>
+            </div>
+            <div v-else-if="lead.address">{{ lead.address }}</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Decision Makers -->
+      <section class="panel-section" v-if="lead.decisionMakers && lead.decisionMakers.length > 0">
+        <div class="section-header vertical-bar">
+          <h3>Decision Makers</h3>
+        </div>
+        <div class="section-content">
+          <div v-for="(dm, idx) in lead.decisionMakers" :key="idx" class="decision-maker-item">
+            <div class="dm-info">
+              <div class="dm-name-title">
+                <strong>{{ dm.name }}</strong>
+                <span v-if="dm.title" class="dm-title">{{ dm.title }}</span>
+              </div>
+              <div v-if="dm.email" class="dm-email">
+                <a :href="`mailto:${dm.email}`" class="contact-link">{{ dm.email }}</a>
+                <button @click="copyToClipboard(dm.email)" class="copy-btn">Copy</button>
+              </div>
+              <div v-if="dm.source" class="dm-source">
+                <span class="source-badge">Source: {{ dm.source }}</span>
+                <span v-if="dm.confidence" class="confidence-badge">Confidence: {{ Math.round(dm.confidence * 100) }}%</span>
+              </div>
+            </div>
           </div>
         </div>
       </section>
@@ -356,6 +421,53 @@ function copyToClipboard(text) {
   });
 }
 
+// Email helpers - handle both string and object formats
+function getEmailAddress(email) {
+  if (typeof email === 'string') {
+    return email;
+  }
+  return email?.email || '';
+}
+
+function getEmailDeliverability(email) {
+  if (typeof email === 'string') {
+    return null;
+  }
+  return email?.deliverability || null;
+}
+
+// Email deliverability helpers
+function getDeliverabilityLabel(status) {
+  const labels = {
+    'valid': '✓ Valid',
+    'risky': '⚠ Risky',
+    'invalid': '✗ Invalid',
+    'unknown': '? Unknown'
+  };
+  return labels[status] || 'Unknown';
+}
+
+function getDeliverabilityTooltip(deliverability) {
+  if (!deliverability) return '';
+  
+  const status = deliverability.status || 'unknown';
+  const score = deliverability.score;
+  const method = deliverability.method || 'unknown';
+  const reason = deliverability.reason || '';
+  
+  let tooltip = `Status: ${status}`;
+  if (score !== undefined) {
+    tooltip += `\nScore: ${score}/100`;
+  }
+  if (method !== 'unknown') {
+    tooltip += `\nMethod: ${method}`;
+  }
+  if (reason) {
+    tooltip += `\n${reason}`;
+  }
+  return tooltip;
+}
+
 async function generateOutreach() {
   // Handled by OutreachAssistant component
 }
@@ -398,6 +510,17 @@ function getVerificationLabel(score) {
   if (score >= 3) return 'Verified';
   if (score >= 1) return 'Partially Verified';
   return 'Unverified';
+}
+
+function formatEmployeeCount(count) {
+  if (typeof count !== 'number' || isNaN(count)) {
+    return String(count || '—');
+  }
+  try {
+    return count.toLocaleString();
+  } catch (error) {
+    return String(count);
+  }
 }
 </script>
 
@@ -618,6 +741,114 @@ function getVerificationLabel(score) {
   gap: var(--spacing-sm);
 }
 
+.decision-maker-item {
+  padding: var(--spacing-md);
+  border: var(--border-thin) solid var(--neutral-2);
+  margin-bottom: var(--spacing-sm);
+  border-radius: 4px;
+}
+
+.decision-maker-item:last-child {
+  margin-bottom: 0;
+}
+
+.dm-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-xs);
+}
+
+.dm-name-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex-wrap: wrap;
+}
+
+.dm-name-title strong {
+  font-size: 1rem;
+  color: var(--neutral-2);
+}
+
+.dm-title {
+  font-size: 0.875rem;
+  color: var(--neutral-2);
+  opacity: 0.8;
+  font-style: italic;
+}
+
+.dm-email {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-xs);
+}
+
+.dm-source {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-xs);
+  flex-wrap: wrap;
+}
+
+.source-badge,
+.confidence-badge {
+  font-size: 0.75rem;
+  padding: 2px 6px;
+  background: var(--neutral-1);
+  border: var(--border-thin) solid var(--neutral-2);
+  border-radius: 3px;
+  color: var(--neutral-2);
+  opacity: 0.7;
+}
+
+.email-info {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-sm);
+  flex: 1;
+  flex-wrap: wrap;
+}
+
+.deliverability-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  font-size: 0.7rem;
+  font-weight: var(--font-weight-semibold);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.deliverability-valid {
+  background: #d4edda;
+  color: #155724;
+  border: 1px solid #28a745;
+}
+
+.deliverability-risky {
+  background: #fff3cd;
+  color: #856404;
+  border: 1px solid #ffc107;
+}
+
+.deliverability-invalid {
+  background: #f8d7da;
+  color: #721c24;
+  border: 1px solid #dc3545;
+}
+
+.deliverability-unknown {
+  background: #e2e3e5;
+  color: #383d41;
+  border: 1px solid #6c757d;
+}
+
+.deliverability-score {
+  font-size: 0.65rem;
+  opacity: 0.8;
+}
+
 .contact-link {
   color: var(--accent);
   text-decoration: none;
@@ -796,6 +1027,48 @@ function getVerificationLabel(score) {
   color: #666;
   font-style: italic;
   line-height: 1.4;
+}
+
+.hiring-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-xs);
+  padding: var(--spacing-xs) var(--spacing-sm);
+  border-radius: 4px;
+  font-size: 0.875rem;
+  font-weight: var(--font-weight-semibold);
+}
+
+.hiring-badge.hiring-active {
+  background: #d4edda;
+  color: #155724;
+  border: var(--border-thin) solid #28a745;
+}
+
+.hiring-icon {
+  font-size: 1rem;
+}
+
+.hiring-detail {
+  font-size: 0.75rem;
+  opacity: 0.8;
+  font-weight: var(--font-weight-normal);
+}
+
+.location-structured {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+}
+
+.location-separator {
+  white-space: pre;
+}
+
+.location-full {
+  margin-top: var(--spacing-xs);
+  color: #666;
 }
 </style>
 

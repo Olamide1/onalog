@@ -169,6 +169,16 @@ export function calculateVerificationScore(lead) {
     additionalSignals += 0.2;
   }
   
+  // NEW: Email deliverability verification (bonus)
+  const hasVerifiedEmail = lead.emails && lead.emails.some(email => {
+    const deliverability = email.deliverability;
+    return deliverability && deliverability.status === 'valid' && deliverability.score >= 80;
+  });
+  if (hasVerifiedEmail) {
+    additionalSignals += 0.2; // Bonus for verified emails
+    sources.push('email_deliverability_verified');
+  }
+  
   if (additionalSignals >= 0.7) {
     score += 1;
     sources.push('additional_signals');
