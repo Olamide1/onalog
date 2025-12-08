@@ -204,30 +204,55 @@
                 <small>{{ lead.address }}</small>
               </div>
             </div>
-            <div v-else-if="lead.address">{{ lead.address }}</div>
+            <div v-else-if="lead.address">
+              {{ lead.address }}
+            </div>
           </div>
         </div>
       </section>
 
-      <!-- Decision Makers -->
-      <section class="panel-section" v-if="lead.decisionMakers && lead.decisionMakers.length > 0">
+      <!-- Decision Makers - PROMINENT SECTION -->
+      <section class="panel-section decision-makers-section" v-if="lead.decisionMakers && lead.decisionMakers.length > 0">
         <div class="section-header vertical-bar">
-          <h3>Decision Makers</h3>
+          <h3>👥 Decision Makers & Contacts ({{ lead.decisionMakers.length }})</h3>
         </div>
         <div class="section-content">
-          <div v-for="(dm, idx) in lead.decisionMakers" :key="idx" class="decision-maker-item">
+          <div v-for="(dm, idx) in lead.decisionMakers" :key="idx" class="decision-maker-item prominent">
             <div class="dm-info">
               <div class="dm-name-title">
-                <strong>{{ dm.name }}</strong>
+                <strong class="dm-name-large">{{ dm.name }}</strong>
                 <span v-if="dm.title" class="dm-title">{{ dm.title }}</span>
               </div>
-              <div v-if="dm.email" class="dm-email">
-                <a :href="`mailto:${dm.email}`" class="contact-link">{{ dm.email }}</a>
+              <div v-if="dm.email" class="dm-email prominent-email">
+                <a :href="`mailto:${dm.email}`" class="contact-link email-link-large">{{ dm.email }}</a>
                 <button @click="copyToClipboard(dm.email)" class="copy-btn">Copy</button>
+              </div>
+              <div v-else class="dm-no-email">
+                <span class="no-email-text">Email not found</span>
               </div>
               <div v-if="dm.source" class="dm-source">
                 <span class="source-badge">Source: {{ dm.source }}</span>
                 <span v-if="dm.confidence" class="confidence-badge">Confidence: {{ Math.round(dm.confidence * 100) }}%</span>
+              </div>
+            </div>
+          </div>
+          
+          <!-- LinkedIn Contacts (if available) -->
+          <div v-if="lead.enrichment?.linkedinContacts?.contacts && lead.enrichment.linkedinContacts.contacts.length > 0" class="linkedin-contacts-section">
+            <h4 class="linkedin-contacts-header">LinkedIn Suggested Contacts</h4>
+            <div v-for="(contact, idx) in lead.enrichment.linkedinContacts.contacts.slice(0, 5)" :key="idx" class="decision-maker-item">
+              <div class="dm-info">
+                <div class="dm-name-title">
+                  <strong>{{ contact.name }}</strong>
+                  <span v-if="contact.title" class="dm-title">{{ contact.title }}</span>
+                </div>
+                <div v-if="contact.suggestedEmail" class="dm-email">
+                  <a :href="`mailto:${contact.suggestedEmail}`" class="contact-link">{{ contact.suggestedEmail }}</a>
+                  <button @click="copyToClipboard(contact.suggestedEmail)" class="copy-btn">Copy</button>
+                </div>
+                <div v-if="contact.seniority" class="dm-source">
+                  <span class="source-badge">{{ contact.seniority }} • {{ contact.department || 'General' }}</span>
+                </div>
               </div>
             </div>
           </div>
@@ -522,6 +547,18 @@ function formatEmployeeCount(count) {
     return String(count);
   }
 }
+
+function formatDistance(distanceKm) {
+  if (distanceKm === null || distanceKm === undefined) return '—';
+  
+  if (distanceKm < 1) {
+    return `${Math.round(distanceKm * 1000)}m`;
+  } else if (distanceKm < 10) {
+    return `${distanceKm.toFixed(1)}km`;
+  } else {
+    return `${Math.round(distanceKm)}km`;
+  }
+}
 </script>
 
 <style scoped>
@@ -775,6 +812,77 @@ function formatEmployeeCount(count) {
   color: var(--neutral-2);
   opacity: 0.8;
   font-style: italic;
+}
+
+/* Prominent Decision Makers Section */
+.decision-makers-section {
+  background: #f8f9fa;
+  border: 2px solid var(--accent);
+  border-radius: 8px;
+}
+
+.decision-maker-item.prominent {
+  background: white;
+  border: 2px solid var(--accent);
+  padding: var(--spacing-lg);
+  margin-bottom: var(--spacing-md);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.dm-name-large {
+  font-size: 1.2rem;
+  color: var(--text-primary);
+  display: block;
+  margin-bottom: var(--spacing-xs);
+}
+
+.prominent-email {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-sm);
+  background: #e8f4f8;
+  border-radius: 4px;
+}
+
+.email-link-large {
+  font-size: 1rem;
+  font-weight: var(--font-weight-semibold);
+  color: var(--accent);
+}
+
+.dm-no-email {
+  margin-top: var(--spacing-sm);
+  padding: var(--spacing-sm);
+  background: #fff3cd;
+  border-radius: 4px;
+}
+
+.no-email-text {
+  color: #856404;
+  font-style: italic;
+}
+
+.linkedin-contacts-section {
+  margin-top: var(--spacing-lg);
+  padding-top: var(--spacing-lg);
+  border-top: 2px solid var(--neutral-2);
+}
+
+.linkedin-contacts-header {
+  font-size: 1rem;
+  font-weight: var(--font-weight-semibold);
+  margin-bottom: var(--spacing-md);
+  color: var(--text-primary);
+}
+
+.distance-badge-large {
+  display: inline-block;
+  margin-left: var(--spacing-sm);
+  padding: 4px 8px;
+  background: #e8f4f8;
+  color: #0066cc;
+  border-radius: 4px;
+  font-size: 0.875rem;
+  font-weight: var(--font-weight-semibold);
 }
 
 .dm-email {

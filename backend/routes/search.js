@@ -747,14 +747,40 @@ async function processSearch(searchId) {
     }
     
     // Deduplicate results at search level BEFORE extraction
-    // IMPORTANT: For Google search links (OSM results without websites), dedupe by business name + location
-    // For real websites, dedupe by hostname
+    // CRITICAL FIX: Handle Google Places results separately (they have "places:" prefix)
     console.log(`[PROCESS] Deduplicating ${googleResults.length} search results...`);
     const seenUrls = new Set();
     const seenBusinessNames = new Set(); // For Google search links
+    const seenPlaceIds = new Set(); // CRITICAL: Track Google Place IDs separately
     const uniqueResults = [];
     
     for (const result of googleResults) {
+      // CRITICAL FIX: Handle Google Places results first (before URL parsing)
+      if (result.link && result.link.startsWith('places:') || result.isGooglePlace) {
+        // Extract place ID from link or result
+        const placeId = result.placeId || (result.link.startsWith('places:') ? result.link.replace('places:', '').trim() : null);
+        
+        if (placeId) {
+          // Deduplicate by place ID (most reliable for Google Places)
+          if (!seenPlaceIds.has(placeId)) {
+            seenPlaceIds.add(placeId);
+            uniqueResults.push(result);
+          } else {
+            console.log(`[PROCESS] Skipping duplicate place ID: ${placeId} (${result.title})`);
+          }
+        } else {
+          // Fallback: deduplicate by business name + address if no place ID
+          const businessKey = `${result.title.toLowerCase().trim()}_${(result.snippet || result.address || '').toLowerCase().trim()}`;
+          if (!seenBusinessNames.has(businessKey)) {
+            seenBusinessNames.add(businessKey);
+            uniqueResults.push(result);
+          } else {
+            console.log(`[PROCESS] Skipping duplicate business: ${result.title} (${result.snippet || result.address})`);
+          }
+        }
+        continue; // Skip URL parsing for Places results
+      }
+      
       try {
         const url = new URL(result.link);
         const isGoogleSearchLink = url.hostname.includes('google.com') && url.pathname.includes('/search');
@@ -861,10 +887,18 @@ async function processSearch(searchId) {
         const fallbackCompanyName = result.title.split(' - ')[0] || result.title;
         const isPersonPage = result.title.includes(' - ');
         
+        // CRITICAL FIX: Detect if extractedCompanyName is a Google Place ID (starts with "ChIJ")
+        // Place IDs look like: ChIJ9TCVpbKNOxARdEJJj7-rgEE
+        const extractedIsPlaceId = extractedCompanyName && 
+          extractedCompanyName.trim().startsWith('ChIJ') && 
+          extractedCompanyName.trim().length > 20 &&
+          /^ChIJ[a-zA-Z0-9_-]+$/.test(extractedCompanyName.trim());
+        
         // Fix: If extraction returned minimal data (e.g., from failed Google search link resolution),
         // prefer the search result title over "Unknown Business" or similar generic names
         // Also prefer search result title if extracted name looks like it came from domain (e.g., "Tiktok" from tiktok.com)
-        let finalCompanyName = extractedCompanyName;
+        // CRITICAL: If extractedCompanyName is a Place ID, ignore it and use fallbackCompanyName
+        let finalCompanyName = (extractedIsPlaceId || !extractedCompanyName) ? fallbackCompanyName : extractedCompanyName;
         
         // Check if extracted name looks like it came from a domain (single word, no spaces, matches domain pattern)
         const extractedLooksLikeDomain = extractedCompanyName && 
@@ -934,6 +968,23 @@ async function processSearch(searchId) {
           return isGenericNameFromConfig(name);
         };
         
+        // CRITICAL FIX: Reject Google Place IDs as company names (they start with "ChIJ" and are 20+ chars)
+        const finalNameIsPlaceId = finalCompanyName && 
+          finalCompanyName.trim().startsWith('ChIJ') && 
+          finalCompanyName.trim().length > 20 &&
+          /^ChIJ[a-zA-Z0-9_-]+$/.test(finalCompanyName.trim());
+        
+        if (finalNameIsPlaceId) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Company name is a Google Place ID "${finalCompanyName}" - using result.title instead`);
+          // Use result.title as fallback
+          finalCompanyName = result.title.split(' - ')[0] || result.title;
+          // If result.title is also invalid, skip the lead
+          if (!finalCompanyName || finalCompanyName.trim().length < 2) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: No valid company name found (Place ID and result.title both invalid)`);
+            return;
+          }
+        }
+        
         // Fix: Check if this is a Google search link (fallback data)
         const isGoogleSearchLink = result.link && (
           result.link.includes('google.com/search') ||
@@ -972,11 +1023,29 @@ async function processSearch(searchId) {
         // These should not appear in phone store or other specific business searches
         const companyNameLower = finalCompanyName.toLowerCase();
         const titleLower = (result.title || '').toLowerCase();
+        const urlLower = (result.link || '').toLowerCase();
+        
+        // CRITICAL FIX: Reject blog posts, articles, guides immediately (before expensive AI check)
+        const isBlogPostOrArticle = 
+          /\b(how to|guide|tips|advice|starting a|launching a|getting started|learn|tutorial|article|blog|post|licenses?|permits?|requirements?|legal|steps?|process)\b/i.test(titleLower) &&
+          (/\b(restaurant|business|company|store|shop|hospital|clinic|school|university)\b/i.test(titleLower) || 
+           /\/(blog|article|post|guide|how-to|tips|advice|learn|tutorial)\//i.test(urlLower));
+        
+        if (isBlogPostOrArticle) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Blog post/article about topic, not actual business: "${finalCompanyName}" from ${result.link}`);
+          return; // Skip this result (no lock created yet)
+        }
+        
         // CRITICAL FIX: Use AI-based relevance filtering instead of hardcoded patterns
         // This dynamically checks if the lead is relevant to the search query
         const hasSpecificQuery = search.industry && search.industry.trim().length > 0;
         
-        if (hasSpecificQuery) {
+        // Always check relevance for specific queries (restaurants, hospitals, etc.)
+        // Also check if query contains business type keywords even without explicit industry
+        const queryLower = (search.query || '').toLowerCase();
+        const hasBusinessTypeInQuery = /\b(restaurant|hospital|clinic|school|university|store|shop|company|business|agency|firm)\b/i.test(queryLower);
+        
+        if (hasSpecificQuery || hasBusinessTypeInQuery) {
           try {
             const relevanceCheck = await isLeadRelevant(
               {
@@ -986,7 +1055,7 @@ async function processSearch(searchId) {
                 categorySignals: extracted.categorySignals || []
               },
               search.query,
-              search.industry
+              search.industry || search.query // Use query as industry if industry not set
             );
             
             if (!relevanceCheck.isRelevant && relevanceCheck.confidence > 0.7) {
@@ -1080,16 +1149,24 @@ async function processSearch(searchId) {
         // Fix: Never use extractedCompanyName on person pages, as it may be a person's name
         // Person pages should only use validated company names (from domain derivation or skip entirely)
         // This prevents person names from being incorrectly used as company names
-        if (extractedCompanyName && extractedCompanyName.trim().length > 0) {
-          // Only use extractedCompanyName if it's NOT a person page
+        // CRITICAL FIX: Also reject Place IDs (they start with "ChIJ" and are 20+ chars)
+        const extractedNameIsPlaceId = extractedCompanyName && 
+          extractedCompanyName.trim().startsWith('ChIJ') && 
+          extractedCompanyName.trim().length > 20 &&
+          /^ChIJ[a-zA-Z0-9_-]+$/.test(extractedCompanyName.trim());
+        
+        if (extractedCompanyName && extractedCompanyName.trim().length > 0 && !extractedNameIsPlaceId) {
+          // Only use extractedCompanyName if it's NOT a person page AND NOT a Place ID
           // On person pages, we've already validated finalCompanyName (from domain or skipped the lead)
           // Using extractedCompanyName on person pages risks using a person's name as company name
+          // Using Place IDs as company names breaks everything downstream
           if (!isPersonPage) {
             lead.companyName = extractedCompanyName;
           }
           // If it's a person page, keep the validated finalCompanyName (from domain derivation)
           // This ensures we never use person names as company names
         }
+        // If extractedCompanyName is a Place ID, finalCompanyName already uses fallbackCompanyName (from result.title)
         // Fix: Filter out social media URLs - never use them as main website
         // Try extracted website first, then original link, but reject social media URLs
         let websiteUrl = null;
@@ -1113,25 +1190,198 @@ async function processSearch(searchId) {
           }
         }
         
-        if (!websiteUrl) {
-          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  No valid website URL (both were social media), skipping lead`);
-          return; // Skip this result - no valid website
+        // CRITICAL FIX: For Google Places results, try to fetch website via Place Details API
+        // Extract place ID from link if it's in "places:PLACE_ID" format
+        let placeId = result.placeId;
+        const isPlacesLink = result.link && result.link.startsWith('places:');
+        if (!placeId && isPlacesLink) {
+          placeId = result.link.replace('places:', '').trim();
         }
         
-        // CRITICAL FIX: Reject invalid domains using centralized config
-        try {
-          const urlObj = new URL(websiteUrl);
-          const hostname = urlObj.hostname.toLowerCase();
-          if (isInvalidDomain(hostname)) {
-            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website domain "${hostname}"`);
-            return; // Skip this result - invalid domain
+        // CRITICAL: Always try Place Details for Google Places results (even if we have a website, to get phone/address)
+        // Check if we need to fetch Place Details (missing website, phone, or address)
+        const needsPlaceDetails = (!websiteUrl || websiteUrl === '' || !result.phone || !result.address) && (result.isGooglePlace || isPlacesLink) && placeId;
+        
+        if (needsPlaceDetails) {
+          try {
+            console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Fetching Place Details for: ${placeId}`);
+            const { getPlaceDetails } = await import('../services/searchProviders.js');
+            const placeDetails = await getPlaceDetails(placeId);
+            if (placeDetails) {
+              // Get website (only if it's a valid URL, not empty string)
+              if ((!websiteUrl || websiteUrl === '' || websiteUrl.trim() === '') && placeDetails.website && placeDetails.website.trim() !== '' && !isSocialMediaUrl(placeDetails.website)) {
+                websiteUrl = placeDetails.website.trim();
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found website via Place Details: ${websiteUrl}`);
+              } else if (placeDetails.website && (placeDetails.website.trim() === '' || isSocialMediaUrl(placeDetails.website))) {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Place Details returned invalid/empty website: "${placeDetails.website}"`);
+              }
+              // Also get phone if not already set
+              if (!result.phone && (placeDetails.formatted_phone_number || placeDetails.international_phone_number)) {
+                result.phone = placeDetails.formatted_phone_number || placeDetails.international_phone_number;
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found phone via Place Details: ${result.phone}`);
+              }
+              // Also get address if not already set
+              if (!result.address && placeDetails.formatted_address) {
+                result.address = placeDetails.formatted_address;
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found address via Place Details: ${result.address}`);
+              }
+            } else {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Place Details returned no data for: ${placeId}`);
+            }
+          } catch (placeDetailsError) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Place Details fetch failed: ${placeDetailsError.message}`);
           }
-        } catch (urlError) {
-          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website URL "${websiteUrl}"`);
-          return; // Skip this result - invalid URL
+        } else if ((result.isGooglePlace || isPlacesLink) && !placeId) {
+          console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Place detected but no place ID found (link: ${result.link})`);
         }
         
-        lead.website = websiteUrl;
+        // CRITICAL FIX: If still no website (or empty string, or invalid URL), use Google Custom Search API to find it
+        // This is especially important for Google Places results which often don't have websites
+        // Check AFTER Place Details, but BEFORE we give up on the website
+        // Also check if websiteUrl is a valid HTTP/HTTPS URL (not a Place ID or invalid format)
+        let hasValidWebsite = false;
+        if (websiteUrl && websiteUrl.trim() !== '') {
+          try {
+            const testUrl = new URL(websiteUrl);
+            hasValidWebsite = (testUrl.protocol === 'http:' || testUrl.protocol === 'https:') && 
+                             !isSocialMediaUrl(websiteUrl) &&
+                             !isInvalidDomain(testUrl.hostname.toLowerCase());
+          } catch (e) {
+            hasValidWebsite = false; // Invalid URL format
+          }
+        }
+        
+        const needsWebsiteSearch = !hasValidWebsite && finalCompanyName && finalCompanyName.trim().length > 2 && !finalCompanyName.startsWith('places:');
+        
+        if (needsWebsiteSearch) {
+          console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Website search needed: websiteUrl="${websiteUrl}", finalCompanyName="${finalCompanyName}", hasValidWebsite=${hasValidWebsite}`);
+          try {
+            // Try Google Custom Search API first (more reliable for finding official websites)
+            if (process.env.GOOGLE_CUSTOM_SEARCH_API_KEY && process.env.GOOGLE_CUSTOM_SEARCH_ENGINE_ID) {
+              const locationPart = search.location ? ` ${search.location}` : '';
+              const searchQuery = `"${finalCompanyName}"${locationPart} official website`.trim();
+              console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Using Google Custom Search to find website: "${searchQuery}"`);
+              
+              const { searchGoogle } = await import('../utils/googleSearchAPI.js');
+              const searchResults = await Promise.race([
+                searchGoogle(searchQuery),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))
+              ]).catch((err) => {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Custom Search error: ${err.message}`);
+                return [];
+              });
+              
+              console.log(`[PROCESS] [${i + 1}/${total}] Google Custom Search returned ${searchResults?.length || 0} results`);
+              
+              if (searchResults && searchResults.length > 0) {
+                // Prioritize results that match the company name in the title/snippet
+                const companyNameLower = finalCompanyName.toLowerCase();
+                const candidate = searchResults.find(r => {
+                  if (!r.link || isSocialMediaUrl(r.link)) return false;
+                  const titleLower = (r.title || '').toLowerCase();
+                  const snippetLower = (r.snippet || '').toLowerCase();
+                  return titleLower.includes(companyNameLower) || snippetLower.includes(companyNameLower);
+                }) || searchResults.find(r => r.link && !isSocialMediaUrl(r.link));
+                
+                if (candidate) {
+                  try {
+                    const urlObj = new URL(candidate.link);
+                    const hostname = urlObj.hostname.toLowerCase();
+                    if (!isInvalidDomain(hostname)) {
+                      websiteUrl = candidate.link;
+                      console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found website via Google Custom Search: ${websiteUrl}`);
+                    } else {
+                      console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Custom Search found invalid domain: ${hostname}`);
+                    }
+                  } catch (e) {
+                    console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Invalid URL from Google Custom Search: ${e.message}`);
+                  }
+                } else {
+                  console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Custom Search found no valid website candidates`);
+                }
+              } else {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Custom Search returned no results`);
+              }
+            } else {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Google Custom Search API not configured (missing API key or engine ID)`);
+            }
+            
+            // Fallback to internal Google search if Custom Search didn't work
+            if (!websiteUrl) {
+              const searchQuery = `${finalCompanyName} ${search.location || ''} official site`.trim();
+              console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Fallback: Attempting to resolve website via internal search: "${searchQuery}"`);
+              const { searchGoogle } = await import('../services/googleSearch.js');
+              
+              const searchResults = await Promise.race([
+                searchGoogle(searchQuery, search.country, search.location, 3),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
+              ]).catch(() => []);
+              
+              if (searchResults && searchResults.length > 0) {
+                const candidate = searchResults.find(r => r.link && !isSocialMediaUrl(r.link));
+                if (candidate) {
+                  try {
+                    const urlObj = new URL(candidate.link);
+                    const hostname = urlObj.hostname.toLowerCase();
+                    if (!isInvalidDomain(hostname)) {
+                      websiteUrl = candidate.link;
+                      console.log(`[PROCESS] [${i + 1}/${total}] ✅ Resolved website via internal search: ${websiteUrl}`);
+                    }
+                  } catch (e) {
+                    // Invalid URL, continue
+                  }
+                }
+              }
+            }
+          } catch (resolveError) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Website resolution failed: ${resolveError.message}`);
+          }
+        }
+        
+        // CRITICAL FIX: Allow leads without websites if we have quality data (name, address, phone)
+        // This is especially important for Google Places results which may not have websites
+        const hasQualityData = finalCompanyName && 
+                              finalCompanyName.trim().length > 2 &&
+                              (result.address || result.phone || extracted.address || extracted.phoneNumbers?.length > 0);
+        
+        if (!websiteUrl) {
+          if (hasQualityData) {
+            // Allow lead without website if we have good data
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  No website URL, but allowing lead with quality data (name, address/phone)`);
+            lead.website = null; // Explicitly set to null
+          } else {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: No website and insufficient quality data`);
+            return; // Skip this result - no website and no quality data
+          }
+        } else {
+          // CRITICAL FIX: Reject invalid domains using centralized config
+          try {
+            const urlObj = new URL(websiteUrl);
+            const hostname = urlObj.hostname.toLowerCase();
+            if (isInvalidDomain(hostname)) {
+              // If invalid domain but we have quality data, allow it without website
+              if (hasQualityData) {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Invalid website domain "${hostname}", but allowing lead with quality data`);
+                lead.website = null;
+              } else {
+                console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website domain "${hostname}"`);
+                return; // Skip this result - invalid domain
+              }
+            } else {
+              lead.website = websiteUrl;
+              console.log(`[PROCESS] [${i + 1}/${total}] ✅ Saved website to lead: ${websiteUrl}`);
+            }
+          } catch (urlError) {
+            // Invalid URL format - if we have quality data, allow without website
+            if (hasQualityData) {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Invalid website URL format, but allowing lead with quality data`);
+              lead.website = null;
+            } else {
+              console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Skipping lead: Invalid website URL "${websiteUrl}"`);
+              return; // Skip this result - invalid URL
+            }
+          }
+        }
         
         // Guard: first‑party vs directory classifier (check both original link and extracted website)
         // Uses dynamic pattern-based detection, not hardcoded domain lists
@@ -1168,9 +1418,66 @@ async function processSearch(searchId) {
           console.log(`[PROCESS] [${i + 1}/${total}] Classifier error (continuing): ${clsErr.message}`);
         }
         
+        // CRITICAL FIX: If we found a website (via Google Custom Search or Place Details), re-extract from it using ScraperAPI
+        // This gives us decision makers and emails that we couldn't get from the Places API
+        // BUT: Only re-extract if websiteUrl is a real URL, not a Place ID
+        const isRealWebsiteUrl = websiteUrl && 
+                                 websiteUrl.trim() !== '' &&
+                                 !websiteUrl.startsWith('places:') && 
+                                 (websiteUrl.startsWith('http://') || websiteUrl.startsWith('https://'));
+        
+        // Re-extract if:
+        // 1. We have a real website URL
+        // 2. It's a Google Place result (which typically lacks decision makers/emails) OR we just found it via Google Custom Search
+        // 3. We haven't already extracted from this website (or extracted.website is different/empty)
+        // CRITICAL: Always re-extract if we found a website and haven't extracted from it yet (especially for Google Places)
+        const shouldReExtract = isRealWebsiteUrl && 
+                               ((result.isGooglePlace || isPlacesLink) || !extracted.website) && 
+                               (!extracted.website || extracted.website !== websiteUrl);
+        
+        if (shouldReExtract) {
+          try {
+            console.log(`[PROCESS] [${i + 1}/${total}] 🔄 Re-extracting from found website: ${websiteUrl}`);
+            const reExtracted = await extractContactInfo(websiteUrl, search.country);
+            
+            // Merge re-extracted data (prioritize website data for emails/decision makers, but keep Places data for phone/address)
+            if (reExtracted) {
+              // Merge decision makers (website extraction is more reliable)
+              if (reExtracted.decisionMakers && reExtracted.decisionMakers.length > 0) {
+                extracted.decisionMakers = reExtracted.decisionMakers;
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found ${reExtracted.decisionMakers.length} decision makers from website`);
+              }
+              
+              // Merge emails (website extraction is more reliable)
+              if (reExtracted.emails && reExtracted.emails.length > 0) {
+                extracted.emails = reExtracted.emails;
+                console.log(`[PROCESS] [${i + 1}/${total}] ✅ Found ${reExtracted.emails.length} emails from website`);
+              }
+              
+              // Merge phone numbers (but prioritize Places API phone if available)
+              if (reExtracted.phoneNumbers && reExtracted.phoneNumbers.length > 0 && !result.phone) {
+                extracted.phoneNumbers = reExtracted.phoneNumbers;
+              }
+              
+              // Merge address (but prioritize Places API address if available)
+              if (reExtracted.address && !result.address) {
+                extracted.address = reExtracted.address;
+              }
+              
+              // Merge other data
+              if (reExtracted.aboutText) extracted.aboutText = reExtracted.aboutText;
+              if (reExtracted.categorySignals) extracted.categorySignals = reExtracted.categorySignals;
+              if (reExtracted.socials) extracted.socials = reExtracted.socials;
+            }
+          } catch (reExtractError) {
+            console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Re-extraction from website failed: ${reExtractError.message}`);
+          }
+        }
+        
         // If result is from Google Places API, prioritize Places data (name, phone, address)
+        // BUT preserve website-extracted decision makers and emails
         if (result.isGooglePlace) {
-          // Use Places API phone if available
+          // Use Places API phone if available (most reliable)
           if (result.phone) {
             const countryCode = search.country || null;
             const formattedPhone = formatPhone(result.phone, countryCode);
@@ -1217,13 +1524,24 @@ async function processSearch(searchId) {
         }
         
         // Filter emails - only keep valid business emails
+        // CRITICAL FIX: Ensure emails are always objects with 'email' property (not strings)
         let filteredEmails = (extracted.emails || []).filter(email => {
-          const emailStr = email.email || email;
+          const emailStr = typeof email === 'string' ? email : (email.email || email);
           // Filter out generic/non-business emails
           return !emailStr.includes('noreply') && 
                  !emailStr.includes('no-reply') &&
                  !emailStr.includes('donotreply') &&
                  !emailStr.includes('example.com');
+        }).map(email => {
+          // Normalize to object format: { email: string, source?: string, confidence?: number }
+          if (typeof email === 'string') {
+            return { email, source: 'website', confidence: 0.8 };
+          }
+          return {
+            email: email.email || email,
+            source: email.source || 'website',
+            confidence: email.confidence || 0.8
+          };
         });
         
         // NEW: Verify emails and add deliverability scores (non-blocking)
@@ -1268,23 +1586,30 @@ async function processSearch(searchId) {
           lead.emails = filteredEmails;
         }
         
-        // Filter phone numbers - only keep valid ones
-        lead.phoneNumbers = (extracted.phoneNumbers || []).filter(phone => {
-          const phoneStr = phone.phone || phone;
-          // Additional validation
-          if (!phoneStr || phoneStr.length < 10) return false;
-          // Reject obviously wrong numbers
-          if (phoneStr.match(/^[01]{8,}$/)) return false; // All 0s or 1s
-          if (phoneStr.match(/^\d{1,3}$/)) return false; // Too short
-          return true;
-        });
+        // CRITICAL FIX: Preserve phone numbers from Places API (don't overwrite with empty extracted data)
+        // Only filter/extend if we don't already have phone numbers from Places API
+        if (!lead.phoneNumbers || lead.phoneNumbers.length === 0) {
+          lead.phoneNumbers = (extracted.phoneNumbers || []).filter(phone => {
+            const phoneStr = phone.phone || phone;
+            // Additional validation
+            if (!phoneStr || phoneStr.length < 10) return false;
+            // Reject obviously wrong numbers
+            if (phoneStr.match(/^[01]{8,}$/)) return false; // All 0s or 1s
+            if (phoneStr.match(/^\d{1,3}$/)) return false; // Too short
+            return true;
+          });
+        }
         lead.whatsappLinks = extracted.whatsappLinks;
         lead.socials = extracted.socials;
-        lead.address = extracted.address;
+        // CRITICAL FIX: Preserve address from Places API (don't overwrite with null extracted data)
+        if (!lead.address) {
+          lead.address = extracted.address;
+        }
         lead.aboutText = extracted.aboutText;
         lead.categorySignals = extracted.categorySignals;
         
         // Process decision makers and generate emails
+        // CRITICAL FIX: Always initialize decisionMakers array, even if empty
         if (extracted.decisionMakers && extracted.decisionMakers.length > 0) {
           console.log(`[PROCESS] [${i + 1}/${total}] Found ${extracted.decisionMakers.length} decision makers from website`);
           
@@ -1292,22 +1617,29 @@ async function processSearch(searchId) {
           lead.decisionMakers = extracted.decisionMakers.map(dm => {
             // Will be enriched with email pattern later
             return {
-              name: dm.name,
-              title: dm.title,
-              email: null, // Will be generated during enrichment
-              source: dm.source,
-              confidence: dm.confidence
+              name: dm.name || '',
+              title: dm.title || '',
+              email: dm.email || null, // Keep email if already found
+              source: dm.source || 'website',
+              confidence: dm.confidence || 0.7
             };
           });
+        } else {
+          // CRITICAL: Always initialize as empty array so frontend can check length
+          lead.decisionMakers = [];
         }
         
         // Executive discovery (business execs) if we still have few/no names
         try {
           // Phase 2: More aggressive decision maker discovery - try even if we have some
           const siteForDiscovery = lead.website || extracted.website || result.link;
+          // CRITICAL FIX: Skip executive discovery for Google Places results without websites (can't crawl "places:" URLs)
+          const isPlacesUrl = siteForDiscovery && (siteForDiscovery.startsWith('places:') || result.isGooglePlace);
+          
           // Try discovery if we have fewer than 5 decision makers (increased from 3)
           // This ensures we get the best possible decision maker data
-          if ((!lead.decisionMakers || lead.decisionMakers.length < 5) && siteForDiscovery) {
+          // BUT: Skip if it's a Google Places URL without a real website
+          if ((!lead.decisionMakers || lead.decisionMakers.length < 5) && siteForDiscovery && !isPlacesUrl) {
             console.log(`[PROCESS] [${i + 1}/${total}] Discovering executives on ${siteForDiscovery}...`);
             try {
               const execs = await discoverExecutives(siteForDiscovery);
@@ -1337,6 +1669,26 @@ async function processSearch(searchId) {
         }
         
         lead.extractionStatus = 'extracted';
+        
+        // CRITICAL FIX: Save phone, address, emails, and decision makers BEFORE enrichment
+        // This ensures they're persisted even if enrichment fails or overwrites them
+        // Log what we're saving for debugging
+        console.log(`[PROCESS] [${i + 1}/${total}] 📊 Data to save: Phones: ${lead.phoneNumbers?.length || 0}, Emails: ${lead.emails?.length || 0}, Decision Makers: ${lead.decisionMakers?.length || 0}, Address: ${lead.address ? 'Yes' : 'No'}`);
+        
+        // Calculate distance from search location
+        try {
+          const { calculateLocationDistance } = await import('../utils/distanceCalculator.js');
+          if (search.location && (lead.address || lead.enrichment?.location?.formatted)) {
+            const companyLocation = lead.enrichment?.location?.formatted || lead.address;
+            const distance = calculateLocationDistance(search.location, companyLocation, search.country);
+            if (distance !== null) {
+              lead.distanceKm = distance;
+              console.log(`[PROCESS] [${i + 1}/${total}] Distance: ${distance}km from ${search.location}`);
+            }
+          }
+        } catch (distErr) {
+          console.log(`[PROCESS] [${i + 1}/${total}] Distance calculation error: ${distErr.message}`);
+        }
         
         // Calculate quality score
         try {
@@ -1469,6 +1821,8 @@ async function processSearch(searchId) {
             
             try {
               const enrichStartTime = Date.now();
+              console.log(`[PROCESS] [${i + 1}/${total}] 🔄 Starting enrichment for "${lead.companyName}" (website: ${lead.website || 'none'}, decisionMakers: ${lead.decisionMakers?.length || 0})`);
+              
               const enrichment = await enrichLead({
                 companyName: lead.companyName,
                 website: lead.website,
@@ -1481,25 +1835,150 @@ async function processSearch(searchId) {
               });
               const enrichDuration = Date.now() - enrichStartTime;
               
+              console.log(`[PROCESS] [${i + 1}/${total}] ✅ Enrichment completed in ${enrichDuration}ms. Decision makers from enrichment: ${enrichment?.decisionMakers?.length || 0}`);
+              
+              // CRITICAL FIX: Preserve phone, address, emails, and decision makers BEFORE setting enrichment
+              // These are set from Places API and website extraction, and should not be lost
+              const preservedPhoneNumbers = lead.phoneNumbers || [];
+              const preservedAddress = lead.address;
+              const preservedEmails = lead.emails || [];
+              const preservedDecisionMakers = lead.decisionMakers || [];
+              
               lead.enrichment = enrichment;
               
+              // CRITICAL FIX: Restore preserved data after enrichment (enrichment might have overwritten it)
+              if (preservedPhoneNumbers.length > 0) {
+                lead.phoneNumbers = preservedPhoneNumbers;
+              }
+              if (preservedAddress) {
+                lead.address = preservedAddress;
+              }
+              if (preservedEmails.length > 0) {
+                // Merge preserved emails with any new ones from enrichment (avoid duplicates)
+                const existingEmailSet = new Set(preservedEmails.map(e => {
+                  const emailStr = typeof e === 'string' ? e : e.email;
+                  return emailStr ? emailStr.toLowerCase() : null;
+                }).filter(Boolean));
+                
+                // Add any new emails from enrichment that aren't duplicates
+                const enrichmentEmails = enrichment.linkedinContacts?.contacts?.filter(c => c.email) || [];
+                for (const contact of enrichmentEmails) {
+                  if (contact.email && !existingEmailSet.has(contact.email.toLowerCase())) {
+                    preservedEmails.push({
+                      email: contact.email,
+                      source: 'linkedin',
+                      confidence: 0.7
+                    });
+                    existingEmailSet.add(contact.email.toLowerCase());
+                  }
+                }
+                lead.emails = preservedEmails;
+              }
+              
               // IMPROVED DECISION MAKER EXTRACTION: Use AI to validate and filter decision makers
-              if (enrichment.decisionMakers && enrichment.decisionMakers.length > 0) {
-                // Validate decision makers with AI to filter out noise
+              // CRITICAL FIX: Merge enrichment decision makers with existing ones (from extraction)
+              // Preserve decision makers found during extraction, add enriched ones
+              const enrichedDecisionMakers = enrichment.decisionMakers || [];
+              
+              if (enrichedDecisionMakers.length > 0 || preservedDecisionMakers.length > 0) {
+                // Merge: combine existing (from extraction) with enriched (from LinkedIn/AI)
+                const existingNames = new Set(preservedDecisionMakers.map(dm => (dm.name || '').toLowerCase()));
+                const merged = [...preservedDecisionMakers];
+                
+                // CRITICAL: Filter out generic placeholder names before adding
+                const genericNames = [
+                  'jane doe', 'john smith', 'emily johnson', 'bob johnson', 'sarah williams',
+                  'michael brown', 'david jones', 'mary wilson', 'robert taylor', 'jennifer davis',
+                  'james johnson', 'lisa anderson', 'william martinez', 'patricia thomas'
+                ];
+                
+                // Add enriched decision makers that aren't duplicates and aren't generic
+                for (const dm of enrichedDecisionMakers) {
+                  const nameKey = (dm.name || '').toLowerCase().trim();
+                  
+                  // Skip if generic name
+                  if (genericNames.some(generic => nameKey === generic)) {
+                    console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Filtered out generic decision maker: ${dm.name}`);
+                    continue;
+                  }
+                  
+                  // Skip if name is just a title (e.g., "CEO/Founder")
+                  if (nameKey.includes('/') || nameKey === (dm.title || '').toLowerCase()) {
+                    console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Filtered out title-as-name decision maker: ${dm.name}`);
+                    continue;
+                  }
+                  
+                  if (!existingNames.has(nameKey) && dm.name) {
+                    merged.push(dm);
+                    existingNames.add(nameKey);
+                  }
+                }
+                
+                // Validate merged decision makers with AI to filter out noise
+                if (merged.length > 0) {
+                  try {
+                    const { validateDecisionMakers } = await import('../utils/decisionMakerValidator.js');
+                    const validated = await validateDecisionMakers(
+                      merged,
+                      lead.companyName,
+                      lead.website
+                    );
+                    lead.decisionMakers = validated;
+                    console.log(`[PROCESS] [${i + 1}/${total}] ✅ Validated ${validated.length} decision makers (from ${merged.length} merged: ${preservedDecisionMakers.length} extracted + ${enrichedDecisionMakers.length} enriched)`);
+                  } catch (validateErr) {
+                    console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Decision maker validation failed, using merged: ${validateErr.message}`);
+                    lead.decisionMakers = merged; // Fallback to merged (without validation)
+                  }
+                } else {
+                  lead.decisionMakers = [];
+                }
+              } else {
+                // No decision makers at all
+                lead.decisionMakers = [];
+              }
+              
+              // CRITICAL: Generate emails for decision makers if we have an email pattern
+              // Even if we don't have a website, try to infer domain from company name
+              if (lead.decisionMakers && lead.decisionMakers.length > 0 && enrichment.emailPattern) {
                 try {
-                  const { validateDecisionMakers } = await import('../utils/decisionMakerValidator.js');
-                  const validated = await validateDecisionMakers(
-                    enrichment.decisionMakers,
-                    lead.companyName,
-                    lead.website
-                  );
-                  lead.decisionMakers = validated;
-                  console.log(`[PROCESS] [${i + 1}/${total}] ✅ Validated ${validated.length} decision makers (filtered from ${enrichment.decisionMakers.length})`);
-                } catch (validateErr) {
-                  console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Decision maker validation failed, using original: ${validateErr.message}`);
-                  lead.decisionMakers = enrichment.decisionMakers; // Fallback to original
+                  const { generateEmailFromName } = await import('../services/enricher.js');
+                  
+                  // Try to get domain from website, or infer from company name
+                  let domain = null;
+                  if (lead.website) {
+                    try {
+                      const urlObj = new URL(lead.website);
+                      domain = urlObj.hostname.replace('www.', '');
+                    } catch (e) {
+                      // Invalid URL, try to infer
+                    }
+                  }
+                  
+                  // If no domain, try to infer from company name (basic heuristic)
+                  if (!domain && lead.companyName) {
+                    // This is a fallback - ideally we'd have a website
+                    // For now, skip email generation if no domain
+                  }
+                  
+                  // Generate emails for decision makers without emails
+                  if (domain) {
+                    for (const dm of lead.decisionMakers) {
+                      if (!dm.email && dm.name) {
+                        const generatedEmail = generateEmailFromName(dm.name, enrichment.emailPattern, `https://${domain}`);
+                        if (generatedEmail) {
+                          dm.email = generatedEmail;
+                          console.log(`[PROCESS] [${i + 1}/${total}] ✅ Generated email for ${dm.name}: ${generatedEmail}`);
+                        }
+                      }
+                    }
+                  }
+                } catch (emailGenError) {
+                  console.log(`[PROCESS] [${i + 1}/${total}] ⚠️  Email generation failed: ${emailGenError.message}`);
                 }
               }
+              
+              // Log final data state for debugging
+              console.log(`[PROCESS] [${i + 1}/${total}] 📊 Final data: Phones: ${lead.phoneNumbers?.length || 0}, Emails: ${lead.emails?.length || 0}, Decision Makers: ${lead.decisionMakers?.length || 0} (with emails: ${lead.decisionMakers?.filter(dm => dm.email).length || 0}), Address: ${lead.address ? 'Yes' : 'No'}`);
               
               // STREAMING UPDATE: Update enriched count immediately
               const currentEnriched = await Lead.countDocuments({ 
@@ -1529,15 +2008,47 @@ async function processSearch(searchId) {
                 // refund if unusable
                 await refundCredit(searchCompanyId, search.userId, search._id, lead._id, 'refund_invalid');
               }
+              // Recalculate distance after enrichment (more accurate location data)
+              try {
+                const { calculateLocationDistance } = await import('../utils/distanceCalculator.js');
+                if (search.location && enrichment.location?.formatted) {
+                  const distance = calculateLocationDistance(search.location, enrichment.location.formatted, search.country);
+                  if (distance !== null) {
+                    lead.distanceKm = distance;
+                    console.log(`[PROCESS] [${i + 1}/${total}] Updated distance: ${distance}km from ${search.location}`);
+                  }
+                }
+              } catch (distErr) {
+                console.log(`[PROCESS] [${i + 1}/${total}] Distance recalculation error: ${distErr.message}`);
+              }
+              
               lead.enrichmentStatus = 'enriched';
+              
+              // CRITICAL FIX: Final save with all data (phone, address, emails, decision makers)
+              // This ensures everything is persisted to the database
               await lead.save();
+              
+              // Verify what was saved (for debugging)
+              const savedLead = await Lead.findById(lead._id).select('phoneNumbers emails decisionMakers address companyName');
               console.log(`[PROCESS] [${i + 1}/${total}] ✅ Enrichment complete (${enrichDuration}ms)`);
+              console.log(`[PROCESS] [${i + 1}/${total}] 💾 Saved to DB: Phones: ${savedLead?.phoneNumbers?.length || 0}, Emails: ${savedLead?.emails?.length || 0}, Decision Makers: ${savedLead?.decisionMakers?.length || 0}, Address: ${savedLead?.address ? 'Yes' : 'No'}`);
             } catch (enrichError) {
-              console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error:`, enrichError.message);
+              console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error for "${lead.companyName || 'Unknown'}":`, enrichError.message);
+              console.error(`[PROCESS] [${i + 1}/${total}] ❌ Enrichment error stack:`, enrichError.stack);
+              console.error(`[PROCESS] [${i + 1}/${total}] ❌ Lead data at failure:`, {
+                companyName: lead.companyName,
+                website: lead.website,
+                hasPhone: !!lead.phoneNumbers?.length,
+                hasEmail: !!lead.emails?.length,
+                hasDecisionMakers: !!lead.decisionMakers?.length,
+                extractionStatus: lead.extractionStatus,
+                enrichmentStatus: lead.enrichmentStatus
+              });
               if (billingEnabled() && searchCompanyId) {
                 await refundCredit(searchCompanyId, search.userId, search._id, lead._id, 'refund_error');
               }
               lead.enrichmentStatus = 'failed';
+              lead.enrichmentError = enrichError.message.substring(0, 200); // Store error message
               await lead.save();
             }
           }
@@ -1640,8 +2151,8 @@ async function processSearch(searchId) {
         }
         
         if (enrichedCount < THRESHOLD_MIN) {
-          // Wait a bit before checking again
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Check every 2 seconds
+          // Wait a bit before checking again (increased from 2s to 5s to reduce log spam)
+          await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
           console.log(`[PROCESS] ⏳ Waiting for threshold: ${enrichedCount}/${THRESHOLD_MIN} enriched...`);
         }
       }
@@ -1742,6 +2253,7 @@ async function processSearch(searchId) {
                 s.extractedCount = currentExtracted;
                 s.enrichedCount = currentEnriched;
                 s.status = 'processing_backfill'; // Ensure status is set
+                // CRITICAL FIX: Save after every lead to ensure real-time updates
                 await s.save().catch(err => {
                   console.log(`[PROCESS] ⚠️  Failed to update backfill progress: ${err.message}`);
                 });
@@ -1793,10 +2305,27 @@ async function processSearch(searchId) {
     }
     
     const totalDuration = Date.now() - startTime;
+    
+    // Get enrichment statistics
+    const enrichmentStats = await Lead.aggregate([
+      { $match: { searchId: search._id, isDuplicate: false } },
+      { $group: {
+          _id: '$enrichmentStatus',
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+    
+    const enrichedCount = enrichmentStats.find(s => s._id === 'enriched')?.count || 0;
+    const failedCount = enrichmentStats.find(s => s._id === 'failed')?.count || 0;
+    const skippedCount = enrichmentStats.find(s => s._id === 'skipped')?.count || 0;
+    const enrichingCount = enrichmentStats.find(s => s._id === 'enriching')?.count || 0;
+    
     console.log(`[PROCESS] ========================================`);
     console.log(`[PROCESS] ✅ Search processing complete!`);
     console.log(`[PROCESS] Total time: ${totalDuration}ms (${(totalDuration / 1000).toFixed(2)}s)`);
-    console.log(`[PROCESS] Results: ${uniqueResults.length} found (${googleResults.length} before dedup), ${extractedCount} extracted, ${search.enrichedCount} enriched`);
+    console.log(`[PROCESS] Results: ${uniqueResults.length} found (${googleResults.length} before dedup), ${extractedCount} extracted, ${enrichedCount} enriched`);
+    console.log(`[PROCESS] Enrichment stats: ${enrichedCount} enriched, ${failedCount} failed, ${skippedCount} skipped, ${enrichingCount} still enriching`);
     console.log(`[PROCESS] Duplicates removed: ${googleResults.length - uniqueResults.length}`);
     console.log(`[PROCESS] Errors: ${errorCount}`);
     console.log(`[PROCESS] ========================================`);

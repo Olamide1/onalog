@@ -24,7 +24,7 @@ export const useLeadsStore = defineStore('leads', () => {
     );
   });
   
-  async function createSearch(query, country, location, industry, resultCount) {
+  async function createSearch(query, country, location, industry, resultCount, maxDistance = null) {
     loading.value = true;
     error.value = null;
     
@@ -34,7 +34,8 @@ export const useLeadsStore = defineStore('leads', () => {
         country,
         location,
         industry,
-        resultCount: parseInt(resultCount)
+        resultCount: parseInt(resultCount),
+        maxDistance: maxDistance ? parseInt(maxDistance) : null
       });
       
       // If there's already a current search, move it to background

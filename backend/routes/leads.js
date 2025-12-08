@@ -42,7 +42,8 @@ router.get('/', async (req, res) => {
       limit = 50,
       minScore = 0,
       country,
-      industry
+      industry,
+      maxDistance
     } = req.query;
     
     const query = { isDuplicate: false };
@@ -80,6 +81,14 @@ router.get('/', async (req, res) => {
     
     if (industry) {
       query['enrichment.industry'] = { $regex: new RegExp(industry, 'i') };
+    }
+    
+    // Filter by maximum distance (in kilometers)
+    if (maxDistance) {
+      const maxDist = parseFloat(maxDistance);
+      if (!isNaN(maxDist) && maxDist > 0) {
+        query.distanceKm = { $lte: maxDist };
+      }
     }
     
     // Fix: MongoDB sorts null values FIRST, not last

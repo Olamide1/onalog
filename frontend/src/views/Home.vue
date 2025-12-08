@@ -238,13 +238,22 @@ async function handleSearch(searchData) {
       searchData.country,
       searchData.location || null,
       searchData.industry || null,
-      searchData.resultCount
+      searchData.resultCount,
+      searchData.maxDistance || null
     );
     
     // Pass searchId to SearchForm for template saving
     if (searchFormRef.value) {
       searchFormRef.value.setSearchId(search.searchId);
     }
+    
+    // Auto-scroll to results section when search starts
+    setTimeout(() => {
+      const resultsSection = document.querySelector('.search-status, .lead-list');
+      if (resultsSection) {
+        resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 500); // Small delay to ensure DOM is updated
     
     // Store current search ID for watchers
     currentSearchId.value = search.searchId;
@@ -257,6 +266,28 @@ async function handleSearch(searchData) {
     console.error('Search error:', error);
   }
 }
+
+// Auto-scroll to results when first leads appear
+watch(
+  () => leadsStore.filteredLeads.length,
+  (newLength, oldLength) => {
+    // Auto-scroll when first results appear (from 0 to >0)
+    if (oldLength === 0 && newLength > 0) {
+      setTimeout(() => {
+        // Try multiple selectors to find results section
+        const resultsSection = document.querySelector('.search-status') || 
+                              document.querySelector('.lead-list') ||
+                              document.querySelector('.main-content');
+        if (resultsSection) {
+          resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          console.log('[AUTO-SCROLL] Scrolled to results section');
+        } else {
+          console.log('[AUTO-SCROLL] Could not find results section to scroll to');
+        }
+      }, 500); // Increased delay to ensure DOM is fully rendered
+    }
+  }
+);
 
 // CRITICAL FIX: Watch for count changes during backfill and refetch leads
 watch(

@@ -156,6 +156,22 @@
       </div>
       <div class="filter-block">
         <label class="filter-label">
+          Max Distance
+          <span class="field-help" title="Filter results by maximum distance from search location. Leave empty to show all distances.">ℹ️</span>
+        </label>
+        <select v-model="formData.maxDistance" class="input" title="Maximum distance from search location">
+          <option :value="null">No limit</option>
+          <option :value="5">Within 5km</option>
+          <option :value="10">Within 10km</option>
+          <option :value="25">Within 25km</option>
+          <option :value="50">Within 50km</option>
+          <option :value="100">Within 100km</option>
+          <option :value="200">Within 200km</option>
+        </select>
+        <p class="helper-text">Filter by distance from search location</p>
+      </div>
+      <div class="filter-block">
+        <label class="filter-label">
           Result Count
           <span class="field-help" title="Choose how many results to retrieve. More results take longer to process and cost more credits.">ℹ️</span>
         </label>
@@ -257,6 +273,7 @@ const formData = ref({
   country: '',
   location: '',
   industry: '',
+  maxDistance: null,
   resultCount: 50
 });
 
@@ -389,6 +406,7 @@ function setSearchParams(params) {
   if (params.country !== undefined) formData.value.country = params.country;
   if (params.location !== undefined) formData.value.location = params.location;
   if (params.industry !== undefined) formData.value.industry = params.industry;
+  if (params.maxDistance !== undefined) formData.value.maxDistance = params.maxDistance;
   if (params.resultCount !== undefined) formData.value.resultCount = params.resultCount;
 }
 

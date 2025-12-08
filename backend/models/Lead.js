@@ -122,6 +122,12 @@ const leadSchema = new mongoose.Schema({
     default: null
   },
   
+  // Distance from search location (in kilometers)
+  distanceKm: {
+    type: Number,
+    default: null
+  },
+  
   // Metadata
   extractionStatus: {
     type: String,

@@ -172,7 +172,24 @@ export async function searchOverpass(query, country = null, location = null, max
     const addTourism = (v) => tagSets.push(`node['tourism'='${v}'](area.a);way['tourism'='${v}'](area.a);relation['tourism'='${v}'](area.a);`);
     const addShop = (v) => tagSets.push(`node['shop'='${v}'](area.a);way['shop'='${v}'](area.a);relation['shop'='${v}'](area.a);`);
     const addOffice = (v) => tagSets.push(`node['office'='${v}'](area.a);way['office'='${v}'](area.a);relation['office'='${v}'](area.a);`);
-    if (q.includes('bank')) addAmenity('bank');
+    
+    // GENERAL APPROACH: Use query context to determine which amenity types to search
+    // For ambiguous words like "bank", check surrounding context
+    const queryHasFoodContext = q.includes('food') || q.includes('meal') || q.includes('charity') || q.includes('nonprofit');
+    const queryHasFinancialContext = q.includes('financial') || q.includes('credit') || q.includes('savings') || q.includes('investment');
+    
+    // Only search amenity=bank if query context suggests financial (not food/charity)
+    if (q.includes('bank')) {
+      if (queryHasFoodContext) {
+        // Food bank query: search for social_facility/charity types instead
+        tagSets.push(`node['amenity'='social_facility']['social_facility'='food_bank'](area.a);way['amenity'='social_facility']['social_facility'='food_bank'](area.a);relation['amenity'='social_facility']['social_facility'='food_bank'](area.a);`);
+        tagSets.push(`node['amenity'='social_facility']['social_facility'='soup_kitchen'](area.a);way['amenity'='social_facility']['social_facility'='soup_kitchen'](area.a);relation['amenity'='social_facility']['social_facility'='soup_kitchen'](area.a);`);
+        tagSets.push(`node['social_facility'='food_bank'](area.a);way['social_facility'='food_bank'](area.a);relation['social_facility'='food_bank'](area.a);`);
+      } else if (queryHasFinancialContext || !queryHasFoodContext) {
+        // Financial bank query or ambiguous "bank" without food context: search amenity=bank
+        addAmenity('bank');
+      }
+    }
     if (q.includes('restaurant')) addAmenity('restaurant');
     if (q.includes('cafe')) addAmenity('cafe');
     if (q.includes('bar')) addAmenity('bar');
@@ -271,6 +288,51 @@ out center tags ${Math.max(10, Math.min(200, maxResults))};`;
       .filter(item => item.title && item.title.length > 2)
       .filter(item => !isOSMNodePage(item.link))
       .filter(item => !isDirectorySite(item.link));
+    
+    // GENERAL APPROACH: Filter results based on semantic mismatch detection
+    // Works for any ambiguous query, not just hardcoded "food bank"
+    const queryContextForFilter = (query || '').toLowerCase();
+    const filterHasFoodContext = queryContextForFilter.includes('food') || queryContextForFilter.includes('meal') || queryContextForFilter.includes('charity') || queryContextForFilter.includes('nonprofit');
+    const filterHasFinancialContext = queryContextForFilter.includes('financial') || queryContextForFilter.includes('credit') || queryContextForFilter.includes('savings') || queryContextForFilter.includes('investment');
+    
+    if (filterHasFoodContext || filterHasFinancialContext) {
+      const filteredResults = results.filter(item => {
+        const name = (item.title || '').toLowerCase();
+        const website = (item.link || '').toLowerCase();
+        
+        // Semantic mismatch: Query wants food/charity but result name suggests financial
+        if (filterHasFoodContext && !filterHasFinancialContext) {
+          const nameSuggestsFinancial = /\b(bank|financial|credit|savings|commercial|retail|investment|merchant|universal|microfinance)\b/i.test(name) &&
+                                       !name.includes('food') && !name.includes('foodbank') && !name.includes('charity') && !name.includes('nonprofit');
+          const websiteSuggestsFinancial = website && (website.includes('bank') || website.includes('financial')) && 
+                                          !website.includes('food') && !website.includes('charity') && !website.includes('nonprofit');
+          
+          if (nameSuggestsFinancial || websiteSuggestsFinancial) {
+            console.log(`[OVERPASS] ⚠️  Semantic mismatch: Query wants food/charity but result is financial: ${item.title}`);
+            return false;
+          }
+        }
+        
+        // Semantic mismatch: Query wants financial but result name suggests food/charity
+        if (filterHasFinancialContext && !filterHasFoodContext) {
+          const nameSuggestsFoodCharity = /\b(food|meal|charity|nonprofit|soup|kitchen|pantry)\b/i.test(name) &&
+                                         !name.includes('bank') && !name.includes('financial');
+          if (nameSuggestsFoodCharity) {
+            console.log(`[OVERPASS] ⚠️  Semantic mismatch: Query wants financial but result is food/charity: ${item.title}`);
+            return false;
+          }
+        }
+        
+        return true;
+      });
+      
+      const filteredCount = results.length - filteredResults.length;
+      if (filteredCount > 0) {
+        console.log(`[OVERPASS] ✅ Found ${filteredResults.length} results (filtered ${filteredCount} semantically mismatched)`);
+      }
+      return filteredResults.slice(0, maxResults);
+    }
+    
     console.log(`[OVERPASS] ✅ Found ${results.length} results`);
     return results.slice(0, maxResults);
   } catch (e) {
@@ -472,8 +534,14 @@ export async function searchGooglePlaces(query, country = null, location = null,
     
     console.log(`[PLACES_API] Starting search: "${query}", Country: ${country || 'none'}, Location: ${location || 'none'}, Max: ${cappedMaxResults} (API calls: ${placesApiCallCount}/${PLACES_API_DAILY_LIMIT})`);
     
-    // Build search query
+    // Build search query - quote multi-word queries to improve accuracy
+    // GENERAL APPROACH: Quote multi-word queries to preserve intent, then filter results semantically
     let searchQuery = query;
+    if (query.split(/\s+/).length > 1 && !query.match(/^["'].*["']$/)) {
+      // Quote multi-word queries to preserve phrase meaning
+      searchQuery = `"${query}"`;
+    }
+    
     if (location) {
       searchQuery += ` ${location}`;
     }
@@ -606,6 +674,12 @@ TO FIX (MOST COMMON ISSUES):
       // Filter directory sites and map results
       // Note: Google Places Text Search doesn't return website field - need Place Details for that
       // So we include all places and let the extractor resolve websites later
+      
+      // GENERAL APPROACH: Detect semantic mismatch between query intent and result type
+      // This works for ANY ambiguous query, not just hardcoded cases
+      const queryWords = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+      const queryContext = query.toLowerCase();
+      
       const pageResults = (json.results || [])
         .filter(place => {
           // Filter out directory sites if website is present (rare in Text Search results)
@@ -613,6 +687,56 @@ TO FIX (MOST COMMON ISSUES):
           if (website && isDirectorySite(website)) {
             return false;
           }
+          
+          // GENERAL SEMANTIC MISMATCH DETECTION:
+          // Check if result type contradicts query intent based on place types and name
+          const placeName = (place.name || '').toLowerCase();
+          const placeTypes = (place.types || []).map(t => t.toLowerCase());
+          const address = (place.formatted_address || place.vicinity || '').toLowerCase();
+          
+          // Extract key semantic categories from query
+          const hasFoodContext = queryContext.includes('food') || queryContext.includes('meal') || queryContext.includes('charity') || queryContext.includes('nonprofit');
+          const hasFinancialContext = queryContext.includes('financial') || queryContext.includes('credit') || queryContext.includes('savings') || queryContext.includes('investment');
+          const hasBankContext = queryContext.includes('bank') && !hasFoodContext; // "bank" alone = financial, "food bank" = charity
+          
+          // Check if place types suggest a different category than query intent
+          const placeIsFinancial = placeTypes.some(type => 
+            ['bank', 'atm', 'financial_establishment', 'finance', 'credit_union', 'insurance_agency', 'accounting'].includes(type)
+          );
+          const placeIsFoodCharity = placeTypes.some(type => 
+            type.includes('food') || type.includes('meal') || type.includes('charity') || type.includes('nonprofit') || type.includes('social_service')
+          );
+          
+          // Semantic mismatch: Query wants food/charity but result is financial
+          if (hasFoodContext && placeIsFinancial && !placeIsFoodCharity) {
+            // Only exclude if name also suggests financial (not just a false positive)
+            const nameSuggestsFinancial = /\b(bank|financial|credit|savings|commercial|retail|investment|merchant|universal|microfinance)\b/i.test(placeName) && 
+                                         !placeName.includes('food') && !placeName.includes('foodbank');
+            if (nameSuggestsFinancial) {
+              console.log(`[PLACES_API] ⚠️  Semantic mismatch: Query wants food/charity but result is financial bank: ${place.name}`);
+              return false;
+            }
+          }
+          
+          // Semantic mismatch: Query wants financial but result is food/charity
+          if (hasFinancialContext && placeIsFoodCharity && !placeIsFinancial) {
+            const nameSuggestsFoodCharity = /\b(food|meal|charity|nonprofit|soup|kitchen|pantry)\b/i.test(placeName);
+            if (nameSuggestsFoodCharity) {
+              console.log(`[PLACES_API] ⚠️  Semantic mismatch: Query wants financial but result is food/charity: ${place.name}`);
+              return false;
+            }
+          }
+          
+          // For ambiguous "bank" queries without context, prefer results that match query words
+          if (hasBankContext && !hasFoodContext && !hasFinancialContext) {
+            // If result has financial types, it's likely correct
+            // If result has food/charity types but query doesn't mention food, exclude it
+            if (placeIsFoodCharity && !placeIsFinancial && !queryContext.includes('food')) {
+              console.log(`[PLACES_API] ⚠️  Ambiguous "bank" query: Excluding food/charity result (query doesn't mention food): ${place.name}`);
+              return false;
+            }
+          }
+          
           // Include all places - website will be resolved by extractor using Place Details or LLM
           return true;
         })
@@ -653,6 +777,43 @@ TO FIX (MOST COMMON ISSUES):
   } catch (error) {
     console.error('[PLACES_API] ❌ Error:', error.message);
     throw new Error(`Google Places API failed: ${error.message}`);
+  }
+}
+
+/**
+ * Get Place Details from Google Places API (includes website field)
+ * @param {string} placeId - Google Place ID
+ * @returns {Promise<Object|null>} Place details with website, or null if error
+ */
+export async function getPlaceDetails(placeId) {
+  if (!process.env.GOOGLE_PLACES_API_KEY || !placeId) {
+    return null;
+  }
+  
+  try {
+    const apiKey = process.env.GOOGLE_PLACES_API_KEY;
+    const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${encodeURIComponent(placeId)}&fields=website,formatted_phone_number,international_phone_number,formatted_address&key=${apiKey}`;
+    
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(5000)
+    });
+    
+    if (!response.ok) {
+      console.log(`[PLACES_API] Place Details error: ${response.status}`);
+      return null;
+    }
+    
+    const data = await response.json();
+    
+    if (data.status !== 'OK') {
+      console.log(`[PLACES_API] Place Details API error: ${data.status}`);
+      return null;
+    }
+    
+    return data.result || null;
+  } catch (error) {
+    console.log(`[PLACES_API] Place Details fetch error: ${error.message}`);
+    return null;
   }
 }
 

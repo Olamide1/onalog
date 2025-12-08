@@ -186,19 +186,42 @@ function extractLocation($) {
  */
 async function suggestKeyContacts(companyData) {
   try {
+    // CRITICAL: If no real decision makers were extracted, return empty array - never invent names
+    const existingDecisionMakers = companyData.existingDecisionMakers || [];
+    if (existingDecisionMakers.length === 0) {
+      console.log('[LINKEDIN] No real decision makers found - returning empty array (no fake names)');
+      return [];
+    }
+    
     if (!openai) {
-      console.warn('[LINKEDIN] OpenAI not configured, using default contacts');
-      return generateDefaultContacts(companyData);
+      console.warn('[LINKEDIN] OpenAI not configured - returning existing decision makers as-is');
+      // Return existing decision makers formatted
+      return existingDecisionMakers.map(dm => ({
+        name: dm.name,
+        title: dm.title || 'Executive',
+        normalizedTitle: dm.title || 'Executive',
+        seniority: getSeniorityLevel(dm.title || 'Executive'),
+        department: extractDepartment(dm.title || 'Executive') || 'General',
+        relevance: 95,
+        suggestedEmail: dm.email || null,
+        linkedinSearchQuery: `${dm.name} ${companyData.companyName} LinkedIn`,
+        notes: 'Real contact extracted from company website'
+      }));
     }
     
     const prompt = buildContactSuggestionPrompt(companyData);
+    
+    // If prompt is null, it means no real decision makers - return empty
+    if (!prompt) {
+      return [];
+    }
     
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
         {
           role: 'system',
-          content: 'You are a B2B contact research assistant. Based on company information, suggest key decision makers and contacts that would be relevant for B2B outreach. Return JSON only with an array of suggested contacts.'
+          content: 'You are a contact formatter. Format existing decision makers into structured JSON. NEVER invent or create new names - only use the exact names provided.'
         },
         {
           role: 'user',
@@ -206,15 +229,44 @@ async function suggestKeyContacts(companyData) {
         }
       ],
       response_format: { type: 'json_object' },
-      temperature: 0.5
+      temperature: 0.1 // Lower temperature to ensure exact name matching
     });
     
     const result = JSON.parse(response.choices[0].message.content);
     const contacts = result.contacts || [];
     
+    // CRITICAL: Filter out generic placeholder names
+    const genericNames = [
+      'jane doe', 'john smith', 'emily johnson', 'bob johnson', 'sarah williams',
+      'michael brown', 'david jones', 'mary wilson', 'robert taylor', 'jennifer davis',
+      'james johnson', 'lisa anderson', 'william martinez', 'patricia thomas',
+      'ceo/founder', 'founder/ceo', 'owner/founder', 'business development manager',
+      'operations director', 'operations manager'
+    ];
+    
     // Validate and format contacts
-    return contacts
-      .filter(contact => contact.name && contact.title)
+    const filteredContacts = contacts
+      .filter(contact => {
+        if (!contact.name || !contact.title) return false;
+        
+        // Reject ONLY obvious generic placeholder names (exact matches)
+        const nameLower = contact.name.toLowerCase().trim();
+        if (genericNames.some(generic => nameLower === generic)) {
+          console.log(`[LINKEDIN] ⚠️  Rejected exact generic name match: ${contact.name}`);
+          return false;
+        }
+        
+        // Reject if name is exactly the same as title (e.g., "CEO/Founder" as name)
+        if (nameLower === contact.title.toLowerCase().trim()) {
+          console.log(`[LINKEDIN] ⚠️  Rejected name that's exactly the title: ${contact.name}`);
+          return false;
+        }
+        
+        // Be more lenient - allow names that contain "/" if they're not exact generic matches
+        // This allows for names like "John/CEO" which might be realistic in some contexts
+        
+        return true;
+      })
       .map(contact => {
         const normalizedTitle = normalizeJobTitle(contact.title) || contact.title;
         const seniority = getSeniorityLevel(contact.title);
@@ -234,6 +286,15 @@ async function suggestKeyContacts(companyData) {
       })
       .slice(0, 5); // Limit to top 5 contacts
     
+    // CRITICAL: If all contacts were filtered out, return empty array
+    // We should NEVER invent fake names - only use real decision makers from extraction
+    if (filteredContacts.length === 0) {
+      console.log(`[LINKEDIN] ⚠️  No real contacts found - returning empty array (no fake names)`);
+      return [];
+    }
+    
+    return filteredContacts;
+    
   } catch (error) {
     console.error('[LINKEDIN] ❌ AI contact suggestion error:', error.message);
     // Return default suggestions based on company size
@@ -245,41 +306,46 @@ async function suggestKeyContacts(companyData) {
  * Build prompt for contact suggestions
  */
 function buildContactSuggestionPrompt(companyData) {
-  const existingNames = companyData.existingDecisionMakers?.map(dm => `${dm.name} (${dm.title})`).join(', ') || 'None found';
+  const existingDecisionMakers = companyData.existingDecisionMakers || [];
+  const existingNames = existingDecisionMakers.length > 0 
+    ? existingDecisionMakers.map(dm => `${dm.name || 'Unknown'} (${dm.title || 'Unknown'})`).join(', ')
+    : 'None found';
   
-  return `Based on this company information, suggest 3-5 key decision makers and contacts that would be relevant for B2B sales outreach:
+  // CRITICAL: If we have real decision makers from extraction, ONLY return those. Never invent names.
+  if (existingDecisionMakers.length === 0) {
+    // No real decision makers found - return empty array, don't invent fake ones
+    return null; // Signal to return empty array
+  }
+  
+  return `You are a contact formatter. Format the EXISTING decision makers provided below into a structured JSON response.
 
 Company: ${companyData.companyName}
 Website: ${companyData.website || 'Not provided'}
-Industry: ${companyData.industry || 'Unknown'}
-Company Size: ${companyData.companySize || 'Unknown'}
-About: ${companyData.aboutText || 'No description'}
-${companyData.linkedinCompanyData ? `LinkedIn: ${companyData.linkedinCompanyData.employeeCount ? companyData.linkedinCompanyData.employeeCount + ' employees' : ''} in ${companyData.linkedinCompanyData.location || ''}` : ''}
-Existing Decision Makers Found: ${existingNames}
 
-IMPORTANT: If existing decision makers are listed above, prioritize using those REAL names and titles. Only suggest additional contacts if needed.
+EXISTING Decision Makers (REAL names - DO NOT change or invent):
+${existingNames}
+
+CRITICAL RULES:
+1. Return ONLY the decision makers listed above - EXACT names and titles as provided
+2. DO NOT invent, guess, or create any new names
+3. DO NOT modify the names or titles - use them exactly as provided
+4. If a name is missing or invalid, skip that contact
 
 Provide a JSON response with:
 {
   "contacts": [
     {
-      "name": "Full name (e.g., John Smith)",
-      "title": "Job title (e.g., CEO, Marketing Director, Operations Manager)",
-      "department": "Department (e.g., Sales, Marketing, Operations, Executive)",
-      "relevance": 0-100 score for how relevant this contact is for B2B outreach,
-      "suggestedEmail": "Guessed email pattern (e.g., john.smith@company.com) or null",
-      "notes": "Why this contact is relevant (1 sentence)"
+      "name": "EXACT name from list above",
+      "title": "EXACT title from list above",
+      "department": "Department based on title (e.g., Sales, Marketing, Operations, Executive)",
+      "relevance": 95,
+      "suggestedEmail": null,
+      "notes": "Real contact extracted from company website"
     }
   ]
 }
 
-Focus on:
-- Decision makers (CEO, Founder, Director, Manager)
-- People who would handle partnerships, sales, or business development
-- Contacts relevant to the company's industry and size
-- Make names realistic but generic (don't use real people's names unless certain)
-
-IMPORTANT: If you see actual names in the company data, use those real names instead of generic ones.`;
+Return ALL decision makers from the list above, using their exact names and titles.`;
 }
 
 /**

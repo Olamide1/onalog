@@ -122,9 +122,14 @@ function fallbackRelevanceCheck(leadData, searchQuery, industry) {
   ].filter(Boolean).join(' ').toLowerCase();
   
   // Basic pattern-based rejection (only for obvious cases)
+  // CRITICAL FIX: Reject blog posts, articles, guides, and informational content
   const obviousIrrelevantPatterns = [
     /domain.*marketplace|domain.*sale|hugedomains|sortlist/i,
-    /example\.com|localhost|test\.com|placeholder/i
+    /example\.com|localhost|test\.com|placeholder/i,
+    // Reject blog posts, articles, guides about the topic (not actual businesses)
+    /\b(how to|guide|tips|advice|starting a|launching a|getting started|learn|tutorial|article|blog|post)\b.*\b(restaurant|business|company|store|shop)\b/i,
+    /\b(licenses?|permits?|requirements?|legal|steps?|process)\b.*\b(restaurant|business|company|store|shop)\b/i,
+    /\b(restaurant|business|company|store|shop)\b.*\b(licenses?|permits?|requirements?|legal|guide|how to|tips)\b/i
   ];
   
   const isObviouslyIrrelevant = obviousIrrelevantPatterns.some(pattern => pattern.test(combinedText));

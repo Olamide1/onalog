@@ -154,13 +154,23 @@
             </td>
             <td class="decision-maker-cell">
               <div v-if="getPrimaryDecisionMaker(lead)" class="decision-maker-info">
-                <div class="dm-name">{{ getPrimaryDecisionMaker(lead).name }}</div>
+                <div class="dm-name"><strong>{{ getPrimaryDecisionMaker(lead).name }}</strong></div>
                 <div v-if="getPrimaryDecisionMaker(lead).title" class="dm-title">{{ getPrimaryDecisionMaker(lead).title }}</div>
-                <div v-if="getPrimaryDecisionMaker(lead).email" class="dm-email">{{ getPrimaryDecisionMaker(lead).email }}</div>
+                <div v-if="getPrimaryDecisionMaker(lead).email" class="dm-email">
+                  <a :href="`mailto:${getPrimaryDecisionMaker(lead).email}`" @click.stop class="dm-email-link">{{ getPrimaryDecisionMaker(lead).email }}</a>
+                </div>
+                <div v-if="lead.decisionMakers && lead.decisionMakers.length > 1" class="dm-count-badge">
+                  +{{ lead.decisionMakers.length - 1 }} more
+                </div>
               </div>
               <span v-else class="text-muted">—</span>
             </td>
-            <td>{{ lead.address || '—' }}</td>
+            <td>
+              <div>{{ lead.address || lead.enrichment?.location?.formatted || '—' }}</div>
+              <div v-if="lead.enrichment?.location?.formatted && lead.enrichment.location.formatted !== lead.address" class="location-enriched">
+                <small>{{ lead.enrichment.location.formatted }}</small>
+              </div>
+            </td>
             <td>
               <div class="score-cell">
                 <div v-if="lead.enrichmentStatus === 'skipped'" class="status-badge skipped">
@@ -539,6 +549,18 @@ function getEmployeeCountTooltip(lead) {
   }
   return '';
 }
+
+function formatDistance(distanceKm) {
+  if (distanceKm === null || distanceKm === undefined) return '—';
+  
+  if (distanceKm < 1) {
+    return `${Math.round(distanceKm * 1000)}m`;
+  } else if (distanceKm < 10) {
+    return `${distanceKm.toFixed(1)}km`;
+  } else {
+    return `${Math.round(distanceKm)}km`;
+  }
+}
 </script>
 
 <style scoped>
@@ -764,6 +786,39 @@ function getEmployeeCountTooltip(lead) {
   font-size: 0.85rem;
   color: var(--accent);
   word-break: break-all;
+}
+
+.dm-email-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-weight: var(--font-weight-semibold);
+}
+
+.dm-email-link:hover {
+  text-decoration: underline;
+}
+
+.dm-count-badge {
+  font-size: 0.75rem;
+  color: #666;
+  font-style: italic;
+  margin-top: 2px;
+}
+
+.location-enriched {
+  margin-top: 2px;
+  color: #666;
+}
+
+.distance-badge {
+  display: inline-block;
+  padding: 2px 6px;
+  background: #e8f4f8;
+  color: #0066cc;
+  border-radius: 3px;
+  font-size: 0.85rem;
+  font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
 }
 
 .status-badge {

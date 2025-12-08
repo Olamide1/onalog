@@ -169,7 +169,27 @@ export async function enrichLead(leadData) {
     }
     
     // Generate emails for decision makers using email pattern and normalize titles
-    const enrichedDecisionMakers = (leadData.decisionMakers || []).map(dm => {
+    // CRITICAL FIX: Merge LinkedIn contacts into decision makers
+    const allDecisionMakers = [...(leadData.decisionMakers || [])];
+    
+    // Add LinkedIn contacts as decision makers if available
+    if (linkedinContacts && linkedinContacts.contacts && Array.isArray(linkedinContacts.contacts)) {
+      const existingNames = new Set((leadData.decisionMakers || []).map(dm => (dm.name || '').toLowerCase()));
+      for (const contact of linkedinContacts.contacts) {
+        if (contact.name && !existingNames.has(contact.name.toLowerCase())) {
+          allDecisionMakers.push({
+            name: contact.name,
+            title: contact.title || contact.role || 'Executive',
+            email: contact.email || null,
+            source: 'linkedin',
+            confidence: 0.7
+          });
+          existingNames.add(contact.name.toLowerCase());
+        }
+      }
+    }
+    
+    const enrichedDecisionMakers = allDecisionMakers.map(dm => {
       if (!dm.name) return null; // Skip invalid decision makers
       
       // Normalize job title
@@ -178,7 +198,7 @@ export async function enrichLead(leadData) {
       const department = extractDepartment(dm.title);
       
       let email = dm.email || null;
-      if (enrichment.emailPattern && dm.name && !email) {
+      if (enrichment.emailPattern && dm.name && !email && leadData.website) {
         // Generate email from name + pattern
         email = generateEmailFromName(dm.name, enrichment.emailPattern, leadData.website);
       }
@@ -190,7 +210,7 @@ export async function enrichLead(leadData) {
         seniority: seniority,
         department: department,
         email: email,
-        source: dm.source === 'website' ? 'website' : 'ai_inferred',
+        source: dm.source || 'ai_inferred',
         confidence: dm.confidence || 0.75
       };
     }).filter(dm => dm !== null); // Remove null entries
@@ -244,7 +264,7 @@ export async function enrichLead(leadData) {
 /**
  * Generate email address from name and email pattern
  */
-function generateEmailFromName(name, emailPattern, website) {
+export function generateEmailFromName(name, emailPattern, website) {
   if (!name || !emailPattern || !website) return null;
   
   try {

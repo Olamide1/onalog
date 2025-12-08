@@ -38,8 +38,9 @@ export async function extractContactInfo(url, defaultCountry = null) {
   // Handle Google Places results (marked with "places:" prefix) - skip slow website resolution
   if (url && url.startsWith('places:')) {
     console.log(`[EXTRACT] ℹ️  Google Places result - using provided data directly (no website resolution needed)`);
-    // Extract business name from the placeholder URL
-    const businessName = url.replace('places:', '').trim();
+    // CRITICAL FIX: Return null for companyName - let search.js use result.title instead
+    // The "places:" URL contains a Place ID, not a company name
+    // The actual company name comes from result.title in the search results
     
     // Return minimal data - the search route will merge this with Places API data (name, address, phone)
     return {
@@ -49,7 +50,7 @@ export async function extractContactInfo(url, defaultCountry = null) {
       address: null, // Will be set from Places API data in search.js
       aboutText: '',
       categorySignals: [],
-      companyName: businessName,
+      companyName: null, // CRITICAL FIX: Return null so search.js uses result.title instead of Place ID
       website: null, // No website available from Places Text Search
       decisionMakers: []
     };
@@ -70,21 +71,21 @@ export async function extractContactInfo(url, defaultCountry = null) {
         new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
       ]).catch(() => null); // Return null on timeout instead of throwing
       
-      if (resolved) {
+    if (resolved) {
         const invalidDomains = ['example.com', 'localhost', '127.0.0.1', '0.0.0.0', 'test.com', 'placeholder.com', 'domain.com', 'website.com', 'site.com'];
-        try {
-          const resolvedUrl = new URL(resolved);
-          const hostname = resolvedUrl.hostname.toLowerCase();
-          
+      try {
+        const resolvedUrl = new URL(resolved);
+        const hostname = resolvedUrl.hostname.toLowerCase();
+        
           if (!invalidDomains.some(domain => hostname === domain || hostname.endsWith('.' + domain))) {
-            console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
-            try {
-              return await extractContactInfo(resolved, defaultCountry);
-            } catch (e) {
+          console.log(`[EXTRACT] 🔗 Resolved website: ${resolved}`);
+          try {
+            return await extractContactInfo(resolved, defaultCountry);
+          } catch (e) {
               console.log(`[EXTRACT] ⚠️  Resolution extract failed: ${e.message}`);
-            }
           }
-        } catch (urlError) {
+        }
+      } catch (urlError) {
           // Invalid URL, fall through
         }
       }
@@ -130,6 +131,23 @@ export async function extractContactInfo(url, defaultCountry = null) {
     const timeoutId = setTimeout(() => controller.abort(), 20000); // Increased timeout to 20s
     
     console.log(`[EXTRACT] Fetching page...`);
+    let html;
+    let useScraperAPI = false;
+    
+    // ENHANCED: Try ScraperAPI first if available (better success rate, handles JS rendering)
+    try {
+      const { scrapeWithScraperAPI } = await import('../utils/scraperAPI.js');
+      html = await scrapeWithScraperAPI(url, { render: false });
+      useScraperAPI = true;
+      console.log(`[EXTRACT] ✅ Fetched via ScraperAPI`);
+    } catch (scraperAPIError) {
+      // Fallback to regular fetch if ScraperAPI fails or not configured
+      console.log(`[EXTRACT] ScraperAPI not available, using regular fetch: ${scraperAPIError.message}`);
+      useScraperAPI = false;
+    }
+    
+    // If ScraperAPI didn't work, use regular fetch
+    if (!useScraperAPI) {
     let response;
     try {
       response = await fetch(url, {
@@ -144,29 +162,6 @@ export async function extractContactInfo(url, defaultCountry = null) {
         signal: controller.signal,
         redirect: 'follow'
       });
-    } catch (fetchError) {
-      // Handle network errors (DNS, connection refused, timeout, etc.)
-      clearTimeout(timeoutId);
-      console.log(`[EXTRACT] ⚠️  Network error: ${fetchError.message} - Will use available data from search results.`);
-      let companyName = 'Unknown Company';
-      try {
-        const domain = new URL(url).hostname.replace('www.', '');
-        companyName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
-      } catch (e) {
-        // Keep default
-      }
-      return {
-        emails: [],
-        phoneNumbers: [],
-        socials: {},
-        address: null,
-        aboutText: '',
-        categorySignals: [],
-        companyName: companyName,
-        website: url,
-        decisionMakers: []
-      };
-    }
     
     clearTimeout(timeoutId);
     
@@ -181,71 +176,9 @@ export async function extractContactInfo(url, defaultCountry = null) {
           const domain = u.hostname.replace('www.', '');
           const baseName = domain.split('.')[0];
           companyName = baseName.charAt(0).toUpperCase() + baseName.slice(1);
-          // Special handling for TripAdvisor-like paths: extract venue name from URL
-          if (/tripadvisor\./i.test(domain)) {
-            const m = decodeURIComponent(u.pathname).match(/Reviews?-.*?([A-Za-z0-9_]+(?:_[A-Za-z0-9_]+){0,6})/i);
-            if (m && m[1]) {
-              const pretty = m[1].replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
-              if (pretty.length > 2) companyName = pretty;
-            }
-          }
         } catch (e) {
           // Keep default
         }
-        // Attempt to resolve first‑party quickly using the derived name
-        // Fix: Don't resolve for very short names (like "Ng" from ng.africabz.com)
-        // These are often country codes or abbreviations that will resolve incorrectly
-        let resolved = null;
-        try {
-          // Only attempt resolution if company name is meaningful (at least 3 characters, not just abbreviations)
-          if (companyName && 
-              companyName !== 'Unknown Company' && 
-              companyName.length >= 3 &&
-              !/^[A-Z]{1,2}$/.test(companyName)) { // Reject single/double letter abbreviations
-            const resolveQuery = `${companyName} official site`;
-            resolved = await resolveWebsiteFromQuery(resolveQuery);
-            
-            // Fix: Validate that resolved website makes sense for the original URL context
-            // Reject if resolved domain doesn't match the business context (e.g., nationalguard.mil for a grocery store)
-            if (resolved) {
-              try {
-                const resolvedHost = new URL(resolved).hostname.toLowerCase();
-                const originalHost = new URL(url).hostname.toLowerCase();
-                
-                // If resolved domain is completely unrelated (e.g., .mil, .gov for a business search),
-                // or if it's a known incorrect resolution pattern, reject it
-                const invalidPatterns = [
-                  /\.mil$/,  // Military domains
-                  /\.gov$/,  // Government domains
-                  /nationalguard/i,  // National Guard specifically
-                  /army\.mil/i,
-                  /navy\.mil/i
-                ];
-                
-                // Check if resolved domain matches invalid patterns
-                const isInvalid = invalidPatterns.some(pattern => pattern.test(resolvedHost));
-                
-                // Also check if resolved domain shares any meaningful part with original
-                // (e.g., "ng.africabz.com" should not resolve to "nationalguard.mil")
-                const originalParts = originalHost.split('.').filter(p => p.length > 2); // Meaningful parts
-                const resolvedParts = resolvedHost.split('.').filter(p => p.length > 2);
-                const hasCommonPart = originalParts.some(op => 
-                  resolvedParts.some(rp => rp.includes(op) || op.includes(rp))
-                );
-                
-                if (isInvalid || (!hasCommonPart && originalParts.length > 0)) {
-                  console.log(`[EXTRACT] ⚠️  Rejected invalid website resolution: ${resolved} (doesn't match context: ${url})`);
-                  resolved = null;
-                }
-              } catch (validationError) {
-                // If validation fails, err on the side of caution and reject
-                console.log(`[EXTRACT] ⚠️  Could not validate resolved website, rejecting: ${resolved}`);
-                resolved = null;
-              }
-            }
-          }
-        } catch (_) {}
-        // Return minimal data - prefer resolved site if found, but only if it's valid
         return {
           emails: [],
           phoneNumbers: [],
@@ -254,12 +187,19 @@ export async function extractContactInfo(url, defaultCountry = null) {
           aboutText: '',
           categorySignals: [],
           companyName: companyName,
-          website: resolved || url,
+              website: url,
           decisionMakers: []
         };
       }
-      // Handle other HTTP errors (404, 500, etc.)
-      console.log(`[EXTRACT] ⚠️  HTTP ${response.status}: ${response.statusText} - Will use available data from search results.`);
+          // Handle other HTTP errors
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+        
+        html = await response.text();
+      } catch (fetchError) {
+        // Handle network errors (DNS, connection refused, timeout, etc.)
+        clearTimeout(timeoutId);
+        console.log(`[EXTRACT] ⚠️  Network error: ${fetchError.message} - Will use available data from search results.`);
       let companyName = 'Unknown Company';
       try {
         const domain = new URL(url).hostname.replace('www.', '');
@@ -278,10 +218,10 @@ export async function extractContactInfo(url, defaultCountry = null) {
         website: url,
         decisionMakers: []
       };
+      }
     }
     
-    console.log(`[EXTRACT] ✅ Page fetched (${response.status}), parsing HTML...`);
-    const html = await response.text();
+    console.log(`[EXTRACT] ✅ Page fetched, parsing HTML...`);
     const $ = cheerio.load(html);
     
     // Extract emails (enhanced - handles obfuscation, contact forms, data attributes, meta tags)
@@ -372,8 +312,222 @@ export async function extractContactInfo(url, defaultCountry = null) {
     
     // Extract decision makers from About Us / Team pages
     console.log(`[EXTRACT] Extracting decision makers...`);
-    const decisionMakers = extractDecisionMakers($, url);
-    console.log(`[EXTRACT] Found ${decisionMakers.length} decision makers`);
+    let decisionMakers = extractDecisionMakers($, url);
+    console.log(`[EXTRACT] Found ${decisionMakers.length} decision makers from main page`);
+    
+    // ENHANCED: Multi-page crawling for more decision makers
+    if (decisionMakers.length < 5 && website) {
+      try {
+        const { crawlTeamPages } = await import('../utils/multiPageCrawler.js');
+        const additionalDMs = await crawlTeamPages(website, html, extractDecisionMakers, 5);
+        
+        // Merge additional decision makers (avoid duplicates)
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        for (const dm of additionalDMs) {
+          const key = `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`;
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key);
+            decisionMakers.push(dm);
+          }
+        }
+        
+        console.log(`[EXTRACT] ✅ Total decision makers after multi-page crawl: ${decisionMakers.length}`);
+      } catch (crawlError) {
+        console.log(`[EXTRACT] ⚠️  Multi-page crawl failed: ${crawlError.message}`);
+      }
+    }
+    
+    // ENHANCED: Use Google and Bing search to find additional decision makers (if we have few)
+    if (decisionMakers.length < 5 && companyName && website) {
+      try {
+        const { searchDecisionMakers: searchGoogleDMs } = await import('../utils/googleSearchAPI.js');
+        const { searchDecisionMakers: searchBingDMs } = await import('../utils/bingSearchAPI.js');
+        const { extractDomain } = await import('../utils/emailPatternDiscovery.js');
+        const domain = extractDomain(website);
+        
+        // Search both APIs in parallel
+        const [googleResults, bingResults] = await Promise.allSettled([
+          searchGoogleDMs(companyName, domain),
+          searchBingDMs(companyName, domain)
+        ]);
+        
+        // Merge results
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        
+        // CRITICAL FIX: Pre-filter invalid names (departments, metadata) before adding
+        const isValidPersonName = (name) => {
+          if (!name || typeof name !== 'string') return false;
+          const trimmed = name.trim();
+          if (trimmed.length < 3 || trimmed.length > 50) return false;
+          
+          // Reject department/role names
+          const departmentPatterns = [
+            /^(retail|corporate|business|commercial|investment|private|wealth|asset|credit|risk|compliance|operations|human|marketing|sales|technology|digital|innovation|strategy|finance|accounting|legal|admin|administrative|customer|client|service|support|product|development|engineering|research|quality|supply|chain|logistics|procurement|sourcing|vendor|partner|alliance|channel|distribution|wholesale|e-commerce|online|mobile|platform|infrastructure|security|information|data|analytics|business intelligence|insights|reporting|audit|internal|external|public|government|regulatory|affairs|relations|communications|media|brand|creative|design|content|editorial|publishing|education|training|learning|talent|recruitment|hr|people|culture|diversity|inclusion|sustainability|environmental|social|responsibility|governance|ethics|compliance|risk|legal|regulatory|tax|treasury|investor|shareholder|stakeholder|community|foundation|charity|non-profit|ngo|public sector|government|municipal|federal|state|local|regional|global|international|emerging|markets|africa|asia|europe|americas|middle east|north|south|east|west|central|northern|southern|eastern|western|central|apac|emea|latam|na)\s+(banking|bank|capital|markets|trading|sales|trading|research|analytics|intelligence|insights|reporting|operations|technology|digital|innovation|strategy|finance|accounting|legal|admin|administrative|customer|client|service|support|product|development|engineering|research|quality|supply|chain|logistics|procurement|sourcing|vendor|partner|alliance|channel|distribution|wholesale|e-commerce|online|mobile|platform|infrastructure|security|information|data|analytics|business intelligence|insights|reporting|audit|internal|external|public|government|regulatory|affairs|relations|communications|media|brand|creative|design|content|editorial|publishing|education|training|learning|talent|recruitment|hr|people|culture|diversity|inclusion|sustainability|environmental|social|responsibility|governance|ethics|compliance|risk|legal|regulatory|tax|treasury|investor|shareholder|stakeholder|community|foundation|charity|non-profit|ngo|public sector|government|municipal|federal|state|local|regional|global|international|emerging|markets|africa|asia|europe|americas|middle east|north|south|east|west|central|northern|southern|eastern|western|central|apac|emea|latam|na)$/i,
+            /^(wikidata|wikipedia|metadata|data|info|information|details|summary|overview|description|about|contact|team|staff|employees|people|personnel|workforce|talent|human|capital|resources|hr|recruitment|hiring|onboarding|training|development|learning|education|skills|competencies|capabilities|expertise|knowledge|experience|background|qualifications|credentials|certifications|licenses|permits|authorizations|approvals|clearances|security|clearance|background|check|verification|validation|authentication|authorization|access|permissions|privileges|rights|roles|responsibilities|duties|functions|tasks|activities|actions|operations|processes|procedures|policies|guidelines|standards|rules|regulations|laws|statutes|ordinances|codes|requirements|specifications|criteria|conditions|terms|provisions|clauses|sections|articles|paragraphs|subsections|subparagraphs|items|points|bullet|points|list|items|elements|components|parts|pieces|segments|sections|divisions|departments|units|groups|teams|squads|crews|staffs|personnel|workforces|workforces|talent|pools|pools|of|talent|human|resources|hr|departments|divisions|units|groups|teams|squads|crews|staffs|personnel|workforces|talent|pools|pools|of|talent|human|resources|hr)$/i,
+            /^(and|or|the|a|an|of|in|on|at|to|for|with|by|from|as|is|was|are|were|be|been|being|have|has|had|do|does|did|will|would|should|could|may|might|must|can)$/i,
+            /^(co|and co|founded by|founder or|co-founder|cofounder)$/i
+          ];
+          if (departmentPatterns.some(pattern => pattern.test(trimmed))) return false;
+          
+          // Must match proper name pattern
+          const properNamePattern = /^[A-Z][a-z]{2,}\s+[A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+)*$/;
+          if (!properNamePattern.test(trimmed)) return false;
+          
+          const words = trimmed.split(/\s+/);
+          if (words.length < 2) return false;
+          if (!words.every(word => /^[A-Z][a-z]{1,}$/.test(word))) return false;
+          
+          return true;
+        };
+        
+        const addDecisionMakers = (results, source) => {
+          if (results.status === 'fulfilled' && results.value) {
+            for (const dm of results.value) {
+              // CRITICAL FIX: Pre-filter invalid names before adding
+              if (!dm.name || !dm.title || !isValidPersonName(dm.name)) {
+                continue; // Skip invalid names
+              }
+              
+              const key = `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`;
+              if (!existingKeys.has(key)) {
+                existingKeys.add(key);
+                decisionMakers.push({
+                  name: dm.name,
+                  title: dm.title,
+                  email: dm.email || null,
+                  source: source,
+                  confidence: dm.confidence || 0.7
+                });
+              }
+            }
+          }
+        };
+        
+        addDecisionMakers(googleResults, 'google_search');
+        addDecisionMakers(bingResults, 'bing_search');
+        
+        if (googleResults.status === 'fulfilled' || bingResults.status === 'fulfilled') {
+          console.log(`[EXTRACT] ✅ Total decision makers after search APIs: ${decisionMakers.length}`);
+        }
+      } catch (searchError) {
+        console.log(`[EXTRACT] ⚠️  Search API integration failed: ${searchError.message}`);
+      }
+    }
+    
+    // ENHANCED: Extract from press releases and news articles
+    if (decisionMakers.length < 5 && html) {
+      try {
+        const { extractFromPressReleases } = await import('../utils/pressReleaseAnalyzer.js');
+        const pressDMs = extractFromPressReleases(html, companyName);
+        
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        for (const dm of pressDMs) {
+          const key = `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`;
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key);
+            decisionMakers.push(dm);
+          }
+        }
+        
+        if (pressDMs.length > 0) {
+          console.log(`[EXTRACT] ✅ Found ${pressDMs.length} decision makers from press releases/news`);
+        }
+      } catch (pressError) {
+        console.log(`[EXTRACT] ⚠️  Press release analysis failed: ${pressError.message}`);
+      }
+    }
+    
+    // ENHANCED: Parse email signatures if we have emails
+    if (decisionMakers.length < 5 && emails.length > 0) {
+      try {
+        const { parseEmailSignature } = await import('../utils/emailSignatureParser.js');
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        
+        for (const emailObj of emails.slice(0, 5)) {
+          const emailStr = typeof emailObj === 'string' ? emailObj : emailObj.email;
+          if (emailStr) {
+            // Try to find email body in HTML (if available)
+            const emailLink = $(`a[href^="mailto:${emailStr}"]`);
+            if (emailLink.length > 0) {
+              const parentText = emailLink.parent().text();
+              const signature = parseEmailSignature(parentText, emailStr);
+              
+              if (signature && signature.name) {
+                const key = `${signature.name.toLowerCase()}-${(signature.title || '').toLowerCase()}`;
+                if (!existingKeys.has(key)) {
+                  existingKeys.add(key);
+                  decisionMakers.push(signature);
+                }
+              }
+            }
+          }
+        }
+      } catch (sigError) {
+        console.log(`[EXTRACT] ⚠️  Email signature parsing failed: ${sigError.message}`);
+      }
+    }
+    
+    // ENHANCED: Try OpenCorporates API for registered companies
+    if (decisionMakers.length < 5 && companyName) {
+      try {
+        const { searchOpenCorporates } = await import('../utils/openCorporatesAPI.js');
+        const openCorpDMs = await searchOpenCorporates(companyName);
+        
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        for (const dm of openCorpDMs) {
+          const key = `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`;
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key);
+            decisionMakers.push(dm);
+          }
+        }
+        
+        if (openCorpDMs.length > 0) {
+          console.log(`[EXTRACT] ✅ Found ${openCorpDMs.length} decision makers from OpenCorporates`);
+        }
+      } catch (ocError) {
+        console.log(`[EXTRACT] ⚠️  OpenCorporates search failed: ${ocError.message}`);
+      }
+    }
+    
+    // ENHANCED: Try Wikipedia extraction
+    if (decisionMakers.length < 5 && companyName) {
+      try {
+        const { extractFromWikipedia } = await import('../utils/wikipediaExtractor.js');
+        const wikiDMs = await extractFromWikipedia(companyName);
+        
+        const existingKeys = new Set(decisionMakers.map(dm => `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`));
+        for (const dm of wikiDMs) {
+          const key = `${dm.name?.toLowerCase()}-${dm.title?.toLowerCase()}`;
+          if (!existingKeys.has(key)) {
+            existingKeys.add(key);
+            decisionMakers.push(dm);
+          }
+        }
+        
+        if (wikiDMs.length > 0) {
+          console.log(`[EXTRACT] ✅ Found ${wikiDMs.length} decision makers from Wikipedia`);
+        }
+      } catch (wikiError) {
+        console.log(`[EXTRACT] ⚠️  Wikipedia extraction failed: ${wikiError.message}`);
+      }
+    }
+    
+    // ENHANCED: Use sitemap to discover more team pages
+    if (decisionMakers.length < 5 && website) {
+      try {
+        const { findTeamPagesFromSitemap } = await import('../utils/sitemapCrawler.js');
+        const teamPages = await findTeamPagesFromSitemap(website);
+        
+        if (teamPages.length > 0) {
+          console.log(`[EXTRACT] ✅ Found ${teamPages.length} team pages from sitemap`);
+          // Note: These pages will be crawled by multiPageCrawler if needed
+          // We just log them here for now
+        }
+      } catch (sitemapError) {
+        console.log(`[EXTRACT] ⚠️  Sitemap discovery failed: ${sitemapError.message}`);
+      }
+    }
     
     // Debug: Log if no decision makers found to help diagnose issues
     if (decisionMakers.length === 0) {
@@ -382,17 +536,89 @@ export async function extractContactInfo(url, defaultCountry = null) {
       console.log(`[EXTRACT] ⚠️  No decision makers found. Has team selectors: ${hasTeamSelectors}, Is about page: ${hasAboutPage}, HTML length: ${html.length}`);
     }
     
+    // ENHANCED: Discover email pattern and generate emails for decision makers
+    let emailPattern = null;
+    if (emails.length >= 2 && website) {
+      try {
+        const { discoverEmailPattern, extractDomain } = await import('../utils/emailPatternDiscovery.js');
+        const domain = extractDomain(website);
+        if (domain) {
+          const emailList = emails.map(e => typeof e === 'string' ? e : e.email).filter(Boolean);
+          emailPattern = discoverEmailPattern(emailList, domain);
+          if (emailPattern) {
+            console.log(`[EXTRACT] ✅ Discovered email pattern: ${emailPattern.format} (confidence: ${emailPattern.confidence.toFixed(2)})`);
+          }
+        }
+      } catch (patternError) {
+        console.log(`[EXTRACT] ⚠️  Email pattern discovery failed: ${patternError.message}`);
+      }
+    }
+    
+    // Generate emails for decision makers using discovered pattern
+    if (emailPattern && website) {
+      try {
+        const { generateEmailFromPattern, extractDomain } = await import('../utils/emailPatternDiscovery.js');
+        const domain = extractDomain(website);
+        
+        for (const dm of decisionMakers) {
+          if (!dm.email && dm.name && domain) {
+            const generatedEmail = generateEmailFromPattern(dm.name, emailPattern, domain);
+            if (generatedEmail) {
+              dm.email = generatedEmail;
+              dm.emailSource = 'pattern_generated';
+              dm.emailConfidence = emailPattern.confidence * 0.8; // Slightly lower confidence for generated emails
+            }
+          }
+        }
+      } catch (genError) {
+        console.log(`[EXTRACT] ⚠️  Email generation failed: ${genError.message}`);
+      }
+    }
+    
+    // ENHANCED: Use TheHarvester to find additional emails for decision makers (limited to top 3 to save API calls)
+    if (decisionMakers.length > 0 && website) {
+      try {
+        const { searchEmails } = await import('../utils/theHarvester.js');
+        const { extractDomain } = await import('../utils/emailPatternDiscovery.js');
+        const domain = extractDomain(website);
+        
+        // Search for emails for top 3 decision makers (to avoid too many API calls)
+        for (const dm of decisionMakers.slice(0, 3)) {
+          if (!dm.email && dm.name && domain) {
+            try {
+              const foundEmails = await searchEmails(dm.name, domain);
+              if (foundEmails.length > 0) {
+                // Use the first email found
+                dm.email = foundEmails[0];
+                dm.emailSource = 'theharvester';
+                dm.emailConfidence = 0.75;
+                console.log(`[EXTRACT] ✅ Found email for ${dm.name} via TheHarvester: ${foundEmails[0]}`);
+              }
+            } catch (searchError) {
+              console.log(`[EXTRACT] ⚠️  TheHarvester search failed for ${dm.name}: ${searchError.message}`);
+            }
+          }
+        }
+      } catch (harvesterError) {
+        console.log(`[EXTRACT] ⚠️  TheHarvester integration failed: ${harvesterError.message}`);
+      }
+    }
+    
     // Extract emails from decision makers and merge with main emails list
     const dmEmails = decisionMakers
       .filter(dm => dm.email && dm.email.includes('@'))
       .map(dm => ({
         email: dm.email.toLowerCase(),
-        source: 'decision_maker',
-        confidence: 0.9 // Higher confidence for decision maker emails
+        source: dm.emailSource || 'decision_maker',
+        confidence: dm.emailConfidence || 0.9 // Higher confidence for decision maker emails
       }));
     
     // Merge decision maker emails with main emails (avoid duplicates)
-    const existingEmails = new Set(emails.map(e => e.email.toLowerCase()));
+    const existingEmails = new Set(emails.map(e => {
+      const emailStr = typeof e === 'string' ? e : e.email;
+      return emailStr?.toLowerCase();
+    }).filter(Boolean));
+    
     dmEmails.forEach(dmEmail => {
       if (!existingEmails.has(dmEmail.email)) {
         emails.push(dmEmail);
@@ -547,21 +773,21 @@ async function resolveWebsiteFromQuery(query) {
     // Only try SearxNG if we have candidates - skip if empty (means it's rate-limited)
     if (searxCandidates.length > 0) {
       for (const base of searxCandidates.slice(0, 2)) { // Only try first 2 to avoid delays
-        try {
+      try {
           const controller = new AbortController();
           const timeoutId = setTimeout(() => controller.abort(), 5000); // Short 5s timeout
           
-          const endpoint = `${base.replace(/\/+$/, '')}/search?format=json&q=${encodeURIComponent(query)}&categories=general`;
+        const endpoint = `${base.replace(/\/+$/, '')}/search?format=json&q=${encodeURIComponent(query)}&categories=general`;
           const res = await fetch(endpoint, { 
             headers: { 'Accept': 'application/json','User-Agent': 'Onalog/1.0' },
             signal: controller.signal
           });
           clearTimeout(timeoutId);
           
-          if (res.ok) {
-            const json = await res.json();
-            const results = (json.results || []).filter(r => r.url && r.title);
-            let candidate = results.find(r => r.url.startsWith('http') && !isDirectoryDomain(r.url));
+        if (res.ok) {
+          const json = await res.json();
+          const results = (json.results || []).filter(r => r.url && r.title);
+          let candidate = results.find(r => r.url.startsWith('http') && !isDirectoryDomain(r.url));
             if (candidate) return candidate.url;
           }
         } catch (e) {
@@ -577,22 +803,22 @@ async function resolveWebsiteFromQuery(query) {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000); // 8s timeout
       
-      const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
+    const ddgUrl = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}`;
       const ddgRes = await fetch(ddgUrl, { 
         headers: { 'User-Agent': 'Onalog/1.0', 'Accept': 'text/html' },
         signal: controller.signal
       });
       clearTimeout(timeoutId);
       
-      if (ddgRes.ok) {
-        const html = await ddgRes.text();
-        const match = html.match(/uddg=([^&"]+)/);
-        if (match) {
-          const decoded = decodeURIComponent(match[1]);
-          if (decoded.startsWith('http') && !isDirectoryDomain(decoded)) {
-            return decoded;
-          }
+    if (ddgRes.ok) {
+      const html = await ddgRes.text();
+      const match = html.match(/uddg=([^&"]+)/);
+      if (match) {
+        const decoded = decodeURIComponent(match[1]);
+        if (decoded.startsWith('http') && !isDirectoryDomain(decoded)) {
+          return decoded;
         }
+      }
       }
     } catch (e) {
       // DuckDuckGo failed or timed out - continue to LLM
@@ -1679,15 +1905,54 @@ function extractDecisionMakers($, baseUrl) {
             const name = founder.name || (founder['@type'] === 'Person' ? founder.name : null);
             if (name && isValidPersonName(name)) {
               const key = name.toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+            decisionMakers.push({
+              name: name,
+                  title: founder.jobTitle || 'Founder',
+                  source: 'structured_data',
+                  confidence: 0.95
+            });
+          }
+        }
+      }
+        }
+        
+        // Organization employee
+        if (item['@type'] === 'Organization' && item.employee) {
+          const employees = Array.isArray(item.employee) ? item.employee : [item.employee];
+          for (const employee of employees) {
+            if (decisionMakers.length >= 10) break;
+            const name = employee.name || (employee['@type'] === 'Person' ? employee.name : null);
+            if (name && isValidPersonName(name)) {
+              const key = name.toLowerCase();
               if (!seen.has(key)) {
                 seen.add(key);
                 decisionMakers.push({
                   name: name,
-                  title: founder.jobTitle || 'Founder',
+                  title: employee.jobTitle || employee.worksFor?.jobTitle || 'Employee',
                   source: 'structured_data',
-                  confidence: 0.95
+                  confidence: 0.9
                 });
               }
+            }
+          }
+        }
+        
+        // EmployeeRole schema
+        if (item['@type'] === 'EmployeeRole' && item.employee) {
+          const employee = item.employee;
+          const name = employee.name || (employee['@type'] === 'Person' ? employee.name : null);
+          if (name && isValidPersonName(name)) {
+            const key = name.toLowerCase();
+          if (!seen.has(key)) {
+            seen.add(key);
+              decisionMakers.push({
+                name: name,
+                title: item.roleName || employee.jobTitle || 'Employee',
+                source: 'structured_data',
+                confidence: 0.9
+              });
             }
           }
         }
@@ -1699,7 +1964,7 @@ function extractDecisionMakers($, baseUrl) {
             seen.add(key);
             decisionMakers.push({
               name: item.name,
-              title: item.jobTitle || 'Team Member',
+              title: item.jobTitle || item.worksFor?.jobTitle || 'Team Member',
               source: 'structured_data',
               confidence: 0.9
             });
@@ -1708,6 +1973,59 @@ function extractDecisionMakers($, baseUrl) {
       }
     } catch (e) {
       // Ignore JSON parse errors
+    }
+  });
+  
+  // Pattern 1b: Microdata/RDFa (itemscope, itemtype="Person")
+  $('[itemscope][itemtype*="Person"], [itemtype*="Person"]').each((i, elem) => {
+    if (decisionMakers.length >= 10) return false;
+    
+    const $el = $(elem);
+    const name = $el.find('[itemprop="name"]').first().text().trim() || 
+                 $el.find('h2, h3, h4').first().text().trim();
+    
+    if (name && isValidPersonName(name)) {
+      const title = $el.find('[itemprop="jobTitle"]').first().text().trim() ||
+                   $el.find('[itemprop="jobTitle"]').first().text().trim() ||
+                   $el.find('.title, .role, .position').first().text().trim();
+      
+              const key = name.toLowerCase();
+              if (!seen.has(key)) {
+                seen.add(key);
+                decisionMakers.push({
+                  name: name,
+          title: title || 'Team Member',
+                  source: 'structured_data',
+          confidence: 0.85
+                });
+              }
+            }
+  });
+  
+  // Pattern 1c: Open Graph tags for team members
+  $('meta[property^="og:"]').each((i, elem) => {
+    if (decisionMakers.length >= 10) return false;
+    
+    const property = $(elem).attr('property');
+    const content = $(elem).attr('content');
+    
+    // Look for og:profile:first_name and og:profile:last_name patterns
+    if (property && content && property.includes('profile') && isValidPersonName(content)) {
+      // Try to find associated title
+      const $parent = $(elem).closest('head, [itemscope]');
+      const title = $parent.find('meta[property*="title"], meta[property*="role"]').first().attr('content') ||
+                   $parent.find('.title, .role').first().text().trim();
+      
+      const key = content.toLowerCase();
+      if (!seen.has(key)) {
+        seen.add(key);
+        decisionMakers.push({
+          name: content,
+          title: title || 'Team Member',
+          source: 'structured_data',
+          confidence: 0.8
+        });
+      }
     }
   });
   
@@ -1802,17 +2120,17 @@ function extractDecisionMakers($, baseUrl) {
         const title = pattern === patterns[0] ? match[2]?.trim() : match[1]?.trim();
         
         if (name && title && isValidPersonName(name)) {
-          const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
+        const key = `${name.toLowerCase()}-${title.toLowerCase()}`;
           if (!seen.has(key)) {
-            seen.add(key);
-            decisionMakers.push({
-              name: name,
-              title: title,
-              source: 'website',
-              confidence: 0.8
-            });
-          }
+          seen.add(key);
+          decisionMakers.push({
+            name: name,
+            title: title,
+            source: 'website',
+            confidence: 0.8
+          });
         }
+      }
       }
     }
   }
