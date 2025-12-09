@@ -381,6 +381,7 @@ const showAllSearches = ref(false);
 const loadingAll = ref(false);
 const allSearches = ref([]);
 let pollInterval = null;
+let currentPollingSearchId = null; // Track which search is being polled to prevent race conditions
 let backgroundPollInterval = null;
 let statsInterval = null;
 let recentSearchesInterval = null;
@@ -469,19 +470,49 @@ async function handleSearch(searchData) {
 }
 
 function startPolling(searchId) {
-  if (pollInterval) clearInterval(pollInterval);
+  // CRITICAL: Stop any existing polling first to prevent race conditions
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  
+  // Set the current polling search ID to prevent stale updates
+  currentPollingSearchId = String(searchId);
   let failedFetchCount = 0;
   
   pollInterval = setInterval(async () => {
+    // CRITICAL: Check if we're still polling the same search (prevent race conditions)
+    const currentSearchId = leadsStore.currentSearch?._id || leadsStore.currentSearch?.searchId;
+    if (currentSearchId && String(currentSearchId) !== currentPollingSearchId) {
+      // Search has changed, stop polling
+      console.log('[POLLING] Search changed, stopping old polling');
+      stopPolling();
+      return;
+    }
+    
     try {
-      const data = await leadsStore.fetchSearch(searchId);
+      // Pass isPolling=true to prevent loading state flicker during polling
+      const data = await leadsStore.fetchSearch(searchId, false, true);
+      
+      // Double-check search ID matches before processing (race condition protection)
+      if (data?.search?._id && String(data.search._id) !== currentPollingSearchId) {
+        console.log('[POLLING] Search ID mismatch, ignoring stale update');
+        return;
+      }
+      
       const requested = data?.search?.resultCount || 50;
       const have = (leadsStore.filteredLeads || []).length;
       const status = (data?.search?.status || '').toLowerCase();
       const searchData = data?.search;
       
-      // Refresh credits after each fetch (in case enrichment completed)
-      refreshCredits();
+      // OPTIMIZATION: Only refresh credits when enrichment status changes (not every poll)
+      // Track previous enriched count to detect changes
+      const currentEnriched = searchData?.enrichedCount || 0;
+      const previousEnriched = leadsStore.currentSearch?.enrichedCount || 0;
+      if (currentEnriched !== previousEnriched || status === 'completed') {
+        // Enrichment count changed or search completed - refresh credits
+        refreshCredits();
+      }
       
       // If search just completed, show notification
       if (status === 'completed' && searchData) {
@@ -528,9 +559,23 @@ function startPolling(searchId) {
       if (!shouldKeepPolling && status !== 'failed') stopPolling();
     } catch (error) {
       console.error('Polling error:', error);
-      // Don't stop immediately on error - might be transient
       failedFetchCount++;
-      if (failedFetchCount >= 3) {
+      
+      // Show error to user after first failure (might be transient, but user should know)
+      if (failedFetchCount === 1) {
+        // First error - show warning but continue polling
+        showToast({
+          type: 'error',
+          message: 'Having trouble updating search. Retrying...',
+          duration: 3000
+        });
+      } else if (failedFetchCount >= 3) {
+        // Multiple failures - stop polling and show error
+        showToast({
+          type: 'error',
+          message: 'Failed to update search. Please refresh the page.',
+          duration: 5000
+        });
         stopPolling();
       }
     }
@@ -542,6 +587,7 @@ function stopPolling() {
     clearInterval(pollInterval);
     pollInterval = null;
   }
+  currentPollingSearchId = null; // Clear tracking
 }
 
 function startBackgroundPolling() {
@@ -587,12 +633,27 @@ function startRecentSearchesPolling() {
   
   recentSearchesInterval = setInterval(async () => {
     try {
-      // Refresh dashboard stats to update recent searches
-      await loadDashboardStats();
+      // Silent background refresh - no loading states, just update data
+      await silentRefreshDashboardStats();
     } catch (error) {
       console.error('Recent searches polling error:', error);
     }
-  }, 10000); // Poll every 10 seconds for real-time updates
+  }, 3000); // Poll every 3 seconds for better real-time updates (silent, so frequent is fine)
+}
+
+// Silent refresh that updates data without showing loading indicators
+async function silentRefreshDashboardStats() {
+  if (!authStore.isAuthenticated) return;
+  
+  try {
+    const response = await api.get('/company/stats');
+    // Silently update the data without setting loadingStats
+    // This prevents the loading bar from showing and disrupting UX
+    dashboardStats.value = response.data;
+  } catch (error) {
+    // Silently fail - don't disrupt user experience
+    console.error('Silent refresh error:', error);
+  }
 }
 
 function stopRecentSearchesPolling() {
@@ -685,15 +746,20 @@ function onRecentDeleted(id) {
 }
 async function loadSearch(search) {
   try {
+    // Prevent any scroll behavior when loading search
+    // Store current scroll position
+    const scrollY = window.scrollY;
+    
     // Switch to this search (moves current to background if needed)
+    // NOTE: This doesn't clear leads - they'll be updated when fetchSearch completes
     leadsStore.switchToSearch(search);
     
-    // Fetch fresh data
+    // Fetch fresh data (this will update leads, preventing empty state flash)
     const data = await leadsStore.fetchSearch(search._id);
     
     // If the selected search is still processing, start polling; otherwise stop
     const status = data?.search?.status || search.status;
-    if (status === 'processing' || status === 'queued' || status === 'searching' || status === 'extracting' || status === 'enriching') {
+    if (status === 'processing' || status === 'queued' || status === 'searching' || status === 'extracting' || status === 'enriching' || status === 'processing_backfill') {
       startPolling(search._id);
     } else {
       stopPolling();
@@ -703,6 +769,11 @@ async function loadSearch(search) {
     if (!backgroundPollInterval && leadsStore.activeBackgroundSearches.length > 0) {
       startBackgroundPolling();
     }
+    
+    // Restore scroll position to prevent page jump
+    requestAnimationFrame(() => {
+      window.scrollTo({ top: scrollY, behavior: 'instant' });
+    });
   } catch (error) {
     console.error('Error loading search:', error);
   }

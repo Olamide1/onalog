@@ -24,7 +24,26 @@ export const useLeadsStore = defineStore('leads', () => {
     );
   });
   
+  // Track last search creation to prevent rapid duplicate submissions
+  let lastSearchCreation = null;
+  const SEARCH_DEBOUNCE_MS = 2000; // 2 second debounce
+  
   async function createSearch(query, country, location, industry, resultCount, maxDistance = null) {
+    // Debounce: Prevent rapid duplicate search creation
+    const now = Date.now();
+    const searchKey = `${query}|${country}|${location}|${industry}|${resultCount}`;
+    
+    if (lastSearchCreation && (now - lastSearchCreation.timestamp) < SEARCH_DEBOUNCE_MS) {
+      if (lastSearchCreation.key === searchKey) {
+        // Same search submitted too quickly - return existing promise or reject
+        console.log('[STORE] Search creation debounced - preventing duplicate');
+        throw new Error('Please wait before creating the same search again');
+      }
+    }
+    
+    // Update last search creation tracking
+    lastSearchCreation = { key: searchKey, timestamp: now };
+    
     loading.value = true;
     error.value = null;
     
@@ -60,9 +79,10 @@ export const useLeadsStore = defineStore('leads', () => {
     }
   }
   
-  async function fetchSearch(searchId, updateBackground = false) {
-    // Only set loading for current search updates, not background
-    if (!updateBackground) {
+  async function fetchSearch(searchId, updateBackground = false, isPolling = false) {
+    // Only set loading for initial fetches, not background updates or polling
+    // Polling updates should be silent to prevent UI flicker
+    if (!updateBackground && !isPolling) {
       loading.value = true;
     }
     error.value = null;
@@ -94,7 +114,8 @@ export const useLeadsStore = defineStore('leads', () => {
         // 1. We have new leads (new IDs)
         // 2. Lead count changed
         // 3. Status is backfill or completed (leads are being added)
-        if (hasNewLeads || leadCountChanged || isBackfillOrCompleted) {
+        // 4. We have no existing leads (initial load - prevents empty state flash)
+        if (hasNewLeads || leadCountChanged || isBackfillOrCompleted || leads.value.length === 0) {
           leads.value = newLeads;
           console.log('[STORE] Updated leads list:', newLeads.length, 'leads (hasNewLeads:', hasNewLeads, ', countChanged:', leadCountChanged, ', isBackfill:', isBackfillOrCompleted, ')');
         }
@@ -156,8 +177,10 @@ export const useLeadsStore = defineStore('leads', () => {
       s._id !== search._id && s.searchId !== search.searchId
     );
     
-    // Set as current
+    // CRITICAL: Set as current WITHOUT clearing leads immediately
+    // Leads will be updated when fetchSearch is called, preventing empty state flash
     currentSearch.value = search;
+    // Don't clear leads here - let fetchSearch update them when new data arrives
   }
   
   function removeBackgroundSearch(searchId) {

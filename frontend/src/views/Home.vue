@@ -126,6 +126,7 @@ const leadsStore = useLeadsStore();
 const selectedLead = ref(null);
 const searchFormRef = ref(null);
 let pollInterval = null;
+let currentPollingSearchId = null; // Track which search is being polled to prevent race conditions
 const lastUpdateTime = ref(null);
 const lastExtractedCount = ref(0);
 const lastEnrichedCount = ref(0);
@@ -320,12 +321,36 @@ watch(
 );
 
 function startPolling(searchId) {
-  if (pollInterval) clearInterval(pollInterval);
+  // CRITICAL: Stop any existing polling first to prevent race conditions
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  
+  // Set the current polling search ID to prevent stale updates
+  currentPollingSearchId = String(searchId);
   
   // Use faster polling (2s) for better real-time updates during backfill
   pollInterval = setInterval(async () => {
+    // CRITICAL: Check if we're still polling the same search (prevent race conditions)
+    const currentSearchId = leadsStore.currentSearch?._id || leadsStore.currentSearch?.searchId;
+    if (currentSearchId && String(currentSearchId) !== currentPollingSearchId) {
+      // Search has changed, stop polling
+      console.log('[POLLING] Search changed, stopping old polling');
+      stopPolling();
+      return;
+    }
+    
     try {
-      const data = await leadsStore.fetchSearch(searchId);
+      // Pass isPolling=true to prevent loading state flicker during polling
+      const data = await leadsStore.fetchSearch(searchId, false, true);
+      
+      // Double-check search ID matches before processing (race condition protection)
+      if (data?.search?._id && String(data.search._id) !== currentPollingSearchId) {
+        console.log('[POLLING] Search ID mismatch, ignoring stale update');
+        return;
+      }
+      
       const requested = data?.search?.resultCount || 50;
       const have = (leadsStore.filteredLeads || []).length;
       const status = (data?.search?.status || '').toLowerCase();
@@ -380,14 +405,21 @@ function startPolling(searchId) {
         );
       
       if (!shouldKeepPolling) {
-        clearInterval(pollInterval);
-        pollInterval = null;
+        stopPolling();
       }
     } catch (err) {
       // Log error but continue polling (network issues shouldn't stop updates)
       console.warn('Polling error (will retry):', err.message);
     }
   }, 2000); // Poll every 2 seconds for better real-time updates during backfill
+}
+
+function stopPolling() {
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+  currentPollingSearchId = null; // Clear tracking
 }
 
 function formatStatus(status) {
@@ -417,7 +449,7 @@ function getProgressMessage(status) {
 }
 
 onUnmounted(() => {
-  if (pollInterval) clearInterval(pollInterval);
+  stopPolling();
 });
 </script>
 

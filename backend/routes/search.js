@@ -2256,6 +2256,9 @@ async function processSearch(searchId) {
                 });
                 s.extractedCount = currentExtracted;
                 s.enrichedCount = currentEnriched;
+                // CRITICAL FIX: Update totalResults to match extractedCount during backfill
+                // This ensures "Results" count matches "Enriched" count logic (Results >= Enriched)
+                s.totalResults = Math.max(s.totalResults || 0, currentExtracted);
                 s.status = 'processing_backfill'; // Ensure status is set
                 // CRITICAL FIX: Save after every lead to ensure real-time updates
                 await s.save().catch(err => {

@@ -27,7 +27,7 @@
         :key="search._id"
         class="search-item geometric-block-thin"
         :class="{ deleting: deletingId === search._id }"
-        @click="$emit('select-search', search)"
+        @click.stop.prevent="handleSearchClick(search)"
       >
         <div class="search-content">
           <div class="search-query">{{ search.query }}</div>
@@ -39,7 +39,7 @@
         </div>
         <div class="search-stats">
           <div class="stat-item">
-            <span class="stat-number">{{ search.totalResults || 0 }}</span>
+            <span class="stat-number">{{ search.extractedCount || search.totalResults || 0 }}</span>
             <span class="stat-label">Results</span>
           </div>
           <div class="stat-item">
@@ -121,6 +121,12 @@ function formatStatus(status) {
 
 function isProcessing(status) {
   return status === 'processing' || status === 'queued' || status === 'searching' || status === 'extracting' || status === 'enriching';
+}
+
+function handleSearchClick(search) {
+  // Prevent any default scroll behavior
+  // Emit event without causing page scroll or navigation jump
+  emit('select-search', search);
 }
 
 async function onDelete(search) {

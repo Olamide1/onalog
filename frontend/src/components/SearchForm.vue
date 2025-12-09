@@ -284,7 +284,18 @@ const loadingTemplates = ref(false);
 const currentSearchId = ref(null);
 const authStore = useAuthStore();
 
+// Debounce search submission to prevent rapid duplicate searches
+let lastSubmitTime = 0;
+const SUBMIT_DEBOUNCE_MS = 2000; // 2 second debounce
+
 async function handleSubmit() {
+  // Prevent rapid duplicate submissions
+  const now = Date.now();
+  if (now - lastSubmitTime < SUBMIT_DEBOUNCE_MS) {
+    console.log('[SEARCH_FORM] Submission debounced - preventing duplicate');
+    return;
+  }
+  lastSubmitTime = now;
   // CRITICAL: Validate required fields
   if (!formData.value.query.trim()) {
     alert('Please enter a search query');
