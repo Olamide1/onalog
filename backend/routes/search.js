@@ -3,8 +3,7 @@ import Search from '../models/Search.js';
 import Lead from '../models/Lead.js';
 import Company from '../models/Company.js';
 import User from '../models/User.js';
-// @todo: rename conflicting name imports (searchGoogle -> searchGoogleService)
-import { fetchGoogleResults, searchGoogle as searchGoogleService } from '../services/googleSearch.js';
+import { fetchGoogleResults } from '../services/googleSearch.js';
 import { isDirectorySite, getPlaceDetails } from '../services/searchProviders.js';
 import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives, quickClassifyUrl } from '../services/extractor.js';
 import { enrichLead, generateEmailFromName } from '../services/enricher.js';
@@ -1320,7 +1319,7 @@ async function processSearch(searchId) {
               console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Fallback: Attempting to resolve website via internal search: "${searchQuery}"`);
               
               const searchResults = await Promise.race([
-                searchGoogleService(searchQuery, search.country, search.location, 3),
+                fetchGoogleResults(searchQuery, search.country, search.location, 3),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
               ]).catch(() => []);
               
