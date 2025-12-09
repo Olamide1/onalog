@@ -3,16 +3,23 @@ import Search from '../models/Search.js';
 import Lead from '../models/Lead.js';
 import Company from '../models/Company.js';
 import User from '../models/User.js';
-import { fetchGoogleResults } from '../services/googleSearch.js';
-import { isDirectorySite } from '../services/searchProviders.js';
-import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives } from '../services/extractor.js';
-import { enrichLead } from '../services/enricher.js';
+// @todo: rename conflicting name imports (searchGoogle -> searchGoogleService)
+import { fetchGoogleResults, searchGoogle as searchGoogleService } from '../services/googleSearch.js';
+import { isDirectorySite, getPlaceDetails } from '../services/searchProviders.js';
+import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives, quickClassifyUrl } from '../services/extractor.js';
+import { enrichLead, generateEmailFromName } from '../services/enricher.js';
 import { detectDuplicates } from '../services/duplicateDetector.js';
 import { normalizeUrl } from '../utils/urlNormalizer.js';
 import { isSocialMediaUrl } from '../utils/socialMediaDetector.js';
 import { verifyEmails } from '../services/emailVerifier.js';
 import { isInvalidDomain, isGenericCompanyName as isGenericNameFromConfig } from '../config/domainValidation.js';
 import { isLeadRelevant } from '../utils/relevanceFilter.js';
+import { parseQuery } from '../utils/queryParser.js';
+import { searchGoogle } from '../utils/googleSearchAPI.js';
+import { calculateLocationDistance } from '../utils/distanceCalculator.js';
+import { calculateQualityScore } from '../utils/qualityScoring.js';
+import { validateDecisionMakers } from '../utils/decisionMakerValidator.js';
+import { calculateVerificationScore } from '../utils/verificationScoring.js';
 import jwt from 'jsonwebtoken';
 import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
@@ -275,7 +282,6 @@ router.post('/', async (req, res) => {
     // Country doesn't prevent extracting industry/location from query text
     if (!industry || !location) {
       try {
-        const { parseQuery } = await import('../utils/queryParser.js');
         const parsed = await parseQuery(query, country, location, industry);
         
         // Use parsed values if explicit values weren't provided
@@ -1076,7 +1082,6 @@ async function processSearch(searchId) {
         // AI-based relevance filtering (only for specific queries to avoid false positives)
         if (hasSpecificQuery && process.env.OPENAI_API_KEY) {
           try {
-            const { isLeadRelevant } = await import('../utils/relevanceFilter.js');
             const relevance = await isLeadRelevant({
               companyName: finalCompanyName,
               website: result.link,
@@ -1210,7 +1215,6 @@ async function processSearch(searchId) {
         if (needsPlaceDetails) {
           try {
             console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Fetching Place Details for: ${placeId}`);
-            const { getPlaceDetails } = await import('../services/searchProviders.js');
             const placeDetails = await getPlaceDetails(placeId);
             if (placeDetails) {
               // Get website (only if it's a valid URL, not empty string)
@@ -1267,7 +1271,6 @@ async function processSearch(searchId) {
               const searchQuery = `"${finalCompanyName}"${locationPart} official website`.trim();
               console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Using Google Custom Search to find website: "${searchQuery}"`);
               
-              const { searchGoogle } = await import('../utils/googleSearchAPI.js');
               const searchResults = await Promise.race([
                 searchGoogle(searchQuery),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))
@@ -1315,10 +1318,9 @@ async function processSearch(searchId) {
             if (!websiteUrl) {
               const searchQuery = `${finalCompanyName} ${search.location || ''} official site`.trim();
               console.log(`[PROCESS] [${i + 1}/${total}] 🔍 Fallback: Attempting to resolve website via internal search: "${searchQuery}"`);
-              const { searchGoogle } = await import('../services/googleSearch.js');
               
               const searchResults = await Promise.race([
-                searchGoogle(searchQuery, search.country, search.location, 3),
+                searchGoogleService(searchQuery, search.country, search.location, 3),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))
               ]).catch(() => []);
               
@@ -1391,9 +1393,6 @@ async function processSearch(searchId) {
         // Guard: first‑party vs directory classifier (check both original link and extracted website)
         // Uses dynamic pattern-based detection, not hardcoded domain lists
         try {
-          const { quickClassifyUrl } = await import('../services/extractor.js');
-          const { isDirectorySite } = await import('../services/searchProviders.js');
-          
           // Check original link using dynamic pattern-based detection
           if (isDirectorySite(result.link, result.title)) {
             console.log(`[PROCESS] [${i + 1}/${total}] Original link is directory: ${result.link}. Skipping.`);
@@ -1682,7 +1681,6 @@ async function processSearch(searchId) {
         
         // Calculate distance from search location
         try {
-          const { calculateLocationDistance } = await import('../utils/distanceCalculator.js');
           if (search.location && (lead.address || lead.enrichment?.location?.formatted)) {
             const companyLocation = lead.enrichment?.location?.formatted || lead.address;
             const distance = calculateLocationDistance(search.location, companyLocation, search.country);
@@ -1697,7 +1695,6 @@ async function processSearch(searchId) {
         
         // Calculate quality score
         try {
-          const { calculateQualityScore } = await import('../utils/qualityScoring.js');
           lead.qualityScore = calculateQualityScore(lead);
           console.log(`[PROCESS] [${i + 1}/${total}] Quality score: ${lead.qualityScore}/5`);
         } catch (qualityErr) {
@@ -1922,7 +1919,6 @@ async function processSearch(searchId) {
                 // Validate merged decision makers with AI to filter out noise
                 if (merged.length > 0) {
                   try {
-                    const { validateDecisionMakers } = await import('../utils/decisionMakerValidator.js');
                     const validated = await validateDecisionMakers(
                       merged,
                       lead.companyName,
@@ -1946,8 +1942,6 @@ async function processSearch(searchId) {
               // Even if we don't have a website, try to infer domain from company name
               if (lead.decisionMakers && lead.decisionMakers.length > 0 && enrichment.emailPattern) {
                 try {
-                  const { generateEmailFromName } = await import('../services/enricher.js');
-                  
                   // Try to get domain from website, or infer from company name
                   let domain = null;
                   if (lead.website) {
@@ -1998,7 +1992,6 @@ async function processSearch(searchId) {
               
               // Calculate verification score
               try {
-                const { calculateVerificationScore } = await import('../utils/verificationScoring.js');
                 const verification = calculateVerificationScore(lead);
                 lead.enrichment.verificationScore = verification.score;
                 lead.enrichment.verificationSources = verification.sources;
@@ -2015,7 +2008,6 @@ async function processSearch(searchId) {
               }
               // Recalculate distance after enrichment (more accurate location data)
               try {
-                const { calculateLocationDistance } = await import('../utils/distanceCalculator.js');
                 if (search.location && enrichment.location?.formatted) {
                   const distance = calculateLocationDistance(search.location, enrichment.location.formatted, search.country);
                   if (distance !== null) {
