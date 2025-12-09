@@ -2,6 +2,7 @@ import express from 'express';
 import Search from '../models/Search.js';
 import Lead from '../models/Lead.js';
 import Company from '../models/Company.js';
+import User from '../models/User.js';
 import { fetchGoogleResults } from '../services/googleSearch.js';
 import { isDirectorySite } from '../services/searchProviders.js';
 import { extractContactInfo, formatPhone, detectCountry, expandDirectoryCompanies, discoverExecutives } from '../services/extractor.js';
@@ -16,6 +17,8 @@ import jwt from 'jsonwebtoken';
 import { billingEnabled, reserveCredit, refundCredit } from '../services/billing.js';
 
 const router = express.Router();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'zxc89IIklOP';
 
 /**
  * Search Queue - Per-user queues with priority and round-robin processing
@@ -298,8 +301,7 @@ router.post('/', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (token) {
       try {
-        const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-        const decoded = jwt.verify(token, secret);
+        const decoded = jwt.verify(token, JWT_SECRET);
         userId = decoded.userId;
       } catch (err) {
         // Token invalid, continue without user
@@ -313,7 +315,6 @@ router.post('/', async (req, res) => {
     let priority = 0;
     if (userId) {
       try {
-        const User = (await import('../models/User.js')).default;
         const user = await User.findById(userId).populate('companyId');
         
         if (user?.companyId) {
@@ -390,9 +391,7 @@ router.delete('/:id', async (req, res) => {
     // Require auth
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-    const decoded = jwt.verify(token, secret);
-    const User = (await import('../models/User.js')).default;
+    const decoded = jwt.verify(token, JWT_SECRET);
     const user = await User.findById(decoded.userId).populate('companyId');
     if (!user) return res.status(401).json({ error: 'Unauthorized' });
     
@@ -404,8 +403,7 @@ router.delete('/:id', async (req, res) => {
     if (String(search.userId) === String(user._id)) {
       allowed = true;
     } else if (user.role === 'admin') {
-      const SearchOwner = (await import('../models/User.js')).default;
-      const owner = await SearchOwner.findById(search.userId);
+      const owner = await User.findById(search.userId);
       if (owner && String(owner.companyId) === String(user.companyId?._id || user.companyId)) {
         allowed = true;
       }
@@ -436,9 +434,7 @@ router.get('/:id', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (token) {
       try {
-        const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-        const decoded = jwt.verify(token, secret);
-        const User = (await import('../models/User.js')).default;
+        const decoded = jwt.verify(token, JWT_SECRET);
         const user = await User.findById(decoded.userId).populate('companyId');
         if (user && user.companyId) {
           userId = user._id;
@@ -457,7 +453,6 @@ router.get('/:id', async (req, res) => {
     
     // Check access: if user is authenticated, verify company access
     if (userCompanyId && search.userId) {
-      const User = (await import('../models/User.js')).default;
       const searchUser = await User.findById(search.userId);
       
       if (shareSearches) {
@@ -477,8 +472,7 @@ router.get('/:id', async (req, res) => {
     let previewLimit = null;
     try {
       if (billingEnabled()) {
-        const OwnerUser = (await import('../models/User.js')).default;
-        const owner = await OwnerUser.findById(search.userId).populate('companyId');
+        const owner = await User.findById(search.userId).populate('companyId');
         const ownerCompany = owner?.companyId;
         if (ownerCompany && (ownerCompany.creditBalance || 0) <= 0) {
           previewLimit = parseInt(process.env.PREVIEW_LIMIT || '10', 10);
@@ -554,10 +548,7 @@ router.get('/', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (token) {
       try {
-        const jwt = await import('jsonwebtoken');
-        const User = (await import('../models/User.js')).default;
-        const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-        const decoded = jwt.default.verify(token, secret);
+        const decoded = jwt.verify(token, JWT_SECRET);
         const user = await User.findById(decoded.userId).populate('companyId');
         if (user && user.companyId) {
           userId = user._id;
@@ -578,7 +569,6 @@ router.get('/', async (req, res) => {
 
     if (userCompanyId) {
       if (shareSearches) {
-        const User = (await import('../models/User.js')).default;
         const companyUsers = await User.find({ companyId: userCompanyId }).select('_id');
         const userIds = companyUsers.map(u => u._id);
         query.userId = { $in: userIds };
@@ -638,9 +628,7 @@ router.get('/templates/list', async (req, res) => {
     const token = req.headers.authorization?.replace('Bearer ', '');
     if (token) {
       try {
-        const secret = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
-        const decoded = jwt.verify(token, secret);
-        const User = (await import('../models/User.js')).default;
+        const decoded = jwt.verify(token, JWT_SECRET);
         const user = await User.findById(decoded.userId).populate('companyId');
         if (user && user.companyId) {
           userId = user._id;
@@ -658,7 +646,6 @@ router.get('/templates/list', async (req, res) => {
     if (userCompanyId) {
       if (shareTemplates) {
         // Get all users in company
-        const User = (await import('../models/User.js')).default;
         const companyUsers = await User.find({ companyId: userCompanyId }).select('_id');
         const userIds = companyUsers.map(u => u._id);
         query.userId = { $in: userIds };
@@ -705,7 +692,6 @@ async function processSearch(searchId) {
     let searchUser = null;
     let searchCompanyId = null;
     try {
-      const User = (await import('../models/User.js')).default;
       searchUser = await User.findById(search.userId).populate('companyId');
       searchCompanyId = searchUser?.companyId?._id || searchUser?.companyId || null;
     } catch {}
