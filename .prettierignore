@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+**/node_modules/
+yarn.lock
+package-lock.json
+yarn-error.log
+
+# Build outputs
+dist/
+build/
+*.min.js
+*.min.css
+
+# Backend
+backend/node_modules/
+backend/dist/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+
+# Logs
+*.log
+logs/
+*.tsbuildinfo
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# Documentation that shouldn't be formatted
+CHANGELOG.md
+LICENSE
+
+# Config files that may have specific formatting
+.npmrc
+.yarnrc
+.prettierrc
+.prettierignore
+
+# Public assets
+public/
+**/public/
+
+# Generated files
+coverage/
+.nyc_output/
