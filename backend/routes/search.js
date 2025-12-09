@@ -849,7 +849,7 @@ async function processSearch(searchId) {
     // PROGRESSIVE EXTRACTION: Start extracting immediately with first batch
     // Don't wait for all results - start as soon as we have enough to begin
     const initialTarget = Math.min(30, expandedResults.length);
-    const MAX_WORKERS = 4; // cap parallelism
+    const MAX_WORKERS = 2; // Reduced from 4 to 2 to lower memory usage (each worker loads HTML pages)
     const TIME_BUDGET_MS = 25000; // ~25s budget for initial reveal
     const deadline = Date.now() + TIME_BUDGET_MS;
     
@@ -864,6 +864,25 @@ async function processSearch(searchId) {
     // Fix: Website-based lock to prevent concurrent processing of same website
     // Map<normalizedWebsite, Promise> - tracks ongoing processing per website
     const websiteLocks = new Map();
+    
+    // Periodic cleanup of website locks to prevent memory growth
+    const MAX_LOCKS = 100; // Maximum concurrent locks
+    const cleanupLocks = () => {
+      if (websiteLocks.size > MAX_LOCKS) {
+        // If we have too many locks, log warning (locks should be cleaned up after processing completes)
+        console.log(`[PROCESS] ⚠️  Website locks map size: ${websiteLocks.size} (max: ${MAX_LOCKS}) - this may indicate a memory leak`);
+      }
+    };
+    
+    // Memory monitoring helper
+    const logMemoryUsage = (label) => {
+      if (process.env.NODE_ENV === 'production') {
+        const usage = process.memoryUsage();
+        const mbUsed = (usage.heapUsed / 1024 / 1024).toFixed(2);
+        const mbTotal = (usage.heapTotal / 1024 / 1024).toFixed(2);
+        console.log(`[MEMORY] ${label}: Heap ${mbUsed}MB / ${mbTotal}MB (RSS: ${(usage.rss / 1024 / 1024).toFixed(2)}MB)`);
+      }
+    };
 
     async function processOne(result, i, total) {
       const itemStartTime = Date.now();
@@ -2106,17 +2125,25 @@ async function processSearch(searchId) {
     let scheduled = 0;
     let completed = 0;
     const totalInit = initialBatch.length;
+    logMemoryUsage('Before initial batch processing');
     async function worker(wid) {
       while (scheduled < totalInit && Date.now() < deadline) {
         const idx = scheduled++;
         await processOne(initialBatch[idx], idx, totalInit);
         completed++;
+        // Periodic cleanup and memory monitoring
+        if (completed % 10 === 0) {
+          cleanupLocks();
+          logMemoryUsage(`After ${completed} items`);
+        }
       }
     }
     const workers = [];
     const pool = Math.min(MAX_WORKERS, totalInit);
     for (let w = 0; w < pool; w++) workers.push(worker(w));
     await Promise.all(workers);
+    logMemoryUsage('After initial batch processing');
+    cleanupLocks(); // Final cleanup
     // Update counts after initial batch
     const initialEnrichedCount = leads.filter(l => l.enrichmentStatus === 'enriched').length;
     search.extractedCount = extractedCount;

@@ -13,19 +13,47 @@ import {
 } from '../config/domainValidation.js';
 dotenv.config();
 
-// In-memory short TTL caches
-const resolverCache = new Map(); // key -> { value, expiresAt }
+// In-memory short TTL caches with size limits to prevent memory leaks
+const resolverCache = new Map(); // key -> { value, expiresAt, lastAccess }
 const directoryCache = new Map();
 const TTL_MS = 20 * 60 * 1000; // 20 minutes
+const MAX_CACHE_SIZE = 500; // Maximum entries per cache to prevent unbounded growth
 
 function cacheGet(cache, key) {
   const hit = cache.get(key);
   if (!hit) return null;
   if (Date.now() > hit.expiresAt) { cache.delete(key); return null; }
+  // Update last access time for LRU eviction
+  hit.lastAccess = Date.now();
   return hit.value;
 }
+
 function cacheSet(cache, key, value, ttl = TTL_MS) {
-  cache.set(key, { value, expiresAt: Date.now() + ttl });
+  // Clean expired entries first
+  const now = Date.now();
+  for (const [k, v] of cache.entries()) {
+    if (now > v.expiresAt) {
+      cache.delete(k);
+    }
+  }
+  
+  // If cache is full, evict least recently used entry
+  if (cache.size >= MAX_CACHE_SIZE) {
+    let oldestKey = null;
+    let oldestAccess = Infinity;
+    for (const [k, v] of cache.entries()) {
+      if (v.lastAccess < oldestAccess) {
+        oldestAccess = v.lastAccess;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) {
+      cache.delete(oldestKey);
+      console.log(`[CACHE] Evicted LRU entry to prevent memory growth: ${oldestKey.substring(0, 50)}...`);
+    }
+  }
+  
+  cache.set(key, { value, expiresAt: Date.now() + ttl, lastAccess: Date.now() });
 }
 /**
  * Extract contact information from a website
