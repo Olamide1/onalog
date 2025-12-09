@@ -18,7 +18,7 @@
     "format:frontend": "prettier --write \"frontend/**/*.{js,vue,json,css,md}\""
   },
   "keywords": ["lead-generation", "b2b", "scraping"],
-  "author": "",
+  "author": "Placeholder LLC",
   "license": "ISC",
   "devDependencies": {
     "concurrently": "^8.2.2",
