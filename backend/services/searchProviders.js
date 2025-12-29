@@ -1429,7 +1429,6 @@ export async function searchOpenStreetMap(query, country = null, location = null
         const placeClass = place.class || '';
         const placeType = place.type || '';
         const displayName = place.display_name || '';
-        const dn = displayName.toLowerCase();
         const addr = place.address || {};
 
         // Drop obvious non-business geographies (prevents "Barber Lake"/"Barber Pond" noise)
@@ -1440,15 +1439,17 @@ export async function searchOpenStreetMap(query, country = null, location = null
           return false;
         }
 
+        // Extract address components once (used by both location and country filtering)
+        const addrCity = (addr.city || '').toLowerCase();
+        const addrState = (addr.state || '').toLowerCase();
+        const addrCountry = (addr.country || '').toLowerCase();
+        const addrRegion = (addr.region || '').toLowerCase();
+        const displayNameLower = displayName.toLowerCase();
+        
         // STRICT LOCATION FILTERING: When location is provided, enforce it strictly
         // This prevents results from wrong locations (e.g., India results for "Lagos" search)
         if (location) {
           const locationLower = location.toLowerCase();
-          const displayNameLower = displayName.toLowerCase();
-          const addrCity = (addr.city || '').toLowerCase();
-          const addrState = (addr.state || '').toLowerCase();
-          const addrCountry = (addr.country || '').toLowerCase();
-          const addrRegion = (addr.region || '').toLowerCase();
           
           // Check if location appears in address components or display name
           const locationInAddress = 
@@ -1533,7 +1534,6 @@ export async function searchOpenStreetMap(query, country = null, location = null
           
           const expectedCountries = countryNames[country.toLowerCase()] || [country.toLowerCase()];
           const addrCountryLower = addrCountry.toLowerCase();
-          const displayNameLower = displayName.toLowerCase();
           
           // Check if country matches
           const countryMatches = expectedCountries.some(expected => 
@@ -1557,7 +1557,7 @@ export async function searchOpenStreetMap(query, country = null, location = null
         // This works for ANY business type (brick & mortar, software, services, etc.)
         // Use all search terms if provided (from LLM expansion), otherwise use local synonyms
         const allTerms = allSearchTerms ? allSearchTerms.map(t => t.toLowerCase()) : Array.from(synonyms).map(t => t.toLowerCase());
-        const displayNameLower = displayName.toLowerCase();
+        // displayNameLower already defined above
         
         // Accept if place name/type matches any of the search synonyms (dynamic, not hardcoded)
         const matchesSearchIntent = allTerms.some(term => {

@@ -18,6 +18,7 @@ defineEmits(['open-buy']);
 .credit-pill {
   border: var(--border-medium) solid var(--neutral-2);
   background: var(--neutral-1);
+  color: var(--neutral-2);
   cursor: pointer;
   padding: 6px 10px;
   border-radius: 18px;

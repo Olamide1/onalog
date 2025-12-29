@@ -979,7 +979,7 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
     const results = [];
     const baseHost = new URL(listPageUrl).hostname.replace('www.','');
     
-    // Also try to extract from structured data (JSON-LD, microdata)
+    // Strategy 1: Extract from structured data (JSON-LD, microdata) - highest quality
     try {
       $('script[type="application/ld+json"]').each((_, el) => {
         try {
@@ -1003,11 +1003,79 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
                 } catch {}
               }
             }
+            // Also check for ItemList with multiple organizations
+            if (item['@type'] === 'ItemList' && item.itemListElement) {
+              const items = Array.isArray(item.itemListElement) ? item.itemListElement : [item.itemListElement];
+              items.forEach(listItem => {
+                const org = listItem.item || listItem;
+                if (org['@type'] === 'Organization' || org['@type'] === 'LocalBusiness') {
+                  const url = org.url || org.sameAs?.[0] || org.website;
+                  if (url && url.startsWith('http')) {
+                    try {
+                      const u = new URL(url);
+                      const host = u.hostname.replace('www.', '');
+                      if (host !== baseHost && !isSocialMediaDomain(host) && !isUniversalBlocked(host) && !seenHosts.has(host)) {
+                        seenHosts.add(host);
+                        results.push({
+                          title: org.name || org.legalName || host,
+                          link: u.toString(),
+                          snippet: org.description || ''
+                        });
+                      }
+                    } catch {}
+                  }
+                }
+              });
+            }
           });
         } catch {}
       });
     } catch {}
     
+    // Strategy 2: Extract from common list/table structures (company cards, list items)
+    try {
+      // Look for company links in common container patterns
+      const containerSelectors = [
+        'article', '.company', '.business', '.organization',
+        '[class*="company"]', '[class*="business"]', '[class*="organization"]',
+        '[class*="listing"]', '[class*="card"]', '[class*="item"]',
+        'li', 'tr', '.row', '[role="listitem"]'
+      ];
+      
+      containerSelectors.forEach(selector => {
+        $(selector).each((_, container) => {
+          const $container = $(container);
+          // Find the first external link in this container
+          const link = $container.find('a[href^="http"]').first();
+          if (link.length) {
+            const href = link.attr('href')?.trim();
+            if (href && href.startsWith('http')) {
+              try {
+                const u = new URL(href);
+                const host = u.hostname.replace('www.', '');
+                if (host !== baseHost && !isSocialMediaDomain(host) && !isUniversalBlocked(host) && !seenHosts.has(host) && !badPath.test(href)) {
+                  seenHosts.add(host);
+                  const title = link.text().trim() || $container.find('h1, h2, h3, h4, .title, [class*="name"]').first().text().trim() || host;
+                  const titleLower = title.toLowerCase();
+                  const isListicleTitle = /^(top|best|leading|list|directory|guide|roundup|compilation)/i.test(titleLower) && 
+                      (titleLower.includes('companies') || titleLower.includes('providers') || titleLower.includes('businesses') || 
+                       titleLower.includes('firms') || titleLower.includes('agencies') || titleLower.includes('services'));
+                  if (!isListicleTitle) {
+                    results.push({
+                      title: title,
+                      link: u.toString(),
+                      snippet: $container.text().substring(0, 150).trim()
+                    });
+                  }
+                }
+              } catch {}
+            }
+          }
+        });
+      });
+    } catch {}
+    
+    // Strategy 3: Extract from all anchor tags (fallback - most comprehensive)
     anchors.each((_, el) => {
       const href = ($(el).attr('href') || '').trim();
       if (!href.startsWith('http')) return;
@@ -1038,8 +1106,10 @@ export async function expandDirectoryCompanies(listPageUrl, maxCompanies = 25) {
       }
     });
     let final = results.slice(0, maxCompanies);
-    // If we found very few links, try an LLM assist (optional) to extract company sites from text
-    if (final.length < Math.min(5, maxCompanies/4) && process.env.OPENAI_API_KEY) {
+    // If we found fewer than expected links, try an LLM assist (optional) to extract company sites from text
+    // Lower threshold: trigger LLM if we have less than 30% of requested companies
+    const llmThreshold = Math.max(3, Math.floor(maxCompanies * 0.3));
+    if (final.length < llmThreshold && process.env.OPENAI_API_KEY) {
       try {
         const llmFound = await llmExtractCompanyLinksFromHtml(html, listPageUrl, maxCompanies);
         if (llmFound && llmFound.length > 0) {

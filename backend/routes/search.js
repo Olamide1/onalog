@@ -818,10 +818,15 @@ async function processSearch(searchId) {
         directoryCount++;
         try {
           console.log(`[PROCESS] Expanding directory/list page: "${r.title}" → ${r.link}`);
-          const maxExpand = Math.max(15, Math.min(50, Math.floor(search.resultCount / 2))); // Expand more aggressively
+          // More aggressive expansion: aim for at least 30-50 companies per directory
+          // Calculate based on how many results we still need
+          const currentCount = expandedResults.length;
+          const remainingNeeded = Math.max(0, search.resultCount - currentCount);
+          // Expand more aggressively: take at least 30, up to 50, or enough to fill remaining need
+          const maxExpand = Math.max(30, Math.min(50, Math.max(remainingNeeded, Math.floor(search.resultCount * 0.6))));
           const derived = await expandDirectoryCompanies(r.link, maxExpand);
           if (derived && derived.length > 0) {
-            console.log(`[PROCESS] ✅ Expanded "${r.title}" into ${derived.length} companies`);
+            console.log(`[PROCESS] ✅ Expanded "${r.title}" into ${derived.length} companies (requested: ${maxExpand})`);
             expandedResults.push(...derived);
             continue;
           } else {
