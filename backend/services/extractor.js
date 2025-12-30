@@ -154,87 +154,42 @@ export async function extractContactInfo(url, defaultCountry = null) {
   }
   
   try {
-    // Use AbortController for timeout (Node.js 18+)
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000); // Increased timeout to 20s
-    
     console.log(`[EXTRACT] Fetching page...`);
     let html;
-    let useScraperAPI = false;
     
-    // ENHANCED: Try ScraperAPI first if available (better success rate, handles JS rendering)
+    // HYBRID SCRAPING: Intelligent fallback chain
+    // ScraperAPI → Puppeteer (stealth) → Enhanced Fetch → Regular Fetch
+    // Maintains quality while providing unlimited scraping capability
     try {
-      const { scrapeWithScraperAPI } = await import('../utils/scraperAPI.js');
-      html = await scrapeWithScraperAPI(url, { render: false });
-      useScraperAPI = true;
-      console.log(`[EXTRACT] ✅ Fetched via ScraperAPI`);
-    } catch (scraperAPIError) {
-      // Fallback to regular fetch if ScraperAPI fails or not configured
-      console.log(`[EXTRACT] ScraperAPI not available, using regular fetch: ${scraperAPIError.message}`);
-      useScraperAPI = false;
-    }
-    
-    // If ScraperAPI didn't work, use regular fetch
-    if (!useScraperAPI) {
-    let response;
-    try {
-      response = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Connection': 'keep-alive',
-          'Upgrade-Insecure-Requests': '1'
-        },
-        signal: controller.signal,
-        redirect: 'follow'
+      const { scrapeUrl } = await import('./scraper.js');
+      
+      // Use hybrid scraper with intelligent method selection
+      // Automatically tries: ScraperAPI → Puppeteer (stealth) → Enhanced Fetch → Regular Fetch
+      html = await scrapeUrl(url, {
+        preferScraperAPI: true,  // Try ScraperAPI first if available (best quality)
+        preferPuppeteer: true,  // Try Puppeteer for JS-heavy or protected sites
+        preferEnhancedFetch: true, // Enhanced fetch with rotation
+        timeout: 20000
       });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) {
-      // Handle 403 Forbidden - some sites block automated requests
-      if (response.status === 403) {
-        console.log(`[EXTRACT] ⚠️  HTTP 403: Site blocked automated access. Will use available data from search results.`);
-        // Try to extract company name from URL as fallback
-        let companyName = 'Unknown Company';
-        try {
-          const u = new URL(url);
-          const domain = u.hostname.replace('www.', '');
-          const baseName = domain.split('.')[0];
-          companyName = baseName.charAt(0).toUpperCase() + baseName.slice(1);
-        } catch (e) {
-          // Keep default
-        }
-        return {
-          emails: [],
-          phoneNumbers: [],
-          socials: {},
-          address: null,
-          aboutText: '',
-          categorySignals: [],
-          companyName: companyName,
-              website: url,
-          decisionMakers: []
-        };
-      }
-          // Handle other HTTP errors
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        html = await response.text();
-      } catch (fetchError) {
-        // Handle network errors (DNS, connection refused, timeout, etc.)
-        clearTimeout(timeoutId);
-        console.log(`[EXTRACT] ⚠️  Network error: ${fetchError.message} - Will use available data from search results.`);
+      
+      console.log(`[EXTRACT] ✅ Page fetched via hybrid scraper`);
+    } catch (scrapeError) {
+      // All scraping methods failed - handle gracefully
+      console.log(`[EXTRACT] ⚠️  All scraping methods failed: ${scrapeError.message}`);
+      console.log(`[EXTRACT] Will use available data from search results.`);
+      
+      // Extract company name from URL as fallback
       let companyName = 'Unknown Company';
       try {
-        const domain = new URL(url).hostname.replace('www.', '');
-        companyName = domain.split('.')[0].charAt(0).toUpperCase() + domain.split('.')[0].slice(1);
+        const u = new URL(url);
+        const domain = u.hostname.replace('www.', '');
+        const baseName = domain.split('.')[0];
+        companyName = baseName.charAt(0).toUpperCase() + baseName.slice(1);
       } catch (e) {
         // Keep default
       }
+      
+      // Return minimal data structure (maintains compatibility)
       return {
         emails: [],
         phoneNumbers: [],
@@ -246,7 +201,11 @@ export async function extractContactInfo(url, defaultCountry = null) {
         website: url,
         decisionMakers: []
       };
-      }
+    }
+    
+    // Validate HTML was fetched
+    if (!html || html.length === 0) {
+      throw new Error('Empty HTML response');
     }
     
     console.log(`[EXTRACT] ✅ Page fetched, parsing HTML...`);
